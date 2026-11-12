@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Nellis Auction Analytics Dashboard & Lot Explorer
-A lightweight, zero-dependency local web app powered by Python & DuckDB.
+Nellis Auction Analytics Dashboard & Deal Sniper
+A lightweight, zero-dependency local web app powered by Python & DuckDB with live countdowns.
 """
 
 import http.server
@@ -46,7 +46,6 @@ def get_r2_duckdb_conn():
     return con
 
 
-# Cached DuckDB connection
 _R2_CONN = None
 
 def get_cached_r2_conn():
@@ -65,7 +64,7 @@ HTML_DASHBOARD = """<!DOCTYPE html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Nellis Auction Data Lake & Deal Finder</title>
+    <title>Nellis Auction Sniper & Deal Finder</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -88,6 +87,13 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         ::-webkit-scrollbar-track { background: #0f172a; }
         ::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
         ::-webkit-scrollbar-thumb:hover { background: #475569; }
+        @keyframes pulse-urgent {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.85; transform: scale(1.03); }
+        }
+        .urgent-pulse {
+            animation: pulse-urgent 1.5s infinite;
+        }
     </style>
 </head>
 <body class="bg-darkbg text-slate-100 min-h-screen flex flex-col font-sans antialiased">
@@ -96,19 +102,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
     <header class="border-b border-bordercolor bg-cardbg/80 backdrop-blur sticky top-0 z-50">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
             <div class="flex items-center space-x-3">
-                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-brand-600 to-emerald-400 flex items-center justify-center shadow-lg shadow-brand-500/20">
-                    <i class="fa-solid fa-gavel text-white text-lg"></i>
+                <div class="w-10 h-10 rounded-xl bg-gradient-to-tr from-rose-600 via-amber-500 to-emerald-400 flex items-center justify-center shadow-lg shadow-rose-500/20">
+                    <i class="fa-solid fa-stopwatch text-white text-lg"></i>
                 </div>
                 <div>
-                    <h1 class="text-lg font-bold tracking-tight bg-gradient-to-r from-white to-slate-300 bg-clip-text text-transparent">Nellis Auction Lake</h1>
-                    <p class="text-xs text-slate-400">Phoenix & Mesa, AZ Analytics</p>
+                    <h1 class="text-lg font-bold tracking-tight bg-gradient-to-r from-white to-slate-300 bg-clip-text text-transparent">Nellis Auction Sniper</h1>
+                    <p class="text-xs text-slate-400">Phoenix & Mesa, AZ Live Analytics</p>
                 </div>
             </div>
 
             <!-- Navigation Tabs -->
             <nav class="flex space-x-1 bg-slate-900/60 p-1 rounded-xl border border-bordercolor">
                 <button onclick="switchTab('deals')" id="tab-deals" class="px-4 py-1.5 rounded-lg text-sm font-medium transition-all bg-brand-600 text-white shadow">
-                    <i class="fa-solid fa-fire mr-1.5 text-amber-300"></i> Deal Finder
+                    <i class="fa-solid fa-crosshairs mr-1.5 text-amber-300"></i> Sniper & Deals
                 </button>
                 <button onclick="switchTab('analytics')" id="tab-analytics" class="px-4 py-1.5 rounded-lg text-sm font-medium text-slate-400 hover:text-white transition-all">
                     <i class="fa-solid fa-chart-pie mr-1.5 text-indigo-400"></i> Analytics Models
@@ -118,13 +124,10 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 </button>
             </nav>
 
-            <!-- Data Source Indicator -->
-            <div class="hidden sm:flex items-center space-x-2 text-xs">
-                <span class="inline-flex items-center px-2.5 py-1 rounded-full bg-emerald-950 text-emerald-400 border border-emerald-800/60">
-                    <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse mr-1.5"></span>
-                    Cloudflare R2 + SQLite
-                </span>
-            </div>
+            <!-- Quick Sniper Mode Preset Button -->
+            <button onclick="quickFilterSniper()" class="hidden sm:flex items-center px-3 py-1.5 rounded-xl bg-rose-950/80 hover:bg-rose-900 border border-rose-800 text-rose-300 text-xs font-bold transition shadow-lg shadow-rose-900/20">
+                <i class="fa-solid fa-fire mr-1.5 text-amber-400 animate-bounce"></i> Ending in &lt; 5m
+            </button>
         </div>
     </header>
 
@@ -134,19 +137,19 @@ HTML_DASHBOARD = """<!DOCTYPE html>
         <!-- Top KPI Metrics Banner -->
         <div id="stats-banner" class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
             <div class="bg-cardbg border border-bordercolor p-4 rounded-xl">
-                <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Auction Lots</div>
+                <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Total Active Lots</div>
                 <div id="stat-total-items" class="text-2xl font-bold mt-1 text-white">Loading...</div>
                 <div class="text-xs text-slate-500 mt-0.5">Phoenix & Mesa Combined</div>
             </div>
             <div class="bg-cardbg border border-bordercolor p-4 rounded-xl">
-                <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Retail Value</div>
+                <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Catalog Retail Value</div>
                 <div id="stat-total-retail" class="text-2xl font-bold mt-1 text-emerald-400">Loading...</div>
-                <div class="text-xs text-slate-500 mt-0.5">Catalog MSRP Total</div>
+                <div class="text-xs text-slate-500 mt-0.5">MSRP Total</div>
             </div>
             <div class="bg-cardbg border border-bordercolor p-4 rounded-xl">
                 <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Average Discount</div>
                 <div id="stat-avg-discount" class="text-2xl font-bold mt-1 text-amber-400">Loading...</div>
-                <div class="text-xs text-slate-500 mt-0.5">Off Retail Price</div>
+                <div class="text-xs text-slate-500 mt-0.5">Current vs Retail</div>
             </div>
             <div class="bg-cardbg border border-bordercolor p-4 rounded-xl">
                 <div class="text-xs font-medium text-slate-400 uppercase tracking-wider">Brand New Lots</div>
@@ -155,14 +158,14 @@ HTML_DASHBOARD = """<!DOCTYPE html>
             </div>
         </div>
 
-        <!-- TAB 1: DEAL FINDER / LOT BROWSER -->
+        <!-- TAB 1: DEAL FINDER & SNIPER BROWSER -->
         <section id="view-deals" class="space-y-6">
             <!-- Filter Controls -->
             <div class="bg-cardbg border border-bordercolor p-4 rounded-2xl space-y-4">
                 <div class="flex flex-col md:flex-row gap-3">
                     <div class="flex-1 relative">
                         <i class="fa-solid fa-magnifying-glass absolute left-3.5 top-3.5 text-slate-400"></i>
-                        <input type="text" id="filter-search" placeholder="Search keywords (e.g. DeWalt, Dyson, Lego, Monitor, Tent)..."
+                        <input type="text" id="filter-search" placeholder="Search keywords (e.g. DeWalt, Dyson, Lego, Monitor, Tent, Air Conditioner)..."
                                class="w-full bg-slate-900 border border-bordercolor rounded-xl pl-10 pr-4 py-2.5 text-sm text-white placeholder-slate-500 focus:outline-none focus:border-brand-500 transition">
                     </div>
                     <button onclick="triggerSearch()" class="px-5 py-2.5 bg-brand-600 hover:bg-brand-500 text-white text-sm font-semibold rounded-xl shadow-lg shadow-brand-600/20 transition flex items-center justify-center">
@@ -174,11 +177,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                 </div>
 
                 <!-- Dropdown / Pill Filters -->
-                <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-5 gap-3 pt-2 border-t border-bordercolor/60 text-xs">
+                <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-6 gap-3 pt-2 border-t border-bordercolor/60 text-xs">
+                    <!-- NEW TIME REMAINING FILTER -->
+                    <div class="col-span-2 sm:col-span-1">
+                        <label class="block text-amber-400 font-bold mb-1 flex items-center">
+                            <i class="fa-solid fa-stopwatch mr-1"></i> Time Remaining
+                        </label>
+                        <select id="filter-time-remaining" onchange="triggerSearch()" class="w-full bg-slate-900 border border-amber-500/50 rounded-lg px-2.5 py-1.5 text-amber-300 font-semibold focus:outline-none focus:border-amber-400">
+                            <option value="all">Any Time Remaining</option>
+                            <option value="5m">🔥 Ending in &lt; 5 mins</option>
+                            <option value="15m">⚡ Ending in &lt; 15 mins</option>
+                            <option value="30m">⏳ Ending in &lt; 30 mins</option>
+                            <option value="1h">⏱️ Ending in &lt; 1 hour</option>
+                            <option value="3h">Ending in &lt; 3 hours</option>
+                            <option value="today">Ending Today</option>
+                        </select>
+                    </div>
+
                     <div>
-                        <label class="block text-slate-400 font-medium mb-1">Warehouse Location</label>
+                        <label class="block text-slate-400 font-medium mb-1">Location</label>
                         <select id="filter-location" class="w-full bg-slate-900 border border-bordercolor rounded-lg px-2.5 py-1.5 text-slate-200">
-                            <option value="all">All Locations (Phoenix & Mesa)</option>
+                            <option value="all">Phoenix & Mesa</option>
                             <option value="Phoenix">Phoenix Only</option>
                             <option value="Mesa">Mesa Only</option>
                         </select>
@@ -197,25 +216,27 @@ HTML_DASHBOARD = """<!DOCTYPE html>
                         <input type="number" id="filter-min-retail" placeholder="e.g. 50" min="0" class="w-full bg-slate-900 border border-bordercolor rounded-lg px-2.5 py-1.5 text-slate-200">
                     </div>
                     <div>
-                        <label class="block text-slate-400 font-medium mb-1">Max Current Bid ($)</label>
-                        <input type="number" id="filter-max-bid" placeholder="e.g. 30" min="0" class="w-full bg-slate-900 border border-bordercolor rounded-lg px-2.5 py-1.5 text-slate-200">
+                        <label class="block text-slate-400 font-medium mb-1">Max Bid ($)</label>
+                        <input type="number" id="filter-max-bid" placeholder="e.g. 40" min="0" class="w-full bg-slate-900 border border-bordercolor rounded-lg px-2.5 py-1.5 text-slate-200">
                     </div>
                     <div>
                         <label class="block text-slate-400 font-medium mb-1">Sort Results By</label>
                         <select id="filter-sort" class="w-full bg-slate-900 border border-bordercolor rounded-lg px-2.5 py-1.5 text-slate-200">
+                            <option value="closing_soon">⏳ Closing Soonest (Sniper)</option>
                             <option value="discount_desc">Highest Discount %</option>
                             <option value="retail_desc">Highest Retail Value</option>
                             <option value="bid_asc">Lowest Current Bid</option>
-                            <option value="closing_soon">Closing Soonest</option>
                         </select>
                     </div>
                 </div>
             </div>
 
-            <!-- Results Count & Live List -->
+            <!-- Results Count & Live Status -->
             <div class="flex items-center justify-between text-xs text-slate-400 px-1">
-                <span id="results-count">Loading auction items...</span>
-                <span>Sorted by active filter</span>
+                <span id="results-count" class="font-medium text-slate-300">Loading auction items...</span>
+                <span class="flex items-center text-emerald-400 font-semibold">
+                    <span class="w-2 h-2 rounded-full bg-emerald-400 animate-ping mr-1.5"></span> Live countdown active
+                </span>
             </div>
 
             <!-- Items Cards Grid -->
@@ -311,6 +332,7 @@ ORDER BY total_lots DESC;</textarea>
 
     <script>
         let currentPage = 1;
+        let activeLots = [];
 
         function switchTab(tab) {
             ['deals', 'analytics', 'sql'].forEach(t => {
@@ -338,16 +360,74 @@ ORDER BY total_lots DESC;</textarea>
             }
         }
 
+        function formatCountdown(closeMs) {
+            const now = Date.now();
+            const diff = closeMs - now;
+            if (diff <= 0) {
+                return { text: "Closed", badgeClass: "bg-slate-800 text-slate-400 border-slate-700", isUrgent: false };
+            }
+            const totalSecs = Math.floor(diff / 1000);
+            const totalMins = Math.floor(totalSecs / 60);
+            const secs = totalSecs % 60;
+            const hours = Math.floor(totalMins / 60);
+            const mins = totalMins % 60;
+
+            if (totalMins < 5) {
+                return {
+                    text: `🔥 ${totalMins}m ${secs.toString().padStart(2, '0')}s left`,
+                    badgeClass: "bg-rose-950 text-rose-300 border-rose-500 font-black urgent-pulse",
+                    isUrgent: true
+                };
+            } else if (totalMins < 15) {
+                return {
+                    text: `⚡ ${totalMins}m ${secs.toString().padStart(2, '0')}s left`,
+                    badgeClass: "bg-amber-950 text-amber-300 border-amber-600 font-bold",
+                    isUrgent: true
+                };
+            } else if (hours < 1) {
+                return {
+                    text: `⏱️ ${totalMins}m left`,
+                    badgeClass: "bg-sky-950 text-sky-300 border-sky-700 font-semibold",
+                    isUrgent: false
+                };
+            } else if (hours < 24) {
+                return {
+                    text: `⏱️ ${hours}h ${mins}m left`,
+                    badgeClass: "bg-slate-900 text-slate-300 border-slate-700",
+                    isUrgent: false
+                };
+            } else {
+                const days = Math.floor(hours / 24);
+                return {
+                    text: `📅 ${days}d ${hours % 24}h left`,
+                    badgeClass: "bg-slate-900 text-slate-400 border-slate-800",
+                    isUrgent: false
+                };
+            }
+        }
+
+        // Live Countdown Tick Function (Updates DOM every second without re-rendering)
+        function updateLiveCountdowns() {
+            document.querySelectorAll('[data-close-ms]').forEach(el => {
+                const closeMs = Number(el.getAttribute('data-close-ms'));
+                const { text, badgeClass } = formatCountdown(closeMs);
+                el.innerText = text;
+                el.className = `px-2 py-0.5 rounded-lg text-[11px] border backdrop-blur ${badgeClass}`;
+            });
+        }
+        setInterval(updateLiveCountdowns, 1000);
+
         async function fetchItems() {
             const search = document.getElementById('filter-search').value;
             const location = document.getElementById('filter-location').value;
             const condition = document.getElementById('filter-condition').value;
+            const timeRemaining = document.getElementById('filter-time-remaining').value;
             const minRetail = document.getElementById('filter-min-retail').value;
             const maxBid = document.getElementById('filter-max-bid').value;
             const sort = document.getElementById('filter-sort').value;
 
             const params = new URLSearchParams({
-                search, location, condition, minRetail, maxBid, sort, page: currentPage, limit: 18
+                search, location, condition, timeRemaining, minRetail, maxBid, sort, page: currentPage, limit: 18
             });
 
             const grid = document.getElementById('items-grid');
@@ -356,45 +436,58 @@ ORDER BY total_lots DESC;</textarea>
             try {
                 const res = await fetch(`/api/items?${params.toString()}`);
                 const data = await res.json();
+                activeLots = data.items || [];
 
-                document.getElementById('results-count').innerText = `Showing ${data.items.length} of ${data.total.toLocaleString()} lots`;
+                document.getElementById('results-count').innerText = `Showing ${activeLots.length} of ${data.total.toLocaleString()} matching lots`;
                 document.getElementById('page-indicator').innerText = `Page ${currentPage} of ${Math.ceil(data.total / 18) || 1}`;
                 document.getElementById('btn-prev').disabled = currentPage <= 1;
                 document.getElementById('btn-next').disabled = currentPage >= Math.ceil(data.total / 18);
 
-                if (!data.items.length) {
+                if (!activeLots.length) {
                     grid.innerHTML = '<div class="col-span-full py-12 text-center text-slate-400">No auction items found matching your filters.</div>';
                     return;
                 }
 
-                grid.innerHTML = data.items.map(item => {
+                grid.innerHTML = activeLots.map(item => {
                     const discount = item.discount_pct ? `${Math.round(item.discount_pct)}% OFF` : 'N/A';
                     const isNew = item.condition_type === 'New';
                     const condClass = isNew ? 'bg-emerald-950 text-emerald-400 border-emerald-800' : 'bg-amber-950 text-amber-400 border-amber-800';
                     const imgUrl = item.photo_url || 'https://images.unsplash.com/photo-1586769852044-692d6e3703f0?w=300&h=300&fit=crop';
-                    
+                    const { text: timeText, badgeClass: timeBadgeClass } = formatCountdown(item.close_time_ms);
+
                     return `
-                    <div class="bg-cardbg border border-bordercolor rounded-2xl overflow-hidden hover:border-slate-500 transition-all flex flex-col group">
+                    <div class="bg-cardbg border border-bordercolor rounded-2xl overflow-hidden hover:border-slate-500 transition-all flex flex-col group shadow-md hover:shadow-xl">
                         <div class="h-48 w-full bg-slate-900 relative overflow-hidden flex items-center justify-center p-2">
                             <img src="${imgUrl}" alt="${item.title}" class="max-h-full max-w-full object-contain group-hover:scale-105 transition duration-300">
+                            
+                            <!-- Condition Tag -->
                             <span class="absolute top-2.5 left-2.5 px-2 py-0.5 rounded-full text-[11px] font-bold border ${condClass}">
                                 ${item.condition_type || 'Used'}
                             </span>
-                            <span class="absolute top-2.5 right-2.5 px-2 py-0.5 rounded-full text-[11px] font-bold bg-slate-900/80 text-slate-300 border border-bordercolor backdrop-blur">
-                                <i class="fa-solid fa-location-dot text-brand-500 mr-1"></i>${item.location_name}
+
+                            <!-- Time Remaining Countdown Pill -->
+                            <span data-close-ms="${item.close_time_ms}" class="absolute top-2.5 right-2.5 px-2 py-0.5 rounded-lg text-[11px] border backdrop-blur ${timeBadgeClass}">
+                                ${timeText}
                             </span>
+
+                            <!-- Discount Tag -->
                             <span class="absolute bottom-2.5 right-2.5 px-2 py-0.5 rounded-lg text-xs font-black bg-rose-600 text-white shadow">
                                 ${discount}
+                            </span>
+
+                            <!-- Warehouse Tag -->
+                            <span class="absolute bottom-2.5 left-2.5 px-2 py-0.5 rounded-lg text-[10px] font-semibold bg-slate-900/80 text-slate-300 border border-bordercolor backdrop-blur">
+                                <i class="fa-solid fa-location-dot text-brand-500 mr-1"></i>${item.location_name}
                             </span>
                         </div>
                         <div class="p-4 flex-1 flex flex-col justify-between space-y-3">
                             <div>
-                                <h3 class="text-xs font-semibold text-white line-clamp-2 title-tooltip" title="${item.title}">${item.title}</h3>
+                                <h3 class="text-xs font-semibold text-white line-clamp-2" title="${item.title}">${item.title}</h3>
                                 ${item.inspector_notes ? `<p class="text-[11px] text-amber-300/90 line-clamp-1 mt-1 bg-amber-950/40 px-2 py-0.5 rounded border border-amber-800/40"><i class="fa-solid fa-triangle-exclamation mr-1"></i>${item.inspector_notes}</p>` : ''}
                             </div>
                             <div class="pt-2 border-t border-bordercolor/60 flex items-center justify-between">
                                 <div>
-                                    <div class="text-[10px] text-slate-400">Current Bid</div>
+                                    <div class="text-[10px] text-slate-400">Winning / Current Bid</div>
                                     <div class="text-base font-black text-white">$${item.winning_bid_amount.toFixed(2)}</div>
                                 </div>
                                 <div class="text-right">
@@ -402,8 +495,8 @@ ORDER BY total_lots DESC;</textarea>
                                     <div class="text-xs font-bold text-slate-400 line-through">$${item.estimated_retail_price.toFixed(2)}</div>
                                 </div>
                             </div>
-                            <a href="${item.item_url}" target="_blank" class="w-full text-center py-2 bg-slate-900 hover:bg-brand-600 border border-bordercolor hover:border-brand-500 text-xs font-semibold rounded-xl text-white transition">
-                                View Lot on Nellis <i class="fa-solid fa-arrow-up-right-from-square ml-1 text-[10px]"></i>
+                            <a href="${item.item_url}" target="_blank" class="w-full text-center py-2 bg-slate-900 hover:bg-brand-600 border border-bordercolor hover:border-brand-500 text-xs font-semibold rounded-xl text-white transition flex items-center justify-center">
+                                View Lot on Nellis <i class="fa-solid fa-arrow-up-right-from-square ml-1.5 text-[10px]"></i>
                             </a>
                         </div>
                     </div>
@@ -416,6 +509,13 @@ ORDER BY total_lots DESC;</textarea>
             }
         }
 
+        function quickFilterSniper() {
+            document.getElementById('filter-time-remaining').value = '5m';
+            document.getElementById('filter-sort').value = 'closing_soon';
+            switchTab('deals');
+            triggerSearch();
+        }
+
         function triggerSearch() {
             currentPage = 1;
             fetchItems();
@@ -425,9 +525,10 @@ ORDER BY total_lots DESC;</textarea>
             document.getElementById('filter-search').value = '';
             document.getElementById('filter-location').value = 'all';
             document.getElementById('filter-condition').value = 'all';
+            document.getElementById('filter-time-remaining').value = 'all';
             document.getElementById('filter-min-retail').value = '';
             document.getElementById('filter-max-bid').value = '';
-            document.getElementById('filter-sort').value = 'discount_desc';
+            document.getElementById('filter-sort').value = 'closing_soon';
             currentPage = 1;
             fetchItems();
         }
@@ -513,7 +614,6 @@ ORDER BY total_lots DESC;</textarea>
             a.click();
         }
 
-        // Initialize on load
         window.onload = () => {
             loadStats();
             fetchItems();
@@ -526,7 +626,6 @@ ORDER BY total_lots DESC;</textarea>
 
 class DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Quiet logger
         return
 
     def do_GET(self):
@@ -597,9 +696,10 @@ class DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         search = params.get("search", [""])[0].strip()
         location = params.get("location", ["all"])[0].strip()
         condition = params.get("condition", ["all"])[0].strip()
+        time_remaining = params.get("timeRemaining", ["all"])[0].strip()
         min_retail = params.get("minRetail", [""])[0].strip()
         max_bid = params.get("maxBid", [""])[0].strip()
-        sort = params.get("sort", ["discount_desc"])[0].strip()
+        sort = params.get("sort", ["closing_soon"])[0].strip()
         page = int(params.get("page", ["1"])[0])
         limit = int(params.get("limit", ["18"])[0])
         offset = (page - 1) * limit
@@ -610,6 +710,28 @@ class DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
 
         where_clauses = []
         sql_params = []
+
+        now_ms = int(time.time() * 1000)
+
+        # Time remaining filter logic
+        if time_remaining == "5m":
+            where_clauses.append("close_time_ms >= ? AND close_time_ms <= ?")
+            sql_params.extend([now_ms, now_ms + (5 * 60 * 1000)])
+        elif time_remaining == "15m":
+            where_clauses.append("close_time_ms >= ? AND close_time_ms <= ?")
+            sql_params.extend([now_ms, now_ms + (15 * 60 * 1000)])
+        elif time_remaining == "30m":
+            where_clauses.append("close_time_ms >= ? AND close_time_ms <= ?")
+            sql_params.extend([now_ms, now_ms + (30 * 60 * 1000)])
+        elif time_remaining == "1h":
+            where_clauses.append("close_time_ms >= ? AND close_time_ms <= ?")
+            sql_params.extend([now_ms, now_ms + (60 * 60 * 1000)])
+        elif time_remaining == "3h":
+            where_clauses.append("close_time_ms >= ? AND close_time_ms <= ?")
+            sql_params.extend([now_ms, now_ms + (3 * 3600 * 1000)])
+        elif time_remaining == "today":
+            where_clauses.append("close_time_ms >= ? AND close_time_ms <= ?")
+            sql_params.extend([now_ms, now_ms + (24 * 3600 * 1000)])
 
         if search:
             where_clauses.append("(title LIKE ? OR inspector_notes LIKE ?)")
@@ -640,21 +762,19 @@ class DashboardRequestHandler(http.server.BaseHTTPRequestHandler):
         where_sql = (" WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
 
         sort_map = {
+            "closing_soon": "close_time_ms ASC",
             "discount_desc": "discount_pct DESC",
             "retail_desc": "estimated_retail_price DESC",
-            "bid_asc": "winning_bid_amount ASC",
-            "closing_soon": "close_time_ms ASC"
+            "bid_asc": "winning_bid_amount ASC"
         }
-        order_sql = f" ORDER BY {sort_map.get(sort, 'discount_pct DESC')}"
+        order_sql = f" ORDER BY {sort_map.get(sort, 'close_time_ms ASC')}"
 
-        # Get total count
         cursor.execute(f"SELECT COUNT(*) FROM auction_items {where_sql}", sql_params)
         total_count = cursor.fetchone()[0]
 
-        # Get page records
         query = f"""
             SELECT id, title, condition_type, winning_bid_amount, estimated_retail_price,
-                   discount_pct, location_name, inspector_notes, item_url, photo_url
+                   discount_pct, close_time_ms, closing_date, location_name, inspector_notes, item_url, photo_url
             FROM auction_items
             {where_sql}
             {order_sql}
@@ -721,8 +841,7 @@ def start_server():
 def main():
     url = f"http://localhost:{PORT}"
     print(f"[*] Starting local server on port {PORT}...")
-    
-    # Launch browser automatically
+
     def open_browser():
         time.sleep(1)
         webbrowser.open(url)
