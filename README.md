@@ -1,62 +1,142 @@
-# Nellis Auction Scraper & Finalizer (Phoenix & Mesa, AZ)
+# Nellis Auction Data Lake & Analytics Pipeline
 
-Automated Python scraper and GitHub Actions workflow to scrape, track, and analyze auction listings from [nellisauction.com](https://www.nellisauction.com) across **Phoenix** and **Mesa, AZ** warehouses into a local SQLite database.
+An automated, $0-cost serverless data lake and analytical query pipeline that scrapes completed and active auction lots from **Nellis Auction** (specifically targeting **Phoenix** and **Mesa, AZ** warehouses), stores them in a compressed columnar data lake on **Cloudflare R2**, and enables sub-second analytical SQL queries via **DuckDB**.
 
-## Architecture & Lifecycle
+---
 
-1. **Morning / Afternoon Catalog Scrape (10:00 AM MST)**:
-   - Queries active listings across Phoenix & Mesa.
-   - Captures item ID, title, description, condition, inspection notes, MSRP retail price, and scheduled closing time.
-   - Inserts records into `auction_items` table with `is_closed = 0`.
-2. **Night Finalization (~10:30 PM MST)**:
-   - Queries all items in the database that reached or passed their closing time.
-   - Fetches their direct endpoint to record the **official winning bid**, **final bid count**, and updates `is_closed = 1`, `market_status = 'sold'`.
-   - Captures soft-close overtime extensions (`was_extended = 1`).
+## 1. Architecture Overview
 
-## Captured Attributes
-
-| Attribute | Column | Description |
-|---|---|---|
-| **Closing Date** | `closing_date` | Formatted Arizona local time (`YYYY-MM-DD HH:MM:SS MST`) |
-| **Title** | `title` | Listing title |
-| **Description** | `description` | Formatted condition, functionality, and inspector notes |
-| **Bids** | `bid_total` | Total bids placed |
-| **Winning Bid** | `winning_bid_amount` | Current or winning bid amount ($) |
-| **Retail Price** | `estimated_retail_price` | Suggested retail price ($) |
-| **Discount %** | `discount_pct` | Calculated percentage discount vs retail |
-| **Inventory #** | `inventory_number` | Unique Nellis inventory number |
-| **Condition** | `condition_type` | `New`, `Used`, `Open Box` |
-| **Star Rating** | `condition_rating` | Numerical condition rating (1 to 5) |
-| **Functional?** | `is_functional` | `Yes`, `No`, `Untested` |
-| **Damage** | `damage_type` | `None`, `Minor`, `Major` |
-| **Missing Parts** | `missing_parts` | `No`, `Partial Set`, `Missing Parts` |
-| **In Package** | `in_package` | `Yes`, `No` |
-| **Assembly** | `assembly_required` | `Yes`, `No` |
-| **Inspector Notes**| `inspector_notes` | Raw notes from Nellis inspection crew |
-| **Status** | `market_status` | `open`, `sold`, `closed`, `relisted` |
-| **Location** | `location_name` | `Phoenix` or `Mesa` |
-| **Item URL** | `item_url` | Direct link to product listing |
-| **Photos** | `photo_count`, `photo_url`, `all_photos_json` | Primary URL and JSON array of all inspection photos |
-
-## Running Locally
-
-```powershell
-# Scrape all active items in Phoenix and Mesa
-python nellis_scraper.py
-
-# Finalize items whose close time has passed
-python nellis_scraper.py --finalize
-
-# Test run with limit
-python nellis_scraper.py --limit 50
-
-# Export to CSV
-python nellis_scraper.py --export-csv nellis_auctions.csv
+```text
+                                  +-----------------------------+
+                                  |   Nellis Auction API        |
+                                  |   (Phoenix & Mesa, AZ)      |
+                                  +--------------+--------------+
+                                                 |
+                                                 v
+                                  +-----------------------------+
+                                  |   GitHub Actions Runner     |
+                                  |   (Scheduled 11:30 PM MST)  |
+                                  +--------------+--------------+
+                                                 |
+                       +-------------------------+-------------------------+
+                       |                                                   |
+                       v                                                   v
+        +-----------------------------+                     +-----------------------------+
+        |   dim_products Transform    |                     |   fact_auctions Transform   |
+        |   (SHA-256 Deduplication)   |                     |   (Pricing & Temporal MST)  |
+        +--------------+--------------+                     +--------------+--------------+
+                       |                                                   |
+                       +-------------------------+-------------------------+
+                                                 | (DuckDB / PyArrow ZSTD Parquet)
+                                                 v
+                                  +-----------------------------+
+                                  |   Cloudflare R2 Bucket      |
+                                  |   (s3://nellis-auction-lake)|
+                                  +--------------+--------------+
+                                                 |
+                                                 | (DuckDB httpfs Range Requests)
+                                                 v
+                                  +-----------------------------+
+                                  |   Analytical SQL Queries    |
+                                  |   (Arbitrage, Sweet Spots)  |
+                                  +-----------------------------+
 ```
 
-## GitHub Actions Automation
+---
 
-The included workflow runs automatically on GitHub:
-- **10:00 AM MST (17:00 UTC)**: Daily Catalog Scrape
-- **10:30 PM MST (05:30 UTC)**: Daily Finalization
-- **Manual Trigger**: Can be run on-demand anytime from the **Actions** tab in GitHub!
+## 2. Storage Layout (Hive-Partitioned Parquet)
+
+Data is stored in **Cloudflare R2** under Hive-partitioned directories for high partition-pruning performance:
+
+```text
+s3://nellis-auction-lake/
+├── dim_products/
+│   └── products_catalog.parquet          # Deduplicated product catalog (upserted daily)
+└── fact_auctions/
+    └── year=2026/
+        └── month=11/
+            ├── auctions_2026-11-11.parquet
+            ├── auctions_2026-11-12.parquet
+            └── ...
+```
+
+---
+
+## 3. Star Schema Design
+
+### `dim_products` (Deduplicated Product Catalog)
+Separates heavy text strings and descriptions from daily transaction facts to compress storage by ~60%:
+
+| Column | Type | Description |
+|---|---|---|
+| `product_id` | `VARCHAR (PK)` | Deterministic SHA-256 hash of normalized title + retail price |
+| `title` | `VARCHAR` | Full product name |
+| `brand` | `VARCHAR` | Extracted / listed brand name |
+| `category_primary` | `VARCHAR` | Primary category (`taxonomyLevel1`) |
+| `category_secondary` | `VARCHAR` | Sub-category (`taxonomyLevel2`) |
+| `base_retail_price` | `DECIMAL(10,2)`| Standard listed retail price |
+| `description` | `TEXT` | Product descriptions & bullet features |
+| `first_seen_date` | `DATE` | Date product was first scraped (`YYYY-MM-DD`) |
+
+### `fact_auctions` (Daily Completed Lots)
+Lean, numeric-heavy table accumulating ~30,000–35,000 rows/day:
+
+| Column | Type | Description |
+|---|---|---|
+| `auction_id` | `BIGINT (PK)` | Unique Nellis lot ID |
+| `product_id` | `VARCHAR (FK)` | Links to `dim_products.product_id` |
+| `location` | `VARCHAR` | Warehouse location (`Phoenix`, `Mesa`) |
+| `condition` | `VARCHAR` | Standardized condition (`Brand New`, `Used`, `Damaged`, `Untested`) |
+| `completeness` | `VARCHAR` | `Complete`, `Missing Parts`, `Partial Set` |
+| `functional_status`| `VARCHAR` | `Tested - Works`, `Untested`, `Not Functional` |
+| `damage_notes` | `VARCHAR` | Raw inspector notes from Nellis team |
+| `retail_price` | `DECIMAL(10,2)`| Retail price listed on this specific lot |
+| `final_price` | `DECIMAL(10,2)`| Winning hammer price ($) |
+| `discount_ratio` | `DECIMAL(5,4)` | Computed `final_price / NULLIF(retail_price, 0)` |
+| `bid_count` | `INTEGER` | Total number of bids placed |
+| `unique_bidders` | `INTEGER` | Estimated count of unique competing bidders |
+| `closed_at` | `TIMESTAMP` | Exact closing timestamp |
+| `close_day_of_week`| `TINYINT` | `0` (Sunday) through `6` (Saturday) |
+| `close_hour` | `TINYINT` | `0` through `23` (Arizona MST hour) |
+| `scraped_date` | `DATE` | Partition date (`YYYY-MM-DD`) |
+
+---
+
+## 4. Querying the Data Lake with DuckDB
+
+DuckDB connects directly to Cloudflare R2 using the `httpfs` extension and executes sub-second queries over the Parquet files without downloading the entire dataset:
+
+### Running Pre-Built Analytical Models
+```powershell
+# 1. Category Value Spreads (Categories & brands with lowest median discount ratio)
+python -m src.query_lake --query category-spread
+
+# 2. Condition Risk Arbitrage (Brand New vs. Used vs. Damaged pricing discount)
+python -m src.query_lake --query condition-arbitrage
+
+# 3. Temporal Sweet Spots (Day of week & hour competition heatmaps)
+python -m src.query_lake --query temporal
+
+# 4. Sleeper / Low-Bid Hunting (Retail > $150, Bids <= 10, Discount Ratio <= 0.25)
+python -m src.query_lake --query sleepers
+```
+
+### Running Custom SQL Queries
+```powershell
+python -m src.query_lake --sql "SELECT p.title, f.final_price, f.retail_price, f.discount_ratio FROM fact_auctions f JOIN dim_products p ON f.product_id = p.product_id WHERE f.discount_ratio < 0.10 ORDER BY f.retail_price DESC LIMIT 10"
+```
+
+### Interactive SQL Shell
+```powershell
+python -m src.query_lake --interactive
+```
+
+---
+
+## 5. Daily Ingestion Pipeline (GitHub Actions)
+
+The workflow runs on GitHub Actions at `30 6 * * *` UTC (11:30 PM Arizona MST):
+1. Executes concurrent requests to fetch all Mesa and Phoenix auction lots from the past 24 hours.
+2. Normalizes records and updates `dim_products/products_catalog.parquet`.
+3. Appends the day's batch to `fact_auctions/year=YYYY/month=MM/auctions_YYYY-MM-DD.parquet`.
+4. Executes verification queries against the lake via DuckDB.
