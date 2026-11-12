@@ -1,2 +1,6 @@
-# Standard library only - no external dependencies required!
-# Python 3.10+ compatible
+# Nellis Auction Data Lake & Analytics Dependencies
+duckdb>=0.9.0
+pyarrow>=14.0.0
+pandas>=2.0.0
+boto3>=1.30.0
+pynacl>=1.5.0
