@@ -126,11 +126,27 @@ def fetch_live_nellis_sniper(page_size=120):
                     photos = p.get('photos') or []
                     photo_url = photos[0].get('url', '') if photos and isinstance(photos[0], dict) else ''
 
+                    # Clean condition parsing from grade object
+                    grade_obj = p.get('grade')
+                    condition_str = "Standard"
+                    if isinstance(grade_obj, dict):
+                        c_type = grade_obj.get('conditionType', {})
+                        c_desc = c_type.get('description', '') if isinstance(c_type, dict) else ''
+                        rating = grade_obj.get('rating')
+                        if c_desc in ['New', 'Brand New'] or rating == 5:
+                            condition_str = "Brand New (5/5)"
+                        elif c_desc:
+                            condition_str = f"{c_desc} ({rating}/5)" if rating else c_desc
+                        elif rating:
+                            condition_str = f"Rated {rating}/5"
+                    elif isinstance(grade_obj, str) and grade_obj:
+                        condition_str = grade_obj
+
                     items.append({
                         'auction_id': p.get('id'),
                         'title': p.get('title', 'Unknown Item'),
                         'location': loc_name,
-                        'condition': p.get('grade') or 'Standard',
+                        'condition': condition_str,
                         'retail_price': retail,
                         'final_price': bid,
                         'discount_pct': round(discount_pct, 1),
@@ -383,8 +399,26 @@ if view_mode == "🎯 Deal Finder":
                     st.markdown(f"[👉 **Place Bid on Nellis Auction**]({item_url})")
 
                 with c_card2:
-                    cond_color = "🟢" if row['condition'] in ["Brand New", "Good"] else "🟡"
-                    st.write(f"{cond_color} **{row['condition']}** · 📍 {row['location']}")
+                    raw_cond = str(row.get('condition', 'Standard'))
+                    cond_display = raw_cond
+                    if raw_cond.startswith("{"):
+                        import ast
+                        try:
+                            g = ast.literal_eval(raw_cond)
+                            c_type = g.get('conditionType', {})
+                            c_desc = c_type.get('description', '') if isinstance(c_type, dict) else ''
+                            rat = g.get('rating')
+                            if c_desc in ['New', 'Brand New'] or rat == 5:
+                                cond_display = "Brand New (5/5)"
+                            elif c_desc:
+                                cond_display = f"{c_desc} ({rat}/5)" if rat else c_desc
+                            elif rat:
+                                cond_display = f"Rated {rat}/5"
+                        except Exception:
+                            cond_display = "Standard"
+
+                    cond_color = "🟢" if any(w in cond_display.lower() for w in ["brand new", "new", "5/5"]) else "🟡"
+                    st.write(f"{cond_color} **{cond_display}** · 📍 {row['location']}")
                     st.markdown(f"{time_badge}")
                     st.caption(f"Bids: **{row['bid_count']}** · Closes: {str(row['closed_at'])[:19]}")
 
