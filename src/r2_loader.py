@@ -83,6 +83,10 @@ def write_fact_auctions(fact_records: list, scrape_date: str = None, use_r2: boo
     df["close_day_of_week"] = df["close_day_of_week"].astype("Int8")
     df["close_hour"] = df["close_hour"].astype("Int8")
     df["scraped_date"] = pd.to_datetime(df["scraped_date"]).dt.date
+    if "photo_url" in df.columns:
+        df["photo_url"] = df["photo_url"].fillna("").astype("string")
+    else:
+        df["photo_url"] = ""
 
     con = get_configured_duckdb_conn()
 
@@ -93,13 +97,42 @@ def write_fact_auctions(fact_records: list, scrape_date: str = None, use_r2: boo
         os.makedirs(local_dir, exist_ok=True)
         target_path = os.path.join(local_dir, f"auctions_{scrape_date}.parquet").replace("\\", "/")
 
-    print(f"[*] Writing {len(df)} fact records to: {target_path}...")
     con.register("daily_facts_view", df)
-    con.execute(f"""
-        COPY daily_facts_view TO '{target_path}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
-    """)
+
+    # Check if partition already exists so we can upsert and preserve earlier closed lots
+    partition_exists = False
+    try:
+        con.execute(f"SELECT COUNT(*) FROM '{target_path}'")
+        partition_exists = True
+    except Exception:
+        partition_exists = False
+
+    if partition_exists:
+        print(f"[*] Merging {len(df)} fact records into existing partition: {target_path}...")
+        con.execute(f"""
+            CREATE OR REPLACE TEMP TABLE merged_facts AS
+            WITH combined AS (
+                SELECT * FROM daily_facts_view
+                UNION ALL BY NAME
+                SELECT * FROM '{target_path}'
+            )
+            SELECT DISTINCT ON (auction_id) *
+            FROM combined
+            ORDER BY auction_id, final_price DESC, bid_count DESC;
+        """)
+        con.execute(f"""
+            COPY merged_facts TO '{target_path}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
+        """)
+        total_rows = con.execute("SELECT COUNT(*) FROM merged_facts").fetchone()[0]
+        print(f"[✓] Successfully merged fact_auctions Parquet ({total_rows:,} total rows)")
+    else:
+        print(f"[*] Writing {len(df)} fact records to: {target_path}...")
+        con.execute(f"""
+            COPY daily_facts_view TO '{target_path}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
+        """)
+        print(f"[✓] Successfully wrote fact_auctions Parquet ({len(df):,} rows)")
+
     con.close()
-    print(f"[✓] Successfully wrote fact_auctions Parquet ({len(df)} rows)")
     return target_path
 
 
@@ -121,6 +154,10 @@ def merge_dim_products(new_products: list, use_r2: bool = True) -> str:
     df_new["base_retail_price"] = df_new["base_retail_price"].astype("float64")
     df_new["description"] = df_new["description"].astype("string")
     df_new["first_seen_date"] = pd.to_datetime(df_new["first_seen_date"]).dt.date
+    if "photo_url" in df_new.columns:
+        df_new["photo_url"] = df_new["photo_url"].fillna("").astype("string")
+    else:
+        df_new["photo_url"] = ""
 
     con = get_configured_duckdb_conn()
 
@@ -155,7 +192,8 @@ def merge_dim_products(new_products: list, use_r2: bool = True) -> str:
                     COALESCE(NULLIF(n.category_secondary, ''), o.category_secondary) AS category_secondary,
                     COALESCE(NULLIF(n.base_retail_price, 0.0), o.base_retail_price) AS base_retail_price,
                     COALESCE(NULLIF(n.description, ''), o.description) AS description,
-                    COALESCE(o.first_seen_date, n.first_seen_date) AS first_seen_date
+                    COALESCE(o.first_seen_date, n.first_seen_date) AS first_seen_date,
+                    COALESCE(NULLIF(n.photo_url, ''), o.photo_url) AS photo_url
                 FROM '{catalog_path}' o
                 FULL OUTER JOIN new_products_view n ON o.product_id = n.product_id
             )
