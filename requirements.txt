@@ -1,0 +1,2 @@
+# Standard library only - no external dependencies required!
+# Python 3.10+ compatible
