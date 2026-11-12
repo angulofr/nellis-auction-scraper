@@ -22,8 +22,8 @@ PORT = 8501
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SQLITE_DB = os.path.join(BASE_DIR, "nellis_auctions.db")
 
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "8716bfa9053104690f8b939b7a8218d0")
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "41b6f9dbb1ff938f1a057d4fb3874344f4ff3071a5e3dd6d387d8163e0893ff8")
+R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "https://965a5411101d1521c551d99d9421a145.r2.cloudflarestorage.com")
 R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "nellis-auction-lake")
 
