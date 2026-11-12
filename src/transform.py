@@ -160,7 +160,8 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
             "closed_at": closed_at_iso,
             "close_day_of_week": close_day_of_week,
             "close_hour": close_hour,
-            "scraped_date": scrape_date
+            "scraped_date": scrape_date,
+            "photo_url": item.get("photo_url") or ""
         }
         fact_auctions.append(fact_record)
 
@@ -174,7 +175,8 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
                 "category_secondary": item.get("subcategory") or item.get("taxonomyLevel2") or "",
                 "base_retail_price": retail_price,
                 "description": item.get("catalog_description") or item.get("description") or "",
-                "first_seen_date": scrape_date
+                "first_seen_date": scrape_date,
+                "photo_url": item.get("photo_url") or ""
             }
 
     return list(dim_products_map.values()), fact_auctions
