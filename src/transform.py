@@ -143,6 +143,11 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
         # Unique bidders: estimated as min(bid_count, max(1, int(bid_count * 0.65)))
         unique_bidders = item.get("unique_bidders") or (min(bid_count, max(1, int(bid_count * 0.65))) if bid_count > 0 else 0)
 
+        # Photo URL extraction (supports both SQLite photo_url and raw Nellis photos array)
+        photos_arr = item.get("photos") if isinstance(item.get("photos"), list) else []
+        first_photo = photos_arr[0].get("url", "") if photos_arr and isinstance(photos_arr[0], dict) else ""
+        photo_url = item.get("photo_url") or first_photo or ""
+
         # 1. Fact Table Record
         fact_record = {
             "auction_id": auction_id,
@@ -161,7 +166,7 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
             "close_day_of_week": close_day_of_week,
             "close_hour": close_hour,
             "scraped_date": scrape_date,
-            "photo_url": item.get("photo_url") or ""
+            "photo_url": photo_url
         }
         fact_auctions.append(fact_record)
 
@@ -176,7 +181,7 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
                 "base_retail_price": retail_price,
                 "description": item.get("catalog_description") or item.get("description") or "",
                 "first_seen_date": scrape_date,
-                "photo_url": item.get("photo_url") or ""
+                "photo_url": photo_url
             }
 
     return list(dim_products_map.values()), fact_auctions
