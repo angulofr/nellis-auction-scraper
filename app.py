@@ -235,11 +235,86 @@ if view_mode == "🎯 Deal Finder":
             ]
         )
 
+    # Initialize synced state for dual slider + direct typing inputs
+    if "min_retail_val" not in st.session_state:
+        st.session_state.min_retail_val = 25
+    if "max_bid_val" not in st.session_state:
+        st.session_state.max_bid_val = 200
+
+    def on_slider_min_change():
+        val = st.session_state["slider_min"]
+        st.session_state.min_retail_val = val
+        st.session_state["input_min"] = val
+
+    def on_input_min_change():
+        val = st.session_state["input_min"]
+        st.session_state.min_retail_val = val
+        st.session_state["slider_min"] = min(2000, val)
+
+    def on_slider_max_change():
+        val = st.session_state["slider_max"]
+        st.session_state.max_bid_val = val
+        st.session_state["input_max"] = val
+
+    def on_input_max_change():
+        val = st.session_state["input_max"]
+        st.session_state.max_bid_val = val
+        st.session_state["slider_max"] = min(1000, val)
+
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        min_retail = st.slider("Minimum Retail MSRP ($)", min_value=0, max_value=2000, value=25, step=25)
+        st.markdown("**Minimum Retail MSRP ($)**")
+        c_s1, c_n1 = st.columns([3, 2])
+        with c_s1:
+            st.slider(
+                "Slide Min MSRP",
+                min_value=0,
+                max_value=2000,
+                value=min(2000, st.session_state.min_retail_val),
+                step=25,
+                key="slider_min",
+                on_change=on_slider_min_change,
+                label_visibility="collapsed"
+            )
+        with c_n1:
+            st.number_input(
+                "Type Min MSRP",
+                min_value=0,
+                max_value=10000,
+                value=st.session_state.min_retail_val,
+                step=5,
+                key="input_min",
+                on_change=on_input_min_change,
+                label_visibility="collapsed"
+            )
+        min_retail = st.session_state.min_retail_val
+
     with col_p2:
-        max_bid = st.slider("Maximum Current / Winning Bid ($)", min_value=1, max_value=1000, value=200, step=10)
+        st.markdown("**Maximum Current / Winning Bid ($)**")
+        c_s2, c_n2 = st.columns([3, 2])
+        with c_s2:
+            st.slider(
+                "Slide Max Bid",
+                min_value=1,
+                max_value=1000,
+                value=min(1000, st.session_state.max_bid_val),
+                step=10,
+                key="slider_max",
+                on_change=on_slider_max_change,
+                label_visibility="collapsed"
+            )
+        with c_n2:
+            st.number_input(
+                "Type Max Bid",
+                min_value=1,
+                max_value=5000,
+                value=st.session_state.max_bid_val,
+                step=5,
+                key="input_max",
+                on_change=on_input_max_change,
+                label_visibility="collapsed"
+            )
+        max_bid = st.session_state.max_bid_val
 
     # Determine whether to use Real-Time Live API or Data Lake
     is_live_sniper = time_filter in [
