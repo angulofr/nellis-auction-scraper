@@ -4,7 +4,10 @@ Nellis Auction Data Lake & Deal Finder App
 Cloud-ready Streamlit application queryable from phone, tablet, or desktop.
 """
 
+import json
 import os
+import time
+import urllib.request
 import duckdb
 import pandas as pd
 import streamlit as st
@@ -46,6 +49,104 @@ def get_duckdb_con():
 
 con = get_duckdb_con()
 
+
+def unflatten_val(idx, data):
+    """Decode Turbo-Stream JSON graph indices."""
+    if not isinstance(idx, int) or idx < 0 or idx >= len(data):
+        return None
+    val = data[idx]
+    if isinstance(val, (int, float, str, bool)) or val is None:
+        return val
+    if isinstance(val, list):
+        if len(val) == 2 and val[0] == 'D' and isinstance(val[1], (int, float)):
+            return val[1]
+        return [unflatten_val(i, data) for i in val]
+    if isinstance(val, dict):
+        res = {}
+        for k, v in val.items():
+            key = k
+            if k.startswith("_"):
+                try:
+                    k_idx = int(k[1:])
+                    if 0 <= k_idx < len(data):
+                        key = str(data[k_idx])
+                except ValueError:
+                    pass
+            res[key] = unflatten_val(v, data)
+        return res
+    return val
+
+
+@st.cache_data(ttl=5)
+def fetch_live_nellis_sniper(page_size=120):
+    """
+    Fetch real-time active lots ending soonest directly from Nellis Auction's API.
+    Guarantees up-to-the-second current winning bids and anti-snipe countdowns.
+    """
+    try:
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
+        # Set Phoenix/Mesa shopping location
+        req_loc = urllib.request.Request(
+            'https://www.nellisauction.com/change-shopping-location',
+            data=b'shoppingLocationId=2',
+            headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded'}
+        )
+        opener.open(req_loc, timeout=10)
+
+        url = f'https://www.nellisauction.com/search.data?sortBy=time_remaining_asc&_p1=s:{page_size},n:1'
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with opener.open(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        now_ms = int(time.time() * 1000)
+        items = []
+        for i, el in enumerate(data):
+            if el == 'products' and i + 1 < len(data):
+                for idx in data[i + 1]:
+                    p = unflatten_val(idx, data)
+                    if not p or p.get('isClosed', False):
+                        continue
+                    
+                    raw_close = p.get('closeTime')
+                    if isinstance(raw_close, list) and raw_close:
+                        raw_close = raw_close[0]
+                    try:
+                        close_ms = int(raw_close)
+                    except (ValueError, TypeError):
+                        continue
+
+                    diff_sec = (close_ms - now_ms) / 1000.0
+                    
+                    loc_dict = p.get('location') if isinstance(p.get('location'), dict) else {}
+                    loc_name = loc_dict.get('name', 'Phoenix')
+                    retail = float(p.get('retailPrice') or 0.0)
+                    bid = float(p.get('currentPrice') or 0.0)
+                    discount_pct = ((retail - bid) / retail * 100.0) if retail > 0 and bid <= retail else 0.0
+                    
+                    photos = p.get('photos') or []
+                    photo_url = photos[0].get('url', '') if photos and isinstance(photos[0], dict) else ''
+
+                    items.append({
+                        'auction_id': p.get('id'),
+                        'title': p.get('title', 'Unknown Item'),
+                        'location': loc_name,
+                        'condition': p.get('grade') or 'Standard',
+                        'retail_price': retail,
+                        'final_price': bid,
+                        'discount_pct': round(discount_pct, 1),
+                        'bid_count': p.get('bidCount', 0),
+                        'damage_notes': p.get('notes') or '',
+                        'diff_sec': diff_sec,
+                        'photo_url': photo_url,
+                        'closed_at': pd.to_datetime(close_ms, unit='ms', utc=True).tz_convert('America/Phoenix')
+                    })
+                break
+        return pd.DataFrame(items)
+    except Exception as e:
+        print(f"Error fetching live sniper items: {e}")
+        return pd.DataFrame()
+
+
 # --- SIDEBAR CONTROLS ---
 st.sidebar.title("🔨 Nellis Auction Lake")
 st.sidebar.caption("Phoenix & Mesa, AZ Analytics")
@@ -72,19 +173,20 @@ st.sidebar.markdown("---")
 view_mode = st.sidebar.radio("Navigation", ["🎯 Deal Finder", "📊 Analytics Hub", "💻 SQL Studio"])
 
 st.sidebar.markdown("---")
-st.sidebar.caption("Cloud Storage: Cloudflare R2 (S3)\nQuery Engine: DuckDB 2.0 (httpfs)")
+st.sidebar.caption("Cloud Storage: Cloudflare R2 (S3)\nQuery Engine: DuckDB 2.0 (httpfs)\nLive Feed: Nellis Turbo-Stream API")
 
 
 # --- TAB 1: DEAL FINDER ---
 if view_mode == "🎯 Deal Finder":
     st.title("🎯 Nellis Auction Deal Finder & Sniper")
-    st.caption("Live & completed lots from Phoenix & Mesa warehouses with instant countdowns")
+    st.caption("Live & historical lots from Phoenix & Mesa warehouses with instant countdowns and real photos")
 
-    col_top1, col_top2 = st.columns([4, 1])
+    col_top1, col_top2 = st.columns([4, 1.2])
     with col_top1:
-        st.markdown("Find liquidation deals, sort by urgency, or filter by items ending in the next few minutes.")
+        st.markdown("Search active lots, filter by ending time, and snipe underpriced items before the hammer closes.")
     with col_top2:
-        if st.button("🔄 Refresh Deals", use_container_width=True):
+        if st.button("🔄 Refresh Live Data", use_container_width=True, type="primary"):
+            st.cache_data.clear()
             st.rerun()
 
     col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 2])
@@ -98,11 +200,11 @@ if view_mode == "🎯 Deal Finder":
         time_filter = st.selectbox(
             "⏳ Time Remaining",
             [
-                "All Active Lots",
-                "🔥 Ending in < 5 mins (Sniper)",
-                "⚡ Ending in < 15 mins",
-                "⏳ Ending in < 30 mins",
-                "🕒 Ending in < 1 hour",
+                "🔥 Ending in < 5 mins (Live)",
+                "⚡ Ending in < 15 mins (Live)",
+                "⏳ Ending in < 30 mins (Live)",
+                "🕒 Ending in < 1 hour (Live)",
+                "All Active Lots (Data Lake)",
                 "📅 Ending Today (< 24 hrs)"
             ]
         )
@@ -119,118 +221,180 @@ if view_mode == "🎯 Deal Finder":
 
     col_p1, col_p2 = st.columns(2)
     with col_p1:
-        min_retail = st.slider("Minimum Retail MSRP ($)", min_value=0, max_value=2000, value=50, step=25)
+        min_retail = st.slider("Minimum Retail MSRP ($)", min_value=0, max_value=2000, value=25, step=25)
     with col_p2:
-        max_bid = st.slider("Maximum Current / Winning Bid ($)", min_value=1, max_value=1000, value=150, step=10)
+        max_bid = st.slider("Maximum Current / Winning Bid ($)", min_value=1, max_value=1000, value=200, step=10)
 
-    # Build SQL Query
-    where_parts = [f"f.retail_price >= {min_retail}", f"f.final_price <= {max_bid}"]
-    if loc_filter != "All":
-        where_parts.append(f"f.location = '{loc_filter}'")
-    if cond_filter != "All":
-        where_parts.append(f"f.condition = '{cond_filter}'")
-    if search_kw.strip():
-        kw = search_kw.strip().replace("'", "''")
-        where_parts.append(f"(p.title ILIKE '%{kw}%' OR f.damage_notes ILIKE '%{kw}%')")
+    # Determine whether to use Real-Time Live API or Data Lake
+    is_live_sniper = time_filter in [
+        "🔥 Ending in < 5 mins (Live)",
+        "⚡ Ending in < 15 mins (Live)",
+        "⏳ Ending in < 30 mins (Live)",
+        "🕒 Ending in < 1 hour (Live)"
+    ]
 
-    # Time Remaining Filter logic
-    if time_filter == "🔥 Ending in < 5 mins (Sniper)":
-        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 5 MINUTE")
-    elif time_filter == "⚡ Ending in < 15 mins":
-        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 15 MINUTE")
-    elif time_filter == "⏳ Ending in < 30 mins":
-        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 30 MINUTE")
-    elif time_filter == "🕒 Ending in < 1 hour":
-        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 1 HOUR")
-    elif time_filter == "📅 Ending Today (< 24 hrs)":
-        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 24 HOUR")
+    results_df = pd.DataFrame()
 
-    where_sql = " AND ".join(where_parts)
-    sort_sql = {
-        "⏳ Closing Soonest (Sniper)": "f.closed_at ASC",
-        "Highest Discount (%)": "f.discount_ratio ASC",
-        "Lowest Final Bid ($)": "f.final_price ASC",
-        "Highest Retail MSRP ($)": "f.retail_price DESC"
-    }.get(sort_by, "f.closed_at ASC")
+    if is_live_sniper:
+        st.info("🟢 **Real-Time Live API Connected** — Querying Nellis Auction directly for up-to-the-second bids & anti-snipe extensions.")
+        with st.spinner("Fetching live active lots from Nellis Auction..."):
+            live_df = fetch_live_nellis_sniper(page_size=120)
+            if not live_df.empty:
+                # Apply in-memory filters
+                filtered = live_df[
+                    (live_df['retail_price'] >= min_retail) &
+                    (live_df['final_price'] <= max_bid)
+                ]
+                if loc_filter != "All":
+                    filtered = filtered[filtered['location'].str.contains(loc_filter, case=False, na=False)]
+                if cond_filter != "All":
+                    filtered = filtered[filtered['condition'].str.contains(cond_filter, case=False, na=False)]
+                if search_kw.strip():
+                    filtered = filtered[
+                        filtered['title'].str.contains(search_kw.strip(), case=False, na=False) |
+                        filtered['damage_notes'].str.contains(search_kw.strip(), case=False, na=False)
+                    ]
+                
+                # Filter by max diff_sec
+                max_sec = {
+                    "🔥 Ending in < 5 mins (Live)": 300,
+                    "⚡ Ending in < 15 mins (Live)": 900,
+                    "⏳ Ending in < 30 mins (Live)": 1800,
+                    "🕒 Ending in < 1 hour (Live)": 3600
+                }.get(time_filter, 3600)
+                filtered = filtered[filtered['diff_sec'] <= max_sec]
 
-    query = f"""
-        SELECT 
-            f.auction_id,
-            p.title,
-            f.location,
-            f.condition,
-            f.retail_price,
-            f.final_price,
-            ROUND((1.0 - f.discount_ratio) * 100.0, 1) AS discount_pct,
-            f.bid_count,
-            f.damage_notes,
-            f.closed_at
-        FROM fact_auctions f
-        JOIN dim_products p ON f.product_id = p.product_id
-        WHERE {where_sql}
-        ORDER BY {sort_sql}
-        LIMIT 50;
-    """
+                # Sorting
+                if sort_by == "Highest Discount (%)":
+                    filtered = filtered.sort_values(by="discount_pct", ascending=False)
+                elif sort_by == "Lowest Final Bid ($)":
+                    filtered = filtered.sort_values(by="final_price", ascending=True)
+                elif sort_by == "Highest Retail MSRP ($)":
+                    filtered = filtered.sort_values(by="retail_price", ascending=False)
+                else:
+                    filtered = filtered.sort_values(by="diff_sec", ascending=True)
 
-    with st.spinner("Querying Cloudflare R2 Data Lake via DuckDB..."):
-        try:
-            results_df = con.execute(query).df()
-            st.write(f"**Found {len(results_df)} matching lots:**")
+                results_df = filtered.head(50)
 
-            if results_df.empty:
-                st.info("No items match your filter criteria. If looking for items ending soon, try expanding the time filter to 15m or 1h.")
-            else:
-                for idx, row in results_df.iterrows():
-                    item_url = f"https://www.nellisauction.com/p/item/{row['auction_id']}"
-                    
-                    # Calculate live time remaining
-                    time_badge = ""
-                    try:
-                        closed_dt = row['closed_at']
-                        if pd.notnull(closed_dt):
-                            now_tz = pd.Timestamp.now(tz=closed_dt.tzinfo if closed_dt.tzinfo else None)
-                            diff_sec = (closed_dt - now_tz).total_seconds()
-                            if diff_sec <= 0:
-                                time_badge = "🔴 **CLOSED**"
-                            elif diff_sec < 300: # < 5 mins
-                                mins = int(diff_sec // 60)
-                                secs = int(diff_sec % 60)
-                                time_badge = f"🔥 **{mins}m {secs}s left** (SNIPE!)"
-                            elif diff_sec < 900: # < 15 mins
-                                mins = int(diff_sec // 60)
-                                time_badge = f"⚡ **{mins}m left**"
-                            elif diff_sec < 3600: # < 1 hour
-                                mins = int(diff_sec // 60)
-                                time_badge = f"⏳ **{mins}m left**"
-                            else:
-                                hours = int(diff_sec // 3600)
-                                mins = int((diff_sec % 3600) // 60)
-                                time_badge = f"🕒 **{hours}h {mins}m left**"
-                    except Exception:
-                        time_badge = f"Closes: {str(row['closed_at'])[:16]}"
+    else:
+        # Query Cloudflare R2 Data Lake via DuckDB
+        where_parts = [f"f.retail_price >= {min_retail}", f"f.final_price <= {max_bid}"]
+        if loc_filter != "All":
+            where_parts.append(f"f.location = '{loc_filter}'")
+        if cond_filter != "All":
+            where_parts.append(f"f.condition = '{cond_filter}'")
+        if search_kw.strip():
+            kw = search_kw.strip().replace("'", "''")
+            where_parts.append(f"(p.title ILIKE '%{kw}%' OR f.damage_notes ILIKE '%{kw}%')")
 
-                    with st.container():
-                        c_card1, c_card2, c_card3 = st.columns([5, 3, 2])
-                        with c_card1:
-                            st.markdown(f"**[{row['title']}]({item_url})**")
-                            notes = row['damage_notes']
-                            if notes and str(notes) != "nan" and str(notes).strip():
-                                st.caption(f"⚠️ Notes: {notes}")
-                            st.markdown(f"[👉 Bid on Nellis Auction]({item_url})")
-                        with c_card2:
-                            cond_color = "🟢" if row['condition'] == "Brand New" else "🟡"
-                            st.write(f"{cond_color} **{row['condition']}** · 📍 {row['location']}")
-                            st.markdown(f"{time_badge}")
-                            st.caption(f"Bids: {row['bid_count']} · Closes: {str(row['closed_at'])[:19]}")
-                        with c_card3:
-                            st.metric(
-                                label="Current Bid",
-                                value=f"${row['final_price']:.2f}",
-                                delta=f"{row['discount_pct']:.0f}% off (${row['retail_price']:.0f} MSRP)"
-                            )
-                        st.markdown("---")
-        except Exception as e:
-            st.error(f"Error executing query: {e}")
+        if time_filter == "📅 Ending Today (< 24 hrs)":
+            where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 24 HOUR")
+
+        where_sql = " AND ".join(where_parts)
+        sort_sql = {
+            "⏳ Closing Soonest (Sniper)": "f.closed_at ASC",
+            "Highest Discount (%)": "f.discount_ratio ASC",
+            "Lowest Final Bid ($)": "f.final_price ASC",
+            "Highest Retail MSRP ($)": "f.retail_price DESC"
+        }.get(sort_by, "f.closed_at ASC")
+
+        query = f"""
+            SELECT 
+                f.auction_id,
+                p.title,
+                f.location,
+                f.condition,
+                f.retail_price,
+                f.final_price,
+                ROUND((1.0 - f.discount_ratio) * 100.0, 1) AS discount_pct,
+                f.bid_count,
+                f.damage_notes,
+                f.closed_at,
+                f.photo_url
+            FROM fact_auctions f
+            JOIN dim_products p ON f.product_id = p.product_id
+            WHERE {where_sql}
+            ORDER BY {sort_sql}
+            LIMIT 50;
+        """
+
+        with st.spinner("Querying Cloudflare R2 Data Lake via DuckDB..."):
+            try:
+                results_df = con.execute(query).df()
+            except Exception as e:
+                st.error(f"Error querying lake: {e}")
+
+    # Render Results Cards with Pictures
+    st.write(f"**Found {len(results_df)} matching lots:**")
+
+    if results_df.empty:
+        st.info("No items match your filter criteria. Try expanding the time filter or adjusting the price sliders.")
+    else:
+        for idx, row in results_df.iterrows():
+            item_url = f"https://www.nellisauction.com/p/item/{row['auction_id']}"
+            
+            # Calculate live time remaining
+            time_badge = ""
+            try:
+                if 'diff_sec' in row and pd.notnull(row['diff_sec']):
+                    diff_sec = float(row['diff_sec'])
+                elif pd.notnull(row['closed_at']):
+                    closed_dt = row['closed_at']
+                    now_tz = pd.Timestamp.now(tz=closed_dt.tzinfo if hasattr(closed_dt, 'tzinfo') and closed_dt.tzinfo else None)
+                    diff_sec = (closed_dt - now_tz).total_seconds()
+                else:
+                    diff_sec = -1
+
+                if diff_sec <= 0:
+                    time_badge = "🔴 **CLOSED / SOLD**"
+                elif diff_sec < 180: # < 3 mins
+                    mins = int(diff_sec // 60)
+                    secs = int(diff_sec % 60)
+                    time_badge = f"🔥 **{mins}m {secs}s left (SNIPE NOW!)**"
+                elif diff_sec < 600: # < 10 mins
+                    mins = int(diff_sec // 60)
+                    secs = int(diff_sec % 60)
+                    time_badge = f"⚡ **{mins}m {secs}s left**"
+                elif diff_sec < 3600: # < 1 hour
+                    mins = int(diff_sec // 60)
+                    time_badge = f"⏳ **{mins}m left**"
+                else:
+                    hours = int(diff_sec // 3600)
+                    mins = int((diff_sec % 3600) // 60)
+                    time_badge = f"🕒 **{hours}h {mins}m left**"
+            except Exception:
+                time_badge = f"Closes: {str(row['closed_at'])[:16]}"
+
+            with st.container():
+                c_img, c_card1, c_card2, c_card3 = st.columns([1.5, 4.5, 2.5, 2.5])
+                
+                with c_img:
+                    photo = row.get("photo_url")
+                    if photo and str(photo) != "nan" and str(photo).strip():
+                        st.image(photo, use_container_width=True)
+                    else:
+                        st.caption("📷 No photo")
+
+                with c_card1:
+                    st.markdown(f"**[{row['title']}]({item_url})**")
+                    notes = row.get('damage_notes')
+                    if notes and str(notes) != "nan" and str(notes).strip():
+                        st.caption(f"⚠️ **Notes:** {notes}")
+                    st.markdown(f"[👉 **Place Bid on Nellis Auction**]({item_url})")
+
+                with c_card2:
+                    cond_color = "🟢" if row['condition'] in ["Brand New", "Good"] else "🟡"
+                    st.write(f"{cond_color} **{row['condition']}** · 📍 {row['location']}")
+                    st.markdown(f"{time_badge}")
+                    st.caption(f"Bids: **{row['bid_count']}** · Closes: {str(row['closed_at'])[:19]}")
+
+                with c_card3:
+                    st.metric(
+                        label="Current Bid",
+                        value=f"${float(row['final_price']):.2f}",
+                        delta=f"{float(row['discount_pct']):.0f}% off (${float(row['retail_price']):.0f} MSRP)"
+                    )
+                st.markdown("---")
 
 
 # --- TAB 2: ANALYTICS HUB ---
