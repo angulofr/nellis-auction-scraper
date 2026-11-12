@@ -17,30 +17,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- PIN PROTECTION GATE ---
-# PIN is read strictly from Streamlit Cloud Secrets (never stored in public code or repository)
-APP_PIN = str(st.secrets.get("APP_PIN", os.environ.get("APP_PIN", ""))).strip()
-
-if "authenticated" not in st.session_state:
-    st.session_state.authenticated = False
-
-if not st.session_state.authenticated:
-    st.markdown("<br><br>", unsafe_allow_html=True)
-    _, pin_col, _ = st.columns([1, 2, 1])
-    with pin_col:
-        st.title("🔒 Nellis Auction Lake")
-        st.caption("Phoenix & Mesa, AZ Liquidation Analytics")
-        entered_pin = st.text_input("Enter PIN to access", type="password", max_chars=16, placeholder="PIN")
-        if st.button("Unlock Dashboard", use_container_width=True, type="primary"):
-            if APP_PIN and entered_pin.strip() == APP_PIN:
-                st.session_state.authenticated = True
-                st.rerun()
-            elif not APP_PIN:
-                st.error("PIN not configured. Please add APP_PIN in Streamlit Cloud Secrets.")
-            else:
-                st.error("Incorrect PIN. Please try again.")
-    st.stop()
-
 # Cloudflare R2 Secrets (Reads from Streamlit Cloud secrets or Environment Variables)
 R2_ACCESS_KEY_ID = st.secrets.get("R2_ACCESS_KEY_ID", os.environ.get("R2_ACCESS_KEY_ID", ""))
 R2_SECRET_ACCESS_KEY = st.secrets.get("R2_SECRET_ACCESS_KEY", os.environ.get("R2_SECRET_ACCESS_KEY", ""))
@@ -97,9 +73,6 @@ view_mode = st.sidebar.radio("Navigation", ["🎯 Deal Finder", "📊 Analytics 
 
 st.sidebar.markdown("---")
 st.sidebar.caption("Cloud Storage: Cloudflare R2 (S3)\nQuery Engine: DuckDB 2.0 (httpfs)")
-if st.sidebar.button("🔒 Lock Dashboard", use_container_width=True):
-    st.session_state.authenticated = False
-    st.rerun()
 
 
 # --- TAB 1: DEAL FINDER ---
