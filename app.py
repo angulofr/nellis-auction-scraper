@@ -153,6 +153,7 @@ def fetch_live_nellis_sniper(page_size=120):
                         'bid_count': p.get('bidCount', 0),
                         'damage_notes': p.get('notes') or '',
                         'diff_sec': diff_sec,
+                        'close_ms': close_ms,
                         'photo_url': photo_url,
                         'closed_at': pd.to_datetime(close_ms, unit='ms', utc=True).tz_convert('America/Phoenix')
                     })
@@ -338,7 +339,8 @@ if view_mode == "🎯 Deal Finder":
                 f.bid_count,
                 f.damage_notes,
                 f.closed_at,
-                f.photo_url
+                f.photo_url,
+                CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
             WHERE {where_sql}
@@ -431,7 +433,9 @@ if view_mode == "🎯 Deal Finder":
 
                     cond_color = "🟢" if any(w in cond_display.lower() for w in ["brand new", "new", "5/5"]) else "🟡"
                     st.write(f"{cond_color} **{cond_display}** · 📍 {row['location']}")
-                    st.markdown(f"{time_badge}")
+                    close_epoch_ms = int(row.get('close_ms') or 0)
+                    time_badge_html = f"""<div class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" style="display:inline-block; font-weight:700; padding:3px 9px; border-radius:6px; font-size:12px; margin-top:4px; margin-bottom:4px; background-color:#450a0a; color:#fca5a5; border:1px solid #ef4444;">{time_badge}</div>"""
+                    st.markdown(time_badge_html, unsafe_allow_html=True)
                     st.caption(f"Bids: **{row['bid_count']}** · Closes: {str(row['closed_at'])[:19]}")
 
                 with c_card3:
@@ -441,6 +445,79 @@ if view_mode == "🎯 Deal Finder":
                         delta=f"{float(row['discount_pct']):.0f}% off (${float(row['retail_price']):.0f} MSRP)"
                     )
                 st.markdown("---")
+
+        # Inject real-time ticking countdown JavaScript
+        import streamlit.components.v1 as components
+        components.html(
+            """
+            <script>
+            (function() {
+                function tickCountdowns() {
+                    try {
+                        const parentDoc = window.parent.document;
+                        if (!parentDoc) return;
+                        const badges = parentDoc.querySelectorAll('.nellis-countdown-badge[data-close-ms]');
+                        const now = Date.now();
+                        
+                        badges.forEach(badge => {
+                            const closeMs = parseInt(badge.getAttribute('data-close-ms'));
+                            if (!closeMs || isNaN(closeMs)) return;
+                            
+                            const diff = closeMs - now;
+                            const totalSec = Math.floor(diff / 1000);
+                            
+                            if (totalSec <= 0) {
+                                badge.innerHTML = "🔴 <b>POTENTIALLY CLOSED</b> <span style='font-size:10px; opacity:0.8;'>(anti-snipe check)</span>";
+                                badge.style.backgroundColor = "#334155";
+                                badge.style.color = "#cbd5e1";
+                                badge.style.borderColor = "#64748b";
+                            } else {
+                                const mins = Math.floor(totalSec / 60);
+                                const secs = totalSec % 60;
+                                const secStr = secs < 10 ? '0' + secs : secs;
+                                
+                                if (totalSec < 180) { // < 3 mins
+                                    badge.innerHTML = "🔥 <b>" + mins + "m " + secStr + "s left (SNIPE NOW!)</b>";
+                                    badge.style.backgroundColor = "#450a0a";
+                                    badge.style.color = "#fca5a5";
+                                    badge.style.borderColor = "#ef4444";
+                                } else if (totalSec < 600) { // < 10 mins
+                                    badge.innerHTML = "⚡ <b>" + mins + "m " + secStr + "s left</b>";
+                                    badge.style.backgroundColor = "#451a03";
+                                    badge.style.color = "#fcd34d";
+                                    badge.style.borderColor = "#f59e0b";
+                                } else if (totalSec < 3600) { // < 1 hour
+                                    badge.innerHTML = "⏳ <b>" + mins + "m left</b>";
+                                    badge.style.backgroundColor = "#172554";
+                                    badge.style.color = "#93c5fd";
+                                    badge.style.borderColor = "#3b82f6";
+                                } else {
+                                    const hours = Math.floor(totalSec / 3600);
+                                    const remMins = Math.floor((totalSec % 3600) / 60);
+                                    badge.innerHTML = "🕒 <b>" + hours + "h " + remMins + "m left</b>";
+                                    badge.style.backgroundColor = "#0f172a";
+                                    badge.style.color = "#cbd5e1";
+                                    badge.style.borderColor = "#334155";
+                                }
+                            }
+                        });
+                    } catch (e) {
+                        // ignore sandbox warnings
+                    }
+                }
+                
+                tickCountdowns();
+                if (window.parent && !window.parent.__nellisTimer) {
+                    window.parent.__nellisTimer = setInterval(tickCountdowns, 1000);
+                } else if (!window.__nellisTimer) {
+                    window.__nellisTimer = setInterval(tickCountdowns, 1000);
+                }
+            })();
+            </script>
+            """,
+            height=0,
+            width=0
+        )
 
 
 # --- TAB 2: ANALYTICS HUB ---
