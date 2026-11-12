@@ -1,0 +1,88 @@
+name: Nellis Auction Sync & Finalize
+
+on:
+  schedule:
+    # Morning Ingestion at 10:00 AM MST (17:00 UTC) - Ingest today's and upcoming auctions
+    - cron: '0 17 * * *'
+    # Night Finalization at 10:30 PM MST (05:30 UTC next day) - Record final winning bids & sold status
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Action to perform'
+        required: true
+        default: 'both'
+        type: choice
+        options:
+          - 'both'
+          - 'scrape'
+          - 'finalize'
+      locations:
+        description: 'Locations to scrape (comma-separated)'
+        required: false
+        default: 'Phoenix,Mesa'
+      limit:
+        description: 'Item limit per location (leave blank for all)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  run-sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Scraper / Finalizer
+        run: |
+          ACTION="${{ github.event.inputs.action || 'auto' }}"
+          LOCATIONS="${{ github.event.inputs.locations || 'Phoenix,Mesa' }}"
+          LIMIT="${{ github.event.inputs.limit }}"
+
+          LIMIT_FLAG=""
+          if [ -n "$LIMIT" ]; then
+            LIMIT_FLAG="--limit $LIMIT"
+          fi
+
+          if [ "$ACTION" = "auto" ] || [ "$ACTION" = "both" ]; then
+            echo "[*] Step 1: Scraping active catalog for $LOCATIONS..."
+            python nellis_scraper.py --locations "$LOCATIONS" $LIMIT_FLAG --export-csv nellis_auctions.csv
+            echo "[*] Step 2: Finalizing closed items..."
+            python nellis_scraper.py --finalize --export-csv nellis_auctions.csv
+          elif [ "$ACTION" = "scrape" ]; then
+            echo "[*] Running catalog scrape for $LOCATIONS..."
+            python nellis_scraper.py --locations "$LOCATIONS" $LIMIT_FLAG --export-csv nellis_auctions.csv
+          elif [ "$ACTION" = "finalize" ]; then
+            echo "[*] Running finalizer on closed items..."
+            python nellis_scraper.py --finalize --export-csv nellis_auctions.csv
+          fi
+
+      - name: Commit and Push Updated Database & CSV
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add nellis_auctions.db nellis_auctions.csv || true
+          if git diff --staged --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto-update Nellis Auction database & CSV [skip ci]"
+            git push
+          fi
+
+      - name: Upload Database & CSV Artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: nellis-auction-data
+          path: |
+            nellis_auctions.db
+            nellis_auctions.csv
+          retention-days: 30
