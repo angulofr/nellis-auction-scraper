@@ -77,10 +77,17 @@ st.sidebar.caption("Cloud Storage: Cloudflare R2 (S3)\nQuery Engine: DuckDB 2.0 
 
 # --- TAB 1: DEAL FINDER ---
 if view_mode == "🎯 Deal Finder":
-    st.title("🎯 Nellis Auction Deal Finder")
-    st.caption("Search and filter live & completed lots from Phoenix & Mesa warehouses")
+    st.title("🎯 Nellis Auction Deal Finder & Sniper")
+    st.caption("Live & completed lots from Phoenix & Mesa warehouses with instant countdowns")
 
-    col1, col2, col3, col4 = st.columns([3, 2, 2, 2])
+    col_top1, col_top2 = st.columns([4, 1])
+    with col_top1:
+        st.markdown("Find liquidation deals, sort by urgency, or filter by items ending in the next few minutes.")
+    with col_top2:
+        if st.button("🔄 Refresh Deals", use_container_width=True):
+            st.rerun()
+
+    col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2, 2])
     with col1:
         search_kw = st.text_input("🔍 Search Keyword", placeholder="e.g. DeWalt, Dyson, Lego, Monitor...")
     with col2:
@@ -88,7 +95,27 @@ if view_mode == "🎯 Deal Finder":
     with col3:
         cond_filter = st.selectbox("Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Damaged"])
     with col4:
-        sort_by = st.selectbox("Sort By", ["Highest Discount", "Lowest Final Bid", "Highest Retail Price"])
+        time_filter = st.selectbox(
+            "⏳ Time Remaining",
+            [
+                "All Active Lots",
+                "🔥 Ending in < 5 mins (Sniper)",
+                "⚡ Ending in < 15 mins",
+                "⏳ Ending in < 30 mins",
+                "🕒 Ending in < 1 hour",
+                "📅 Ending Today (< 24 hrs)"
+            ]
+        )
+    with col5:
+        sort_by = st.selectbox(
+            "Sort By",
+            [
+                "⏳ Closing Soonest (Sniper)",
+                "Highest Discount (%)",
+                "Lowest Final Bid ($)",
+                "Highest Retail MSRP ($)"
+            ]
+        )
 
     col_p1, col_p2 = st.columns(2)
     with col_p1:
@@ -106,12 +133,25 @@ if view_mode == "🎯 Deal Finder":
         kw = search_kw.strip().replace("'", "''")
         where_parts.append(f"(p.title ILIKE '%{kw}%' OR f.damage_notes ILIKE '%{kw}%')")
 
+    # Time Remaining Filter logic
+    if time_filter == "🔥 Ending in < 5 mins (Sniper)":
+        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 5 MINUTE")
+    elif time_filter == "⚡ Ending in < 15 mins":
+        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 15 MINUTE")
+    elif time_filter == "⏳ Ending in < 30 mins":
+        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 30 MINUTE")
+    elif time_filter == "🕒 Ending in < 1 hour":
+        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 1 HOUR")
+    elif time_filter == "📅 Ending Today (< 24 hrs)":
+        where_parts.append("f.closed_at >= now() AND f.closed_at <= now() + INTERVAL 24 HOUR")
+
     where_sql = " AND ".join(where_parts)
     sort_sql = {
-        "Highest Discount": "f.discount_ratio ASC",
-        "Lowest Final Bid": "f.final_price ASC",
-        "Highest Retail Price": "f.retail_price DESC"
-    }.get(sort_by, "f.discount_ratio ASC")
+        "⏳ Closing Soonest (Sniper)": "f.closed_at ASC",
+        "Highest Discount (%)": "f.discount_ratio ASC",
+        "Lowest Final Bid ($)": "f.final_price ASC",
+        "Highest Retail MSRP ($)": "f.retail_price DESC"
+    }.get(sort_by, "f.closed_at ASC")
 
     query = f"""
         SELECT 
@@ -129,7 +169,7 @@ if view_mode == "🎯 Deal Finder":
         JOIN dim_products p ON f.product_id = p.product_id
         WHERE {where_sql}
         ORDER BY {sort_sql}
-        LIMIT 40;
+        LIMIT 50;
     """
 
     with st.spinner("Querying Cloudflare R2 Data Lake via DuckDB..."):
@@ -138,10 +178,37 @@ if view_mode == "🎯 Deal Finder":
             st.write(f"**Found {len(results_df)} matching lots:**")
 
             if results_df.empty:
-                st.info("No items match your filter criteria. Try adjusting the sliders or keyword.")
+                st.info("No items match your filter criteria. If looking for items ending soon, try expanding the time filter to 15m or 1h.")
             else:
                 for idx, row in results_df.iterrows():
                     item_url = f"https://www.nellisauction.com/p/item/{row['auction_id']}"
+                    
+                    # Calculate live time remaining
+                    time_badge = ""
+                    try:
+                        closed_dt = row['closed_at']
+                        if pd.notnull(closed_dt):
+                            now_tz = pd.Timestamp.now(tz=closed_dt.tzinfo if closed_dt.tzinfo else None)
+                            diff_sec = (closed_dt - now_tz).total_seconds()
+                            if diff_sec <= 0:
+                                time_badge = "🔴 **CLOSED**"
+                            elif diff_sec < 300: # < 5 mins
+                                mins = int(diff_sec // 60)
+                                secs = int(diff_sec % 60)
+                                time_badge = f"🔥 **{mins}m {secs}s left** (SNIPE!)"
+                            elif diff_sec < 900: # < 15 mins
+                                mins = int(diff_sec // 60)
+                                time_badge = f"⚡ **{mins}m left**"
+                            elif diff_sec < 3600: # < 1 hour
+                                mins = int(diff_sec // 60)
+                                time_badge = f"⏳ **{mins}m left**"
+                            else:
+                                hours = int(diff_sec // 3600)
+                                mins = int((diff_sec % 3600) // 60)
+                                time_badge = f"🕒 **{hours}h {mins}m left**"
+                    except Exception:
+                        time_badge = f"Closes: {str(row['closed_at'])[:16]}"
+
                     with st.container():
                         c_card1, c_card2, c_card3 = st.columns([5, 3, 2])
                         with c_card1:
@@ -149,13 +216,15 @@ if view_mode == "🎯 Deal Finder":
                             notes = row['damage_notes']
                             if notes and str(notes) != "nan" and str(notes).strip():
                                 st.caption(f"⚠️ Notes: {notes}")
+                            st.markdown(f"[👉 Bid on Nellis Auction]({item_url})")
                         with c_card2:
                             cond_color = "🟢" if row['condition'] == "Brand New" else "🟡"
                             st.write(f"{cond_color} **{row['condition']}** · 📍 {row['location']}")
-                            st.caption(f"Bids: {row['bid_count']} · Closes: {str(row['closed_at'])[:16]}")
+                            st.markdown(f"{time_badge}")
+                            st.caption(f"Bids: {row['bid_count']} · Closes: {str(row['closed_at'])[:19]}")
                         with c_card3:
                             st.metric(
-                                label="Current / Final Bid",
+                                label="Current Bid",
                                 value=f"${row['final_price']:.2f}",
                                 delta=f"{row['discount_pct']:.0f}% off (${row['retail_price']:.0f} MSRP)"
                             )
