@@ -809,12 +809,11 @@ if view_mode == "🎯 Deal Finder":
         }
         /* Distinct Card Separation for both Desktop Grid & Stacked Mobile */
         div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] {
-            border: 2px solid rgba(100, 116, 139, 0.42) !important;
+            border: 2px solid #94a3b8 !important;
             border-radius: 14px !important;
-            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12) !important;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14) !important;
             padding: 12px !important;
             margin-bottom: 18px !important;
-            background: var(--background-color);
         }
         .nellis-stat-grid {
             display: grid;
@@ -823,10 +822,10 @@ if view_mode == "🎯 Deal Finder":
             margin-bottom: 8px;
         }
         .nellis-stat-box {
-            background: var(--secondary-background-color, #1e293b);
-            border: 1px solid rgba(100, 116, 139, 0.35);
+            background: #f8fafc;
+            border: 1px solid #cbd5e1;
             border-radius: 10px;
-            padding: 7px 8px;
+            padding: 8px 8px;
             text-align: center;
         }
         .nellis-stat-label {
@@ -834,22 +833,26 @@ if view_mode == "🎯 Deal Finder":
             font-weight: 800;
             letter-spacing: 0.5px;
             text-transform: uppercase;
-            color: var(--text-color);
-            opacity: 0.72;
-            margin-bottom: 2px;
+            color: #475569;
+            margin-bottom: 3px;
         }
         .nellis-stat-val {
             font-size: 15px;
             font-weight: 800;
-            color: var(--text-color);
+            color: #0f172a;
             line-height: 1.2;
+        }
+        .nellis-disc-badge {
+            font-size: 11px;
+            color: #15803d;
+            font-weight: 800;
         }
         .nellis-meta-strip {
             display: grid;
             grid-template-columns: 1fr 0.65fr 1fr;
             gap: 4px;
-            background: var(--secondary-background-color, #1e293b);
-            border: 1px solid rgba(100, 116, 139, 0.32);
+            background: #f1f5f9;
+            border: 1px solid #cbd5e1;
             border-radius: 8px;
             padding: 7px 4px;
             margin-bottom: 8px;
@@ -859,13 +862,13 @@ if view_mode == "🎯 Deal Finder":
             font-size: 9.5px;
             font-weight: 800;
             text-transform: uppercase;
-            color: var(--text-color);
-            opacity: 0.72;
+            color: #475569;
+            margin-bottom: 2px;
         }
         .nellis-meta-item-val {
             font-size: 13px;
-            font-weight: 700;
-            color: var(--text-color);
+            font-weight: 800;
+            color: #0f172a;
         }
         .nellis-cond-row {
             text-align: center;
@@ -1288,7 +1291,7 @@ if view_mode == "🎯 Deal Finder":
                                 </div>
                                 <div class="nellis-stat-box">
                                     <div class="nellis-stat-label">{bid_label}</div>
-                                    <div class="nellis-stat-val">${cur_bid:,.2f} <span style="font-size:11px; color:#4ade80; font-weight:700;">({disc_pct_val:.0f}% off)</span></div>
+                                    <div class="nellis-stat-val">${cur_bid:,.2f} <span class="nellis-disc-badge">({disc_pct_val:.0f}% off)</span></div>
                                 </div>
                             </div>
                             """,
