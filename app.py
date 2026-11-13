@@ -18,7 +18,7 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from src.transform import CATEGORY_RULES, classify_product_category
+from src.transform import CATEGORY_RULES, classify_product_category, is_incomplete_or_damaged
 
 # Page setup
 st.set_page_config(
@@ -118,12 +118,21 @@ def extract_search_keywords(title: str) -> str:
     return " ".join(words[:6])
 
 
-def format_clean_condition(raw_cond) -> str:
-    """Convert raw grade dict or string into clean display label."""
+def format_clean_condition(raw_cond, title: str = "", notes: str = "") -> str:
+    """Convert raw grade dict or string into clean display label, flagging incomplete/damaged items."""
     if isinstance(raw_cond, dict):
         c_type = raw_cond.get('conditionType', {})
+        d_type = raw_cond.get('damageType', {})
+        m_type = raw_cond.get('missingPartsType', {})
+        f_type = raw_cond.get('functionalType', {})
         c_desc = c_type.get('description', '') if isinstance(c_type, dict) else ''
+        d_desc = d_type.get('description', '') if isinstance(d_type, dict) else ''
+        m_desc = m_type.get('description', '') if isinstance(m_type, dict) else ''
+        f_desc = f_type.get('description', '') if isinstance(f_type, dict) else ''
         rat = raw_cond.get('rating')
+
+        if is_incomplete_or_damaged(title=title, notes=notes, damage_type=d_desc, missing_parts=m_desc, func_type=f_desc, rating=rat):
+            return f"Incomplete / Damaged / Parts ({rat}/5)" if rat else "Incomplete / Damaged / Parts"
         if c_desc in ['New', 'Brand New'] or rat == 5:
             return "Brand New (5/5)"
         elif c_desc:
@@ -136,17 +145,21 @@ def format_clean_condition(raw_cond) -> str:
     if s.startswith("{"):
         try:
             g = ast.literal_eval(s)
-            return format_clean_condition(g)
+            return format_clean_condition(g, title=title, notes=notes)
         except Exception:
-            return "Standard"
+            pass
+
+    if is_incomplete_or_damaged(title=title, notes=notes):
+        m_r = re.search(r"(\d)/5", s)
+        return f"Incomplete / Damaged / Parts ({m_r.group(1)}/5)" if m_r else "Incomplete / Damaged / Parts"
     return s
 
 
-def get_condition_tier(cond_str: str) -> str:
+def get_condition_tier(cond_str: str, title: str = "", notes: str = "") -> str:
     """Standardize condition into like-for-like comparison tiers."""
-    c = format_clean_condition(cond_str).lower()
-    if any(k in c for k in ["damaged", "missing", "broken", "1/5", "2/5", "parts"]):
-        return "Damaged"
+    c = format_clean_condition(cond_str, title=title, notes=notes).lower()
+    if any(k in c for k in ["incomplete", "damaged", "missing", "broken", "1/5", "2/5", "parts"]):
+        return "Incomplete / Damaged / Parts"
     if any(k in c for k in ["used", "fair", "3/5"]):
         return "Used"
     if any(k in c for k in ["like new", "open box", "4/5", "very good"]):
@@ -220,10 +233,11 @@ def load_historical_price_index():
     for row in hist_df.to_dict("records"):
         purl = row.get("photo_url") or ""
         title = row.get("title") or ""
+        notes = row.get("damage_notes") or ""
         img_id = extract_amazon_image_id(purl)
         sig = get_title_signature(title)
-        row["cond_tier"] = get_condition_tier(row.get("condition"))
-        row["clean_cond"] = format_clean_condition(row.get("condition"))
+        row["cond_tier"] = get_condition_tier(row.get("condition"), title=title, notes=notes)
+        row["clean_cond"] = format_clean_condition(row.get("condition"), title=title, notes=notes)
 
         if img_id:
             by_img.setdefault(img_id, []).append(row)
@@ -330,8 +344,9 @@ def parse_nellis_products_from_stream(data: list) -> list:
 
                 photos = p.get('photos') or []
                 photo_url = photos[0].get('url', '') if photos and isinstance(photos[0], dict) else ''
-                condition_str = format_clean_condition(p.get('grade'))
                 title_str = p.get('title', 'Unknown Item')
+                notes_str = p.get('notes') or ''
+                condition_str = format_clean_condition(p.get('grade'), title=title_str, notes=notes_str)
                 cat_primary, cat_secondary = classify_product_category(
                     title_str,
                     p.get('taxonomyLevel1') or p.get('category') or "",
@@ -959,7 +974,7 @@ if view_mode == "🎯 Deal Finder":
 
     cat_filter = st.sidebar.selectbox("🏷️ Category", PRIMARY_CATEGORIES)
     loc_filter = st.sidebar.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"])
-    cond_filter = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Damaged"])
+    cond_filter = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"])
     min_retail = st.sidebar.number_input(
         "Minimum Retail MSRP ($)",
         min_value=0,
@@ -1233,7 +1248,7 @@ if view_mode == "🎯 Deal Finder":
             ]
             if loc_filter != "All":
                 where_parts.append(f"f.location = '{loc_filter}'")
-            if cond_filter != "All":
+            if cond_filter != "All" and cond_filter != "Incomplete / Damaged / Parts":
                 where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
             if search_kw.strip():
                 fuzzy_sql = build_fuzzy_sql_where(search_kw)
@@ -1274,6 +1289,14 @@ if view_mode == "🎯 Deal Finder":
             try:
                 archive_df = con.execute(archive_query).df()
                 archive_df = enrich_categories(archive_df)
+                if not archive_df.empty:
+                    notes_col = archive_df["damage_notes"].fillna("") if "damage_notes" in archive_df.columns else [""] * len(archive_df)
+                    archive_df["condition"] = [
+                        format_clean_condition(c, t, n)
+                        for c, t, n in zip(archive_df["condition"].fillna(""), archive_df["title"].fillna(""), notes_col)
+                    ]
+                    if cond_filter != "All":
+                        archive_df = archive_df[archive_df["condition"].str.contains(cond_filter, case=False, na=False)]
                 if not archive_df.empty and cat_filter != "All Categories":
                     archive_df = archive_df[archive_df["category_primary"] == cat_filter]
                 if not archive_df.empty and search_kw.strip():
@@ -1308,7 +1331,7 @@ if view_mode == "🎯 Deal Finder":
                     where_parts.append("f.closed_at <= now() + INTERVAL 24 HOUR")
                 if loc_filter != "All":
                     where_parts.append(f"f.location = '{loc_filter}'")
-                if cond_filter != "All":
+                if cond_filter != "All" and cond_filter != "Incomplete / Damaged / Parts":
                     where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
                 if search_kw.strip():
                     fuzzy_sql = build_fuzzy_sql_where(search_kw)
@@ -1359,6 +1382,11 @@ if view_mode == "🎯 Deal Finder":
 
         if not live_df.empty:
             live_df = enrich_categories(live_df)
+            notes_col = live_df["damage_notes"].fillna("") if "damage_notes" in live_df.columns else [""] * len(live_df)
+            live_df["condition"] = [
+                format_clean_condition(c, t, n)
+                for c, t, n in zip(live_df["condition"].fillna(""), live_df["title"].fillna(""), notes_col)
+            ]
             # Strict filter: Only currently active lots (diff_sec > 0)
             filtered = live_df[
                 (live_df['diff_sec'] > 0) &
@@ -1772,7 +1800,7 @@ elif view_mode == "🏆 Best Past Deals":
     )
     pd_cat = st.sidebar.selectbox("🏷️ Category", PRIMARY_CATEGORIES, key="pd_cat")
     pd_loc = st.sidebar.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"], key="pd_loc")
-    pd_cond = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Damaged"], key="pd_cond")
+    pd_cond = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"], key="pd_cond")
     pd_min_retail = st.sidebar.number_input("Minimum Retail MSRP ($)", min_value=0, max_value=50000, value=0, step=10, key="pd_min_retail")
     pd_max_bid = st.sidebar.number_input("Maximum Winning Bid ($)", min_value=1, max_value=50000, value=1000, step=25, key="pd_max_bid")
     pd_sort = st.sidebar.selectbox(
@@ -1814,7 +1842,7 @@ elif view_mode == "🏆 Best Past Deals":
         where_parts.append("f.bid_count <= 3 AND f.retail_price >= 100")
     if pd_loc != "All":
         where_parts.append(f"f.location = '{pd_loc}'")
-    if pd_cond != "All":
+    if pd_cond != "All" and pd_cond != "Incomplete / Damaged / Parts":
         where_parts.append(f"f.condition ILIKE '%{pd_cond}%'")
     if pd_kw.strip():
         fuzzy_sql = build_fuzzy_sql_where(pd_kw)
@@ -1871,6 +1899,14 @@ elif view_mode == "🏆 Best Past Deals":
         ]
         pd_df["category_primary"] = [c[0] for c in cats]
         pd_df["category_secondary"] = [c[1] for c in cats]
+
+        notes_col = pd_df["damage_notes"].fillna("") if "damage_notes" in pd_df.columns else [""] * len(pd_df)
+        pd_df["condition"] = [
+            format_clean_condition(c, t, n)
+            for c, t, n in zip(pd_df["condition"].fillna(""), pd_df["title"].fillna(""), notes_col)
+        ]
+        if pd_cond != "All":
+            pd_df = pd_df[pd_df["condition"].str.contains(pd_cond, case=False, na=False)]
 
         if pd_cat != "All Categories":
             pd_df = pd_df[pd_df["category_primary"] == pd_cat]
