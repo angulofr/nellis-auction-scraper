@@ -73,6 +73,15 @@ def get_duckdb_con():
 con = get_duckdb_con()
 
 
+def run_duckdb_query(sql: str) -> pd.DataFrame:
+    """Execute a DuckDB query on a dedicated cursor so concurrent reruns never collide."""
+    cur = con.cursor()
+    try:
+        return cur.execute(sql).df()
+    finally:
+        cur.close()
+
+
 # --- PRODUCT MATCHING & NORMALIZATION ENGINE ($0 COST) ---
 
 def extract_amazon_image_id(photo_url: str) -> str:
@@ -211,7 +220,7 @@ def load_historical_price_index():
     by Amazon Image ID and Normalized Title Signature.
     """
     try:
-        hist_df = con.execute("""
+        hist_df = run_duckdb_query("""
             SELECT 
                 f.auction_id,
                 p.title,
@@ -226,7 +235,7 @@ def load_historical_price_index():
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
             WHERE f.closed_at <= now() AND f.final_price > 0
-        """).df()
+        """)
     except Exception as e:
         print(f"Warning loading historical index: {e}")
         return {"by_img": {}, "by_sig": {}}
@@ -741,14 +750,14 @@ def load_open_radar_index():
     """Build O(1) index of currently open lots from R2 + Live API for 'Back Tonight' Radar."""
     open_rows = []
     try:
-        lake_open = con.execute("""
+        lake_open = run_duckdb_query("""
             SELECT f.auction_id, p.title, f.location, f.condition, f.retail_price,
                    f.final_price, f.bid_count, f.closed_at, f.photo_url
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
             WHERE f.closed_at > now()
             LIMIT 3000;
-        """).df()
+        """)
         if not lake_open.empty:
             open_rows.extend(lake_open.to_dict("records"))
     except Exception:
@@ -1291,7 +1300,7 @@ if view_mode == "🎯 Deal Finder":
                 LIMIT 2000;
             """
             try:
-                archive_df = con.execute(archive_query).df()
+                archive_df = run_duckdb_query(archive_query)
                 archive_df = enrich_categories(archive_df)
                 if not archive_df.empty:
                     notes_col = archive_df["damage_notes"].fillna("") if "damage_notes" in archive_df.columns else [""] * len(archive_df)
@@ -1374,7 +1383,7 @@ if view_mode == "🎯 Deal Finder":
                     LIMIT 2000;
                 """
                 try:
-                    lake_active_df = con.execute(lake_active_query).df()
+                    lake_active_df = run_duckdb_query(lake_active_query)
                     if not lake_active_df.empty:
                         if live_df.empty:
                             live_df = lake_active_df
@@ -1793,7 +1802,7 @@ elif view_mode == "🏆 Best Past Deals":
         "🔥 Minimum Discount (% Off)",
         min_value=0,
         max_value=99,
-        value=50,
+        value=90,
         step=5,
         key="pd_min_disc",
     )
@@ -1804,7 +1813,7 @@ elif view_mode == "🏆 Best Past Deals":
     )
     pd_cat = st.sidebar.selectbox("🏷️ Category", PRIMARY_CATEGORIES, key="pd_cat")
     pd_loc = st.sidebar.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"], key="pd_loc")
-    pd_cond = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"], key="pd_cond")
+    pd_cond = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"], index=1, key="pd_cond")
     pd_min_retail = st.sidebar.number_input("Minimum Retail MSRP ($)", min_value=0, max_value=50000, value=0, step=10, key="pd_min_retail")
     pd_max_bid = st.sidebar.number_input("Maximum Winning Bid ($)", min_value=1, max_value=50000, value=1000, step=25, key="pd_max_bid")
     pd_sort = st.sidebar.selectbox(
@@ -1888,7 +1897,7 @@ elif view_mode == "🏆 Best Past Deals":
     pd_df = pd.DataFrame()
     with st.spinner("Scanning past winning deals in Data Lake..."):
         try:
-            pd_df = con.execute(past_deals_sql).df()
+            pd_df = run_duckdb_query(past_deals_sql)
         except Exception as e:
             st.error(f"Error querying Best Past Deals: {e}")
 
@@ -2126,7 +2135,7 @@ elif view_mode == "📊 Analytics Hub":
         """
         st.subheader("Condition Risk Arbitrage")
         st.caption("Compares discount ratios across functional and cosmetic condition tiers to quantify risk-adjusted bidding.")
-        df = con.execute(sql).df()
+        df = run_duckdb_query(sql)
         st.dataframe(df, use_container_width=True)
         if not df.empty:
             st.bar_chart(df.set_index("condition")["median_discount_pct"])
@@ -2151,7 +2160,7 @@ elif view_mode == "📊 Analytics Hub":
         """
         st.subheader("Category & Brand Liquidation Spreads")
         st.caption("Identifies segments with the highest historical liquidation spreads (lowest winning price vs retail).")
-        df = con.execute(sql).df()
+        df = run_duckdb_query(sql)
         st.dataframe(df, use_container_width=True)
 
     elif "3. Temporal" in model_choice:
@@ -2179,7 +2188,7 @@ elif view_mode == "📊 Analytics Hub":
         """
         st.subheader("Temporal Sweet Spots (Arizona MST)")
         st.caption("Tracks bidding competition and discount depth by day of week and closing hour.")
-        df = con.execute(sql).df()
+        df = run_duckdb_query(sql)
         st.dataframe(df, use_container_width=True)
         if not df.empty:
             st.line_chart(df.set_index("close_hour")[["avg_bids_per_item"]])
@@ -2208,7 +2217,7 @@ elif view_mode == "📊 Analytics Hub":
         """
         st.subheader("Sleeper Lot Hunter")
         st.caption("High-MSRP items ($150+) that closed with <= 10 bids and >= 75% discount.")
-        df = con.execute(sql).df()
+        df = run_duckdb_query(sql)
         st.dataframe(df, use_container_width=True)
 
 
@@ -2237,7 +2246,7 @@ LIMIT 25;"""
     if st.button("▶ Execute SQL Query", type="primary"):
         with st.spinner("Executing query on DuckDB..."):
             try:
-                res_df = con.execute(custom_sql).df()
+                res_df = run_duckdb_query(custom_sql)
                 st.success(f"Returned {len(res_df)} rows.")
                 st.dataframe(res_df, use_container_width=True)
             except Exception as e:
