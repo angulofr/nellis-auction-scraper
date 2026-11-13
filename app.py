@@ -807,6 +807,15 @@ if view_mode == "🎯 Deal Finder":
         .nellis-card-title a {
             text-decoration: none;
         }
+        /* Distinct Card Separation for both Desktop Grid & Stacked Mobile */
+        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] {
+            border: 2px solid rgba(100, 116, 139, 0.42) !important;
+            border-radius: 14px !important;
+            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.12) !important;
+            padding: 12px !important;
+            margin-bottom: 18px !important;
+            background: var(--background-color);
+        }
         .nellis-stat-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -814,46 +823,49 @@ if view_mode == "🎯 Deal Finder":
             margin-bottom: 8px;
         }
         .nellis-stat-box {
-            background: #1e293b;
-            border: 1px solid #334155;
+            background: var(--secondary-background-color, #1e293b);
+            border: 1px solid rgba(100, 116, 139, 0.35);
             border-radius: 10px;
             padding: 7px 8px;
             text-align: center;
         }
         .nellis-stat-label {
             font-size: 10px;
-            font-weight: 700;
+            font-weight: 800;
             letter-spacing: 0.5px;
             text-transform: uppercase;
-            color: #94a3b8;
+            color: var(--text-color);
+            opacity: 0.72;
             margin-bottom: 2px;
         }
         .nellis-stat-val {
             font-size: 15px;
             font-weight: 800;
-            color: #f8fafc;
+            color: var(--text-color);
             line-height: 1.2;
         }
         .nellis-meta-strip {
             display: grid;
-            grid-template-columns: 1fr 0.7fr 1fr;
+            grid-template-columns: 1fr 0.65fr 1fr;
             gap: 4px;
-            border-top: 1px solid #334155;
-            border-bottom: 1px solid #334155;
-            padding: 6px 2px;
+            background: var(--secondary-background-color, #1e293b);
+            border: 1px solid rgba(100, 116, 139, 0.32);
+            border-radius: 8px;
+            padding: 7px 4px;
             margin-bottom: 8px;
             text-align: center;
         }
         .nellis-meta-item-label {
             font-size: 9.5px;
-            font-weight: 700;
+            font-weight: 800;
             text-transform: uppercase;
-            color: #94a3b8;
+            color: var(--text-color);
+            opacity: 0.72;
         }
         .nellis-meta-item-val {
-            font-size: 12.5px;
-            font-weight: 600;
-            color: #e2e8f0;
+            font-size: 13px;
+            font-weight: 700;
+            color: var(--text-color);
         }
         .nellis-cond-row {
             text-align: center;
