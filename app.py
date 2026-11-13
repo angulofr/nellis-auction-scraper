@@ -2493,10 +2493,7 @@ LIMIT 25;"""
     if "ai_sql_question" not in st.session_state:
         st.session_state["ai_sql_question"] = ""
 
-    with st.expander("📋 Table & Column Reference", expanded=False):
-        st.code(SCHEMA_PROMPT, language="text")
-
-    st.subheader("✨ Ask in Plain English")
+    st.subheader("✨ Ask Anything About Nellis Auctions")
     gemini_key = get_secret("GEMINI_API_KEY", "").strip()
     if not gemini_key:
         st.info("Add `GEMINI_API_KEY` (free from [Google AI Studio](https://aistudio.google.com/)) to Streamlit Secrets, or paste one below for this session.")
@@ -2504,12 +2501,12 @@ LIMIT 25;"""
 
     ex_cols = st.columns(3)
     examples = [
-        "How many Brand New items from last night ended up with 0 bids?",
-        "What's the cheapest final price seen for a Brand New usb-c drive?",
-        "Top 10 categories by average discount % on Brand New items over $100 retail",
+        ("0-Bid Brand New Last Night", "How many Brand New items from last night ended up with 0 bids?"),
+        ("Cheapest New USB-C Drive", "What's the cheapest final price seen for a Brand New usb-c drive?"),
+        ("Top Categories by % Off", "Top 10 categories by average discount % on Brand New items over $100 retail"),
     ]
-    for idx_ex, ex_text in enumerate(examples):
-        if ex_cols[idx_ex].button(f"💡 {ex_text[:38]}...", key=f"sql_ex_{idx_ex}", use_container_width=True):
+    for idx_ex, (label_ex, ex_text) in enumerate(examples):
+        if ex_cols[idx_ex].button(f"💡 {label_ex}", key=f"sql_ex_{idx_ex}", use_container_width=True):
             st.session_state["ai_sql_question"] = ex_text
 
     ai_question = st.text_input(
@@ -2518,31 +2515,62 @@ LIMIT 25;"""
         placeholder="e.g. How many Brand New items from last night ended up with 0 bids?",
     )
 
-    ai_col1, ai_col2 = st.columns([1.5, 4])
-    run_ai_clicked = ai_col1.button("✨ Generate & Run SQL", type="primary", disabled=(not gemini_key or not ai_question.strip()), use_container_width=True)
+    run_ai_clicked = st.button(
+        "✨ Ask AI & Show Answer",
+        type="primary",
+        disabled=(not gemini_key or not ai_question.strip()),
+        use_container_width=True,
+    )
 
     if run_ai_clicked:
-        with st.spinner("Translating English to DuckDB SQL..."):
+        with st.spinner("Translating question to SQL & querying Data Lake..."):
             try:
                 generated_sql = generate_sql_from_english(ai_question.strip(), gemini_key)
                 st.session_state["sql_editor_text"] = generated_sql
-                st.session_state["_run_generated_sql"] = True
+                safe_sql = validate_readonly_sql(generated_sql)
+                st.session_state["sql_last_df"] = run_duckdb_query(safe_sql)
+                st.session_state["sql_last_err"] = ""
             except Exception as e:
-                st.error(f"AI SQL Generation Error: {e}")
+                st.session_state["sql_last_err"] = str(e)
 
-    st.markdown("---")
-    custom_sql = st.text_area("SQL Query Editor", key="sql_editor_text", height=180)
-    run_manual_clicked = st.button("▶ Execute SQL Query")
+    # Render results immediately below the question box (no scrolling past SQL editor)
+    if st.session_state.get("sql_last_err"):
+        st.error(f"Query Error: {st.session_state['sql_last_err']}")
+    elif isinstance(st.session_state.get("sql_last_df"), pd.DataFrame):
+        res_df = st.session_state["sql_last_df"]
+        if res_df.empty:
+            st.info("Query ran cleanly, but returned 0 matching rows.")
+        elif len(res_df) == 1 and len(res_df.columns) <= 4:
+            m_cols = st.columns(len(res_df.columns))
+            for idx_c, col_name in enumerate(res_df.columns):
+                val = res_df.iloc[0][col_name]
+                disp_val = f"{val:,.2f}" if isinstance(val, float) else (f"{val:,}" if isinstance(val, int) else str(val))
+                m_cols[idx_c].metric(col_name.replace("_", " ").title(), disp_val)
+            st.dataframe(res_df, use_container_width=True, hide_index=True)
+        else:
+            st.success(f"Found {len(res_df):,} rows.")
+            display_df = res_df.copy()
+            col_cfg = {}
+            if "auction_id" in display_df.columns and "item_url" not in display_df.columns:
+                display_df.insert(0, "item_url", display_df["auction_id"].apply(lambda x: f"https://www.nellisauction.com/p/item/{int(x)}" if pd.notna(x) else ""))
+                col_cfg["item_url"] = st.column_config.LinkColumn("Nellis Link", display_text="View ↗")
+            st.dataframe(display_df, use_container_width=True, hide_index=True, column_config=col_cfg)
 
-    if st.session_state.pop("_run_generated_sql", False) or run_manual_clicked:
-        with st.spinner("Executing query on DuckDB..."):
-            try:
-                safe_sql = validate_readonly_sql(custom_sql)
-                res_df = run_duckdb_query(safe_sql)
-                st.success(f"Returned {len(res_df):,} rows.")
-                st.dataframe(res_df, use_container_width=True)
-            except Exception as e:
-                st.error(f"SQL Error: {e}")
+    with st.expander("🛠️ View / Edit SQL Query", expanded=False):
+        custom_sql = st.text_area("SQL Query Editor", key="sql_editor_text", height=160)
+        if st.button("▶ Execute Custom SQL"):
+            with st.spinner("Executing query on DuckDB..."):
+                try:
+                    safe_sql = validate_readonly_sql(custom_sql)
+                    st.session_state["sql_last_df"] = run_duckdb_query(safe_sql)
+                    st.session_state["sql_last_err"] = ""
+                    st.rerun()
+                except Exception as e:
+                    st.session_state["sql_last_err"] = str(e)
+                    st.rerun()
+
+    with st.expander("📋 Table & Column Reference", expanded=False):
+        st.code(SCHEMA_PROMPT, language="text")
 
 
 if st.session_state.pop("_scroll_to_top", False):
