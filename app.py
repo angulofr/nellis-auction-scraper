@@ -795,17 +795,127 @@ if view_mode == "🎯 Deal Finder":
         }
         .nellis-card-title {
             font-size: 14px;
-            font-weight: 600;
+            font-weight: 700;
             line-height: 1.35;
             height: 38px;
             overflow: hidden;
             display: -webkit-box;
             -webkit-line-clamp: 2;
             -webkit-box-orient: vertical;
-            margin-bottom: 6px;
+            margin-bottom: 8px;
         }
         .nellis-card-title a {
             text-decoration: none;
+        }
+        .nellis-stat-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+            margin-bottom: 8px;
+        }
+        .nellis-stat-box {
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 10px;
+            padding: 7px 8px;
+            text-align: center;
+        }
+        .nellis-stat-label {
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+            color: #94a3b8;
+            margin-bottom: 2px;
+        }
+        .nellis-stat-val {
+            font-size: 15px;
+            font-weight: 800;
+            color: #f8fafc;
+            line-height: 1.2;
+        }
+        .nellis-meta-strip {
+            display: grid;
+            grid-template-columns: 1fr 0.7fr 1fr;
+            gap: 4px;
+            border-top: 1px solid #334155;
+            border-bottom: 1px solid #334155;
+            padding: 6px 2px;
+            margin-bottom: 8px;
+            text-align: center;
+        }
+        .nellis-meta-item-label {
+            font-size: 9.5px;
+            font-weight: 700;
+            text-transform: uppercase;
+            color: #94a3b8;
+        }
+        .nellis-meta-item-val {
+            font-size: 12.5px;
+            font-weight: 600;
+            color: #e2e8f0;
+        }
+        .nellis-cond-row {
+            text-align: center;
+            margin-bottom: 8px;
+        }
+        .nellis-stars {
+            font-size: 14px;
+            letter-spacing: 1px;
+            margin-bottom: 4px;
+        }
+        .nellis-tag-pill {
+            display: inline-block;
+            font-size: 10.5px;
+            font-weight: 600;
+            padding: 2px 8px;
+            border-radius: 999px;
+            margin: 2px 2px;
+            background: #451a03;
+            color: #fde68a;
+            border: 1px solid #92400e;
+        }
+        .nellis-tag-pill.new {
+            background: #052e16;
+            color: #86efac;
+            border-color: #166534;
+        }
+        .nellis-place-bid-btn {
+            display: block;
+            width: 100%;
+            text-align: center;
+            background: #b91c1c;
+            color: #ffffff !important;
+            font-weight: 800;
+            font-size: 13px;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            padding: 8px 10px;
+            border-radius: 8px;
+            text-decoration: none !important;
+            margin-bottom: 6px;
+        }
+        .nellis-place-bid-btn:hover {
+            background: #dc2626;
+        }
+        .nellis-place-bid-btn.archive {
+            background: #334155;
+        }
+        @media (max-width: 768px) {
+            .nellis-card-img-wrap {
+                height: 210px;
+            }
+            .nellis-card-img-wrap img {
+                max-height: 196px;
+            }
+            .nellis-card-title {
+                height: auto;
+                -webkit-line-clamp: 3;
+                font-size: 15px;
+            }
+            .nellis-stat-val {
+                font-size: 17px;
+            }
         }
         </style>
         """,
@@ -1137,41 +1247,94 @@ if view_mode == "🎯 Deal Finder":
                             unsafe_allow_html=True,
                         )
 
-                        # 3. Title (2-line clamp)
+                        # 3. Title
                         safe_title = str(row_dict.get('title') or 'Untitled').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
                         st.markdown(
                             f'<div class="nellis-card-title" title="{safe_title}"><a href="{item_url}" target="_blank">{safe_title}</a></div>',
                             unsafe_allow_html=True,
                         )
 
-                        # 4. Condition & Location
-                        cond_color = "🟢" if cond_tier == "New" else "🟡"
-                        st.caption(f"{cond_color} **{cond_display}** · 📍 {row_dict['location']}")
-
-                        # 5. Dynamic Countdown or Closed Timestamp
+                        # 4. 2-Column Nellis-style Stat Boxes: TIME LEFT | CURRENT PRICE
+                        bid_label = "WINNING PRICE" if is_archive_mode else "CURRENT PRICE"
+                        disc_pct_val = float(row_dict.get('discount_pct') or 0)
                         if is_archive_mode:
-                            st.markdown(
-                                f'<div style="display:inline-block; font-weight:700; padding:3px 8px; border-radius:6px; font-size:11.5px; margin:2px 0 6px 0; background-color:#1e293b; color:#cbd5e1; border:1px solid #475569;">{time_badge}</div>',
-                                unsafe_allow_html=True,
-                            )
+                            time_cell_html = f'<div style="font-size:12px; font-weight:700; color:#cbd5e1;">🏁 {str(row_dict.get("closed_at"))[:16]}</div>'
                         else:
                             close_epoch_ms = int(row_dict.get('close_ms') or 0)
-                            time_badge_html = f"""<div class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" style="display:inline-block; font-weight:700; padding:3px 8px; border-radius:6px; font-size:11.5px; margin:2px 0 6px 0; background-color:#450a0a; color:#fca5a5; border:1px solid #ef4444;">{time_badge}</div>"""
-                            st.markdown(time_badge_html, unsafe_allow_html=True)
+                            time_cell_html = (
+                                f'<span class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" '
+                                f'style="display:inline-block; font-weight:700; padding:2px 6px; border-radius:6px; font-size:12px; '
+                                f'background-color:#450a0a; color:#fca5a5; border:1px solid #ef4444;">{time_badge}</span>'
+                            )
 
-                        # 6. Price, MSRP, Discount & Bids
-                        bid_label = "Winning Bid" if is_archive_mode else "Current Bid"
-                        disc_pct_val = float(row_dict.get('discount_pct') or 0)
                         st.markdown(
-                            f"**{bid_label}:** <span style='font-size:18px; font-weight:800;'>${cur_bid:.2f}</span> "
-                            f"<span style='color:#4ade80; font-size:12px; font-weight:600;'>({disc_pct_val:.0f}% off · ${msrp:.0f} MSRP)</span>",
+                            f"""
+                            <div class="nellis-stat-grid">
+                                <div class="nellis-stat-box">
+                                    <div class="nellis-stat-label">{"CLOSED" if is_archive_mode else "TIME LEFT"}</div>
+                                    <div class="nellis-stat-val">{time_cell_html}</div>
+                                </div>
+                                <div class="nellis-stat-box">
+                                    <div class="nellis-stat-label">{bid_label}</div>
+                                    <div class="nellis-stat-val">${cur_bid:,.2f} <span style="font-size:11px; color:#4ade80; font-weight:700;">({disc_pct_val:.0f}% off)</span></div>
+                                </div>
+                            </div>
+                            """,
                             unsafe_allow_html=True,
                         )
-                        st.caption(f"Bids: **{row_dict['bid_count']}** · Lot `#{auction_id}`")
 
+                        # 5. 3-Column Metadata Strip: EST. RETAIL | BIDS | LOCATION
+                        st.markdown(
+                            f"""
+                            <div class="nellis-meta-strip">
+                                <div>
+                                    <div class="nellis-meta-item-label">EST. RETAIL</div>
+                                    <div class="nellis-meta-item-val">${msrp:,.2f}</div>
+                                </div>
+                                <div>
+                                    <div class="nellis-meta-item-label">BIDS</div>
+                                    <div class="nellis-meta-item-val">{int(row_dict.get('bid_count') or 0)}</div>
+                                </div>
+                                <div>
+                                    <div class="nellis-meta-item-label">LOCATION</div>
+                                    <div class="nellis-meta-item-val">📍 {row_dict['location']}</div>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+
+                        # 6. Star Rating + Condition Pill Tags
+                        m_rating = re.search(r"(\d)/5", cond_display)
+                        if m_rating:
+                            stars_n = int(m_rating.group(1))
+                        elif cond_tier == "New":
+                            stars_n = 5
+                        elif cond_tier == "Open Box / Like New":
+                            stars_n = 4
+                        elif cond_tier == "Used":
+                            stars_n = 3
+                        else:
+                            stars_n = 2
+                        stars_html = f'<span style="color:#facc15;">{"★" * stars_n}</span><span style="color:#475569;">{"☆" * (5 - stars_n)}</span>'
+
+                        tag_cls = "nellis-tag-pill new" if cond_tier == "New" else "nellis-tag-pill"
+                        tags = [cond_display.split("(")[0].strip().lower()]
                         notes = row_dict.get('damage_notes')
-                        if notes and str(notes) != "nan" and str(notes).strip():
-                            st.caption(f"⚠️ **Notes:** {str(notes)[:80]}")
+                        notes_str = str(notes).strip() if notes and str(notes) != "nan" else ""
+                        if "missing" in notes_str.lower():
+                            tags.append("missing parts")
+                        if "damage" in notes_str.lower() or "broken" in notes_str.lower():
+                            tags.append("damaged")
+                        tags_html = "".join(f'<span class="{tag_cls}">{t}</span>' for t in tags[:3])
+
+                        st.markdown(
+                            f'<div class="nellis-cond-row"><div class="nellis-stars">{stars_html}</div>{tags_html}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        if notes_str:
+                            st.caption(f"⚠️ **Notes:** {notes_str[:80]}")
 
                         # 7. Price History & Cheaper Active Copies Summary
                         if past_matches:
@@ -1192,9 +1355,13 @@ if view_mode == "🎯 Deal Finder":
                             cheapest_open = min(float(c.get("final_price") or 0) for c in cheaper_in_batch)
                             st.markdown(f"💡 **:green[{len(cheaper_in_batch)} Cheaper Open (${cheapest_open:.2f})!]**")
 
-                        # 8. Card Action Links & History Modal Button
-                        action_label = "🔗 View Closed Lot ↗" if is_archive_mode else "👉 Place Bid on Nellis ↗"
-                        st.markdown(f"[{action_label}]({item_url})")
+                        # 8. Nellis-style Place Bid Button + History & Active Modal Button
+                        btn_cls = "nellis-place-bid-btn archive" if is_archive_mode else "nellis-place-bid-btn"
+                        action_label = "VIEW CLOSED LOT ↗" if is_archive_mode else "PLACE BID ↗"
+                        st.markdown(
+                            f'<a class="{btn_cls}" href="{item_url}" target="_blank">{action_label}</a>',
+                            unsafe_allow_html=True,
+                        )
                         btn_label = f"🔍 History ({len(past_matches)}) & Active"
                         if st.button(btn_label, key=f"btn_hist_{auction_id}", use_container_width=True):
                             show_item_history_dialog(row_dict)
