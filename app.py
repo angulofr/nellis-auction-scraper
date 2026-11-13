@@ -1537,8 +1537,9 @@ if view_mode == "🎯 Deal Finder":
     end_idx = min(start_idx + PAGE_SIZE, total_results)
     results_df = filtered_all.iloc[start_idx:end_idx] if total_results > 0 else pd.DataFrame()
 
-    # Load cached historical index for fast O(1) price history badges
+    # Load cached historical index and open radar index for fast O(1) badges
     hist_index = load_historical_price_index()
+    open_radar_index = load_open_radar_index()
     active_batch_records = live_df.to_dict("records") if not live_df.empty else []
 
     def render_pagination_bar(key_prefix: str):
@@ -1613,8 +1614,9 @@ if view_mode == "🎯 Deal Finder":
                     except Exception:
                         time_badge = f"Closes: {str(row_dict.get('closed_at'))[:16]}"
 
-                # 1. Lookup Historical Closed Matches (Like-for-Like Condition)
+                # 1. Lookup Historical Closed Matches (Like-for-Like Condition) & Active Copies
                 past_matches = find_historical_matches(row_dict, hist_index, same_condition_only=True)
+                open_matches = find_open_radar_matches(row_dict, open_radar_index)
 
                 # 2. Check for cheaper active copies in current batch (when not in archive mode)
                 cheaper_in_batch = []
@@ -1769,7 +1771,7 @@ if view_mode == "🎯 Deal Finder":
                             f'<a class="{btn_cls}" href="{item_url}" target="_blank">{action_label}</a>',
                             unsafe_allow_html=True,
                         )
-                        btn_label = f"🔍 History ({len(past_matches)}) & Active"
+                        btn_label = f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})"
                         if st.button(btn_label, key=f"btn_hist_{auction_id}", use_container_width=True):
                             show_item_history_dialog(row_dict)
 
@@ -2212,7 +2214,7 @@ elif view_mode == "🏆 Best Past Deals":
                             f'<a class="nellis-place-bid-btn archive" href="{item_url}" target="_blank">VIEW CLOSED LOT ↗</a>',
                             unsafe_allow_html=True,
                         )
-                        if st.button(f"🔍 History ({len(past_matches)}) & Active", key=f"pd_btn_hist_{auction_id}", use_container_width=True):
+                        if st.button(f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})", key=f"pd_btn_hist_{auction_id}", use_container_width=True):
                             show_item_history_dialog(row_dict)
 
         render_pd_pagination("pd_bot")
