@@ -82,6 +82,12 @@ def run_duckdb_query(sql: str) -> pd.DataFrame:
         cur.close()
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def run_cached_duckdb_query(sql: str) -> pd.DataFrame:
+    """Cached DuckDB query (5m TTL) so pagination & modal clicks don't re-scan R2."""
+    return run_duckdb_query(sql)
+
+
 # --- PRODUCT MATCHING & NORMALIZATION ENGINE ($0 COST) ---
 
 def extract_amazon_image_id(photo_url: str) -> str:
@@ -807,7 +813,7 @@ def find_open_radar_matches(item_row: dict, open_index: dict) -> list:
     return matches
 
 
-@st.cache_data(ttl=120)
+@st.cache_data(ttl=300)
 def load_open_radar_index():
     """Build O(1) index of currently open lots from R2 + Live API for 'Back Tonight' Radar."""
     open_rows = []
@@ -1391,7 +1397,7 @@ if view_mode == "🎯 Deal Finder":
                 LIMIT 2000;
             """
             try:
-                archive_df = run_duckdb_query(archive_query)
+                archive_df = run_cached_duckdb_query(archive_query)
                 archive_df = enrich_categories(archive_df)
                 if not archive_df.empty:
                     notes_col = archive_df["damage_notes"].fillna("") if "damage_notes" in archive_df.columns else [""] * len(archive_df)
@@ -1471,8 +1477,7 @@ if view_mode == "🎯 Deal Finder":
                         f.damage_notes,
                         f.closed_at,
                         f.photo_url,
-                        CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms,
-                        (CAST(epoch_ms(f.closed_at) AS DOUBLE) - {int(time.time()*1000)}) / 1000.0 AS diff_sec
+                        CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms
                     FROM fact_auctions f
                     JOIN dim_products p ON f.product_id = p.product_id
                     WHERE {where_sql}
@@ -1480,8 +1485,11 @@ if view_mode == "🎯 Deal Finder":
                     LIMIT 2000;
                 """
                 try:
-                    lake_active_df = run_duckdb_query(lake_active_query)
+                    lake_active_df = run_cached_duckdb_query(lake_active_query)
                     if not lake_active_df.empty:
+                        now_ms_val = int(time.time() * 1000)
+                        lake_active_df = lake_active_df.copy()
+                        lake_active_df["diff_sec"] = (lake_active_df["close_ms"].astype("float64") - now_ms_val) / 1000.0
                         if live_df.empty:
                             live_df = lake_active_df
                         else:
@@ -2051,7 +2059,7 @@ elif view_mode == "🏆 Best Past Deals":
     pd_df = pd.DataFrame()
     with st.spinner("Scanning past winning deals in Data Lake..."):
         try:
-            pd_df = run_duckdb_query(past_deals_sql)
+            pd_df = run_cached_duckdb_query(past_deals_sql)
         except Exception as e:
             st.error(f"Error querying Best Past Deals: {e}")
 
