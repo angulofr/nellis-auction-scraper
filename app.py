@@ -985,23 +985,9 @@ if view_mode == "🎯 Deal Finder":
     )
     is_archive_mode = (time_filter == "🗄️ Closed / Historical Archive")
 
-    cat_filter = st.sidebar.selectbox("🏷️ Category", PRIMARY_CATEGORIES)
-    loc_filter = st.sidebar.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"])
+    cat_filter = "All Categories"
+    loc_filter = "All"
     cond_filter = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"])
-    min_retail = st.sidebar.number_input(
-        "Minimum Retail MSRP ($)",
-        min_value=0,
-        max_value=50000,
-        value=0,
-        step=10
-    )
-    max_bid = st.sidebar.number_input(
-        "Maximum Current / Winning Bid ($)",
-        min_value=1,
-        max_value=50000,
-        value=1000,
-        step=25
-    )
     sort_options = (
         [
             "🕒 Most Recently Closed",
@@ -1036,6 +1022,25 @@ if view_mode == "🎯 Deal Finder":
             min_hist_sales = st.sidebar.number_input("Min Past Sales", min_value=1, max_value=50, value=2, step=1, key="min_hist_sales")
             min_hist_disc = st.sidebar.number_input("Min Historical Avg % Off", min_value=50, max_value=99, value=85, step=5, key="min_hist_disc")
             max_hist_avg = st.sidebar.number_input("Max Historical Avg Price ($)", min_value=1, max_value=5000, value=25, step=5, key="max_hist_avg")
+
+    with st.sidebar.expander("⚙️ More Filters", expanded=False):
+        cat_filter = st.selectbox("🏷️ Category", PRIMARY_CATEGORIES)
+        loc_filter = st.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"])
+        min_retail = st.number_input(
+            "Minimum Retail MSRP ($)",
+            min_value=0,
+            max_value=50000,
+            value=0,
+            step=10
+        )
+        max_bid = st.number_input(
+            "Maximum Current / Winning Bid ($)",
+            min_value=1,
+            max_value=50000,
+            value=1000,
+            step=25
+        )
+        page_size_opt = st.selectbox("📄 Items Per Page", [40, 60, 100], index=0, key="df_page_size")
 
     # Active filter summary bar + floating always-accessible Refresh button
     kw_label = f" · 🔍 '{search_kw.strip()}'" if search_kw.strip() else ""
@@ -1513,11 +1518,11 @@ if view_mode == "🎯 Deal Finder":
 
             filtered_all = filtered
 
-    # Pagination: 100 items per page
-    PAGE_SIZE = 100
+    # Pagination: configurable (default 40 items per page)
+    PAGE_SIZE = page_size_opt
     filter_sig = (
         search_kw.strip(), time_filter, cat_filter, loc_filter, cond_filter,
-        min_retail, max_bid, sort_by, predict_cheap_only, min_hist_sales, min_hist_disc, max_hist_avg,
+        min_retail, max_bid, sort_by, predict_cheap_only, min_hist_sales, min_hist_disc, max_hist_avg, PAGE_SIZE,
     )
     if st.session_state.get("last_filter_sig") != filter_sig:
         st.session_state["last_filter_sig"] = filter_sig
@@ -1729,7 +1734,11 @@ if view_mode == "🎯 Deal Finder":
                         )
 
                         if notes_str:
-                            st.caption(f"⚠️ **Notes:** {notes_str[:80]}")
+                            safe_notes = notes_str.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+                            st.markdown(
+                                f'<div style="font-size:11.5px; color:#fbbf24; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:4px;" title="{safe_notes}">⚠️ {safe_notes}</div>',
+                                unsafe_allow_html=True,
+                            )
 
                         # 7. Price History & Cheaper Active Copies Summary
                         if past_matches:
@@ -1882,16 +1891,7 @@ elif view_mode == "🏆 Best Past Deals":
         step=5,
         key="pd_min_disc",
     )
-    pd_sleeper_only = st.sidebar.checkbox(
-        "😴 Low-Competition Sleepers (Bids ≤ 3 & MSRP ≥ $100)",
-        value=False,
-        key="pd_sleeper_only",
-    )
-    pd_cat = st.sidebar.selectbox("🏷️ Category", PRIMARY_CATEGORIES, key="pd_cat")
-    pd_loc = st.sidebar.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"], key="pd_loc")
     pd_cond = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"], index=1, key="pd_cond")
-    pd_min_retail = st.sidebar.number_input("Minimum Retail MSRP ($)", min_value=0, max_value=50000, value=0, step=10, key="pd_min_retail")
-    pd_max_bid = st.sidebar.number_input("Maximum Winning Bid ($)", min_value=1, max_value=50000, value=1000, step=25, key="pd_max_bid")
     pd_sort = st.sidebar.selectbox(
         "↕️ Sort By",
         [
@@ -1903,6 +1903,18 @@ elif view_mode == "🏆 Best Past Deals":
         ],
         key="pd_sort",
     )
+
+    with st.sidebar.expander("⚙️ More Filters", expanded=False):
+        pd_sleeper_only = st.checkbox(
+            "😴 Low-Competition Sleepers (Bids ≤ 3 & MSRP ≥ $100)",
+            value=False,
+            key="pd_sleeper_only",
+        )
+        pd_cat = st.selectbox("🏷️ Category", PRIMARY_CATEGORIES, key="pd_cat")
+        pd_loc = st.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"], key="pd_loc")
+        pd_min_retail = st.number_input("Minimum Retail MSRP ($)", min_value=0, max_value=50000, value=0, step=10, key="pd_min_retail")
+        pd_max_bid = st.number_input("Maximum Winning Bid ($)", min_value=1, max_value=50000, value=1000, step=25, key="pd_max_bid")
+        pd_page_size_opt = st.selectbox("📄 Deals Per Page", [40, 60, 100], index=0, key="pd_page_size")
 
     inject_nellis_card_css()
 
@@ -2030,11 +2042,33 @@ elif view_mode == "🏆 Best Past Deals":
         avg_bids = float(pd_df["bid_count"].mean())
         max_savings = float(pd_df["dollar_savings"].max())
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Matching Closed Lots", f"{len(pd_df):,}", f"Avg {avg_bids:.1f} bids/lot")
-        c2.metric("Median Winning Price", f"${median_win:,.2f}", f"{median_disc:.1f}% median off")
-        c3.metric("🎯 Target Steal (Bottom 20%)", f"${steal_p20:,.2f}", "Max walk-away target")
-        c4.metric("💰 Biggest $ Savings", f"${max_savings:,.2f}", "Top single-lot steal")
+        st.markdown(
+            f"""
+            <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(145px, 1fr)); gap:8px; margin-bottom:10px;">
+                <div class="nellis-stat-box">
+                    <div class="nellis-stat-label">Matching Lots</div>
+                    <div class="nellis-stat-val">{len(pd_df):,}</div>
+                    <div style="font-size:11px; color:#475569; font-weight:600;">Avg {avg_bids:.1f} bids</div>
+                </div>
+                <div class="nellis-stat-box">
+                    <div class="nellis-stat-label">Median Win</div>
+                    <div class="nellis-stat-val">${median_win:,.2f}</div>
+                    <div style="font-size:11px; color:#15803d; font-weight:700;">{median_disc:.1f}% off</div>
+                </div>
+                <div class="nellis-stat-box">
+                    <div class="nellis-stat-label">🎯 Target Steal (P20)</div>
+                    <div class="nellis-stat-val">${steal_p20:,.2f}</div>
+                    <div style="font-size:11px; color:#475569; font-weight:600;">Walk-away target</div>
+                </div>
+                <div class="nellis-stat-box">
+                    <div class="nellis-stat-label">💰 Top Savings</div>
+                    <div class="nellis-stat-val">${max_savings:,.2f}</div>
+                    <div style="font-size:11px; color:#475569; font-weight:600;">Single-lot high</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
         # IDEA 5: "Condition Arbitrage" Quick Comparison Strip
         pd_df["_cond_tier"] = [get_condition_tier(c) for c in pd_df["condition"]]
@@ -2061,9 +2095,9 @@ elif view_mode == "🏆 Best Past Deals":
         open_radar_index = load_open_radar_index()
         hist_index = load_historical_price_index()
 
-        # 100-per-page pagination
-        PD_PAGE_SIZE = 100
-        pd_sig = (pd_kw.strip(), pd_date_preset, str(pd_start_date), str(pd_end_date), pd_min_disc, pd_sleeper_only, pd_cat, pd_loc, pd_cond, pd_min_retail, pd_max_bid, pd_sort)
+        # Configurable pagination (default 40 per page)
+        PD_PAGE_SIZE = pd_page_size_opt
+        pd_sig = (pd_kw.strip(), pd_date_preset, str(pd_start_date), str(pd_end_date), pd_min_disc, pd_sleeper_only, pd_cat, pd_loc, pd_cond, pd_min_retail, pd_max_bid, pd_sort, PD_PAGE_SIZE)
         if st.session_state.get("pd_last_sig") != pd_sig:
             st.session_state["pd_last_sig"] = pd_sig
             st.session_state["pd_page_num"] = 1
