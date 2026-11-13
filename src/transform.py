@@ -81,6 +81,52 @@ def standardize_functionality(func_type: str) -> str:
     return "Untested"
 
 
+CATEGORY_RULES = [
+    ("Electronics", "Speakers & Audio", ["speaker", "soundbar", "subwoofer", "earbud", "headphone", "airpod", "bluetooth audio", "turntable", "amplifier", "receiver", "microphone", "karaoke", "bose", "sonos", "jbl", "beats", "skullcandy"]),
+    ("Electronics", "Monitors & TVs", ["monitor", "television", "smart tv", "oled", "qled", "4k tv", "projector", "tv mount", "tv stand", "roku", "fire tv", "apple tv"]),
+    ("Electronics", "Computers & Tablets", ["laptop", "macbook", "chromebook", "desktop", "ipad", "tablet", "keyboard", "mouse", "webcam", "router", "mesh wifi", "ssd", "hard drive", "motherboard", "gpu", "graphics card", "docking station", "usb-c hub", "printer", "scanner"]),
+    ("Electronics", "Cameras & Drones", ["camera", "dash cam", "dashcam", "webcam", "gopro", "drone", "gimbal", "tripod", "ring light", "security camera", "doorbell camera", "nvr", "trail camera"]),
+    ("Electronics", "Gaming & VR", ["playstation", "ps5", "ps4", "xbox", "nintendo", "switch", "gaming chair", "gaming desk", "controller", "vr headset", "oculus", "meta quest", "headset"]),
+    ("Electronics", "Phones & Smartwatches", ["iphone", "samsung galaxy", "pixel", "smartwatch", "apple watch", "garmin", "fitbit", "charger", "power bank", "magsafe", "phone case", "screen protector"]),
+    ("Tools & Hardware", "Power Tools", ["drill", "impact driver", "circular saw", "miter saw", "jigsaw", "reciprocating saw", "angle grinder", "sander", "nailer", "nail gun", "rotary tool", "oscillating", "dewalt", "milwaukee", "makita", "ryobi", "bosch", "craftsman"]),
+    ("Tools & Hardware", "Hand Tools & Storage", ["wrench", "socket set", "screwdriver", "pliers", "toolbox", "tool chest", "tool bag", "ladder", "step stool", "pressure washer", "air compressor", "generator", "multimeter", "laser level", "stud finder"]),
+    ("Home & Kitchen", "Kitchen Appliances", ["air fryer", "espresso", "coffee maker", "keurig", "nespresso", "blender", "vitamix", "ninja", "mixer", "kitchenaid", "toaster", "microwave", "instant pot", "slow cooker", "rice cooker", "food processor", "juicer", "ice maker", "mini fridge", "wine cooler"]),
+    ("Home & Kitchen", "Cookware & Dining", ["cookware", "skillet", "frying pan", "dutch oven", "knife set", "cutlery", "flatware", "dinnerware", "bakeware", "thermos", "tumbler", "stanley", "yeti", "water bottle"]),
+    ("Home & Kitchen", "Vacuums & Floor Care", ["vacuum", "roomba", "roborock", "dyson", "shark", "bissell", "carpet cleaner", "steam mop", "robot vacuum", "air purifier", "humidifier", "dehumidifier", "space heater", "tower fan", "ceiling fan"]),
+    ("Home & Kitchen", "Furniture & Decor", ["sofa", "couch", "recliner", "bookshelf", "nightstand", "dresser", "dining table", "coffee table", "desk", "office chair", "bar stool", "mattress", "bed frame", "rug", "mirror", "lamp", "chandelier", "curtain", "blinds"]),
+    ("Home & Kitchen", "Bedding & Bath", ["comforter", "duvet", "sheet set", "pillow", "memory foam", "towel", "shower head", "bidet", "bathroom vanity", "faucet", "bath mat"]),
+    ("Patio & Garden", "Outdoor & Grill", ["grill", "bbq", "smoker", "blackstone", "traeger", "patio", "gazebo", "pergola", "fire pit", "lawn mower", "string trimmer", "leaf blower", "chainsaw", "hose", "sprinkler", "planter", "solar light"]),
+    ("Sports & Outdoors", "Fitness & Exercise", ["treadmill", "exercise bike", "peloton", "dumbbell", "kettlebell", "barbell", "weight bench", "yoga mat", "massage gun", "theragun", "pull up bar", "rowing machine", "elliptical"]),
+    ("Sports & Outdoors", "Camping & Recreation", ["tent", "sleeping bag", "cooler", "kayak", "paddleboard", "bicycle", "e-bike", "ebike", "scooter", "helmet", "backpack", "pickleball", "golf", "fishing"]),
+    ("Automotive", "Parts & Accessories", ["car seat cover", "floor mat", "jump starter", "tire inflator", "car stereo", "carplay", "brake pad", "headlight", "led light bar", "tonneau cover", "roof rack", "obd2", "car cover", "dash mat"]),
+    ("Toys & Games", "Toys & LEGO", ["lego", "nerf", "barbie", "hot wheels", "board game", "puzzle", "action figure", "plush", "rc car", "remote control", "playset", "dollhouse", "trampoline"]),
+    ("Baby & Kids", "Baby Gear", ["stroller", "car seat", "crib", "bassinet", "high chair", "baby monitor", "diaper", "bottle warmer", "playpen", "baby gate"]),
+    ("Beauty & Health", "Personal Care", ["hair dryer", "curling iron", "flat iron", "straightener", "electric toothbrush", "waterpik", "shaver", "razor", "trimmer", "skincare", "serum", "perfume", "cologne", "blood pressure", "thermometer"]),
+    ("Pet Supplies", "Pet Care", ["dog bed", "dog crate", "cat tree", "litter box", "pet feeder", "dog food", "leash", "harness", "aquarium", "dog toy", "pet gate", "bark collar"]),
+    ("Clothing & Shoes", "Apparel & Accessories", ["jacket", "hoodie", "sneaker", "boots", "shoes", "sandals", "jeans", "leggings", "backpack", "handbag", "wallet", "sunglasses", "luggage", "suitcase"]),
+    ("Office & School", "Office Supplies", ["shredder", "whiteboard", "label maker", "standing desk", "ergonomic", "calculator", "binder", "filing cabinet", "desk lamp", "toner", "ink cartridge"]),
+]
+
+
+def classify_product_category(title: str, existing_primary: str = "", existing_secondary: str = "") -> Tuple[str, str]:
+    """
+    Resolve Nellis-style two-level category (primary, secondary).
+    Uses existing taxonomy fields if present; otherwise applies deterministic keyword classification ($0 cost).
+    """
+    p_clean = str(existing_primary or "").strip()
+    s_clean = str(existing_secondary or "").strip()
+    if p_clean and p_clean.lower() not in ("nan", "none", "uncategorized"):
+        return p_clean, (s_clean if s_clean and s_clean.lower() not in ("nan", "none") else "General")
+
+    t_low = f" {str(title or '').lower()} "
+    for primary, secondary, keywords in CATEGORY_RULES:
+        for kw in keywords:
+            if kw in t_low:
+                return primary, secondary
+
+    return "Home & General", "Miscellaneous"
+
+
 def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[List[Dict], List[Dict]]:
     """
     Transform raw auction item dictionaries into:
@@ -172,12 +218,15 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
 
         # 2. Dim Table Record (Deduplicated)
         if product_id not in dim_products_map:
+            raw_cat_primary = item.get("category") or item.get("taxonomyLevel1") or ""
+            raw_cat_secondary = item.get("subcategory") or item.get("taxonomyLevel2") or ""
+            cat_primary, cat_secondary = classify_product_category(title, raw_cat_primary, raw_cat_secondary)
             dim_products_map[product_id] = {
                 "product_id": product_id,
                 "title": title,
                 "brand": item.get("brand") or "",
-                "category_primary": item.get("category") or item.get("taxonomyLevel1") or "",
-                "category_secondary": item.get("subcategory") or item.get("taxonomyLevel2") or "",
+                "category_primary": cat_primary,
+                "category_secondary": cat_secondary,
                 "base_retail_price": retail_price,
                 "description": item.get("catalog_description") or item.get("description") or "",
                 "first_seen_date": scrape_date,
