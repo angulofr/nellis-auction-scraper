@@ -1,11 +1,9 @@
-name: Nellis Auction Sync & Finalize
+name: Nellis Auction Legacy SQLite Export (Manual Only)
+
+# NOTE: Replaced by daily_scrape.yml (Cloudflare R2 Parquet Data Lake).
+# Schedule & git-push of nellis_auctions.db removed because SQLite exceeded GitHub's 100 MB limit.
 
 on:
-  schedule:
-    # Morning Ingestion at 10:00 AM MST (17:00 UTC) - Ingest today's and upcoming auctions
-    - cron: '0 17 * * *'
-    # Night Finalization at 10:30 PM MST (05:30 UTC next day) - Record final winning bids & sold status
-    - cron: '30 5 * * *'
   workflow_dispatch:
     inputs:
       action:
@@ -26,9 +24,6 @@ on:
         required: false
         default: ''
 
-permissions:
-  contents: write
-
 jobs:
   run-sync:
     runs-on: ubuntu-latest
@@ -43,7 +38,7 @@ jobs:
 
       - name: Run Scraper / Finalizer
         run: |
-          ACTION="${{ github.event.inputs.action || 'auto' }}"
+          ACTION="${{ github.event.inputs.action || 'both' }}"
           LOCATIONS="${{ github.event.inputs.locations || 'Phoenix,Mesa' }}"
           LIMIT="${{ github.event.inputs.limit }}"
 
@@ -52,29 +47,13 @@ jobs:
             LIMIT_FLAG="--limit $LIMIT"
           fi
 
-          if [ "$ACTION" = "auto" ] || [ "$ACTION" = "both" ]; then
-            echo "[*] Step 1: Scraping active catalog for $LOCATIONS..."
+          if [ "$ACTION" = "both" ]; then
             python nellis_scraper.py --locations "$LOCATIONS" $LIMIT_FLAG --export-csv nellis_auctions.csv
-            echo "[*] Step 2: Finalizing closed items..."
             python nellis_scraper.py --finalize --export-csv nellis_auctions.csv
           elif [ "$ACTION" = "scrape" ]; then
-            echo "[*] Running catalog scrape for $LOCATIONS..."
             python nellis_scraper.py --locations "$LOCATIONS" $LIMIT_FLAG --export-csv nellis_auctions.csv
           elif [ "$ACTION" = "finalize" ]; then
-            echo "[*] Running finalizer on closed items..."
             python nellis_scraper.py --finalize --export-csv nellis_auctions.csv
-          fi
-
-      - name: Commit and Push Updated Database & CSV
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add nellis_auctions.db nellis_auctions.csv || true
-          if git diff --staged --quiet; then
-            echo "No changes to commit."
-          else
-            git commit -m "Auto-update Nellis Auction database & CSV [skip ci]"
-            git push
           fi
 
       - name: Upload Database & CSV Artifacts
