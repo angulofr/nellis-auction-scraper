@@ -1543,6 +1543,7 @@ if view_mode == "🎯 Deal Finder":
         with p_col1:
             if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(current_page <= 1), use_container_width=True):
                 st.session_state["page_num"] = current_page - 1
+                st.session_state["_scroll_to_top"] = True
                 st.rerun()
         with p_col2:
             st.markdown(
@@ -1554,6 +1555,7 @@ if view_mode == "🎯 Deal Finder":
         with p_col3:
             if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(current_page >= total_pages), use_container_width=True):
                 st.session_state["page_num"] = current_page + 1
+                st.session_state["_scroll_to_top"] = True
                 st.rerun()
 
     mode_noun = "closed historical lots" if is_archive_mode else "active lots"
@@ -2081,6 +2083,7 @@ elif view_mode == "🏆 Best Past Deals":
             with p1:
                 if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(pd_curr_page <= 1), use_container_width=True):
                     st.session_state["pd_page_num"] = pd_curr_page - 1
+                    st.session_state["_scroll_to_top"] = True
                     st.rerun()
             with p2:
                 st.markdown(
@@ -2092,6 +2095,7 @@ elif view_mode == "🏆 Best Past Deals":
             with p3:
                 if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(pd_curr_page >= pd_total_pages), use_container_width=True):
                     st.session_state["pd_page_num"] = pd_curr_page + 1
+                    st.session_state["_scroll_to_top"] = True
                     st.rerun()
 
         render_pd_pagination("pd_top")
@@ -2331,3 +2335,38 @@ LIMIT 25;"""
                 st.dataframe(res_df, use_container_width=True)
             except Exception as e:
                 st.error(f"SQL Error: {e}")
+
+
+if st.session_state.pop("_scroll_to_top", False):
+    components.html(
+        """
+        <script>
+        (function() {
+            function scrollTopNow() {
+                try {
+                    const p = window.parent;
+                    const doc = p.document;
+                    const selectors = [
+                        'section.stMain',
+                        'section.main',
+                        '[data-testid="stAppViewContainer"]',
+                        '[data-testid="stMain"]',
+                        '.main'
+                    ];
+                    selectors.forEach(sel => {
+                        const el = doc.querySelector(sel);
+                        if (el) el.scrollTop = 0;
+                    });
+                    if (doc.documentElement) doc.documentElement.scrollTop = 0;
+                    if (doc.body) doc.body.scrollTop = 0;
+                    p.scrollTo(0, 0);
+                } catch (e) {}
+            }
+            scrollTopNow();
+            setTimeout(scrollTopNow, 80);
+            setTimeout(scrollTopNow, 250);
+        })();
+        </script>
+        """,
+        height=0,
+    )
