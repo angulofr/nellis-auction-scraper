@@ -653,16 +653,19 @@ def show_item_history_dialog(item_row: dict):
         key=f"dlg_cond_toggle_{item_id}",
     )
 
-    # Fetch both active copies and past matches
-    with st.spinner("Checking live copies & price history..."):
-        live_copies = search_live_active_duplicates(title, msrp, photo)
-        other_active = [
-            c for c in live_copies
-            if int(c.get("auction_id") or 0) != item_id
-            and (not same_cond_only or get_condition_tier(c.get("condition")) == cond_tier)
-        ]
-        hist_index = load_historical_price_index()
-        past_matches = find_historical_matches(item_row, hist_index, same_condition_only=same_cond_only)
+    # Instant O(1) lookup from cached indexes (0ms network wait when opening modal)
+    open_radar_index = load_open_radar_index()
+    cached_active = find_open_radar_matches(item_row, open_radar_index)
+    live_key = f"_dlg_live_copies_{item_id}"
+    live_copies = st.session_state.get(live_key)
+    source_active = live_copies if live_copies is not None else cached_active
+    other_active = [
+        c for c in source_active
+        if int(c.get("auction_id") or 0) != item_id
+        and (not same_cond_only or get_condition_tier(c.get("condition")) == cond_tier)
+    ]
+    hist_index = load_historical_price_index()
+    past_matches = find_historical_matches(item_row, hist_index, same_condition_only=same_cond_only)
 
     # Quick Tab Switcher inside modal for clean mobile reading
     tab_hist, tab_active = st.tabs([
@@ -727,6 +730,11 @@ def show_item_history_dialog(item_row: dict):
             st.markdown("".join(rows_html), unsafe_allow_html=True)
 
     with tab_active:
+        if st.button("🔄 Live-Check Nellis Now", key=f"dlg_live_btn_{item_id}"):
+            with st.spinner("Querying Nellis live catalog..."):
+                st.session_state[live_key] = search_live_active_duplicates(title, msrp, photo)
+                st.rerun(scope="fragment")
+
         if not other_active:
             st.info(f"No other open copies in **{cond_tier if same_cond_only else 'any'}** condition right now.")
         else:
@@ -743,12 +751,16 @@ def show_item_history_dialog(item_row: dict):
                 c_id = copy.get("auction_id")
                 c_url = f"https://www.nellisauction.com/p/item/{c_id}"
                 c_price = float(copy.get("final_price") or 0)
-                c_disc = float(copy.get("discount_pct") or 0)
+                c_msrp = float(copy.get("retail_price") or msrp or 0)
+                c_disc = float(copy.get("discount_pct") or (((c_msrp - c_price) / c_msrp * 100.0) if c_msrp > 0 else 0.0))
                 c_loc = copy.get("location") or "AZ"
                 c_cond = format_clean_condition(copy.get("condition"))
                 c_bids = copy.get("bid_count", 0)
-                c_sec = float(copy.get("diff_sec") or 0)
-                c_time_str = f"{max(1, int(c_sec // 60))}m left" if c_sec < 3600 else f"{int(c_sec // 3600)}h {int((c_sec % 3600) // 60)}m left"
+                if copy.get("diff_sec") is not None:
+                    c_sec = float(copy.get("diff_sec") or 0)
+                    c_time_str = f"{max(1, int(c_sec // 60))}m left" if c_sec < 3600 else f"{int(c_sec // 3600)}h {int((c_sec % 3600) // 60)}m left"
+                else:
+                    c_time_str = f"Closes {str(copy.get('closed_at') or '')[:16]}"
                 cheaper_badge = ' <span style="background:#14532d; color:#86efac; font-size:10.5px; padding:2px 6px; border-radius:4px;">CHEAPER</span>' if c_price < cur_bid else ""
                 active_html.append(
                     f"""
@@ -1667,23 +1679,20 @@ if view_mode == "🎯 Deal Finder":
                     except Exception:
                         time_badge = f"Closes: {str(row_dict.get('closed_at'))[:16]}"
 
-                # 1. Lookup Historical Closed Matches (Like-for-Like Condition) & Active Copies
+                # 1. Lookup Historical Closed Matches (Like-for-Like Condition) & Active Copies (O(1))
                 past_matches = find_historical_matches(row_dict, hist_index, same_condition_only=True)
-                open_matches = find_open_radar_matches(row_dict, open_radar_index)
+                open_matches = [
+                    c for c in find_open_radar_matches(row_dict, open_radar_index)
+                    if int(c.get("auction_id") or 0) != auction_id
+                ]
 
-                # 2. Check for cheaper active copies in current batch (when not in archive mode)
+                # 2. Check for cheaper active copies in O(1) open_matches (when not in archive mode)
                 cheaper_in_batch = []
-                if not is_archive_mode:
+                if not is_archive_mode and open_matches:
                     cheaper_in_batch = [
-                        c for c in active_batch_records
-                        if int(c.get("auction_id") or 0) != auction_id
-                        and float(c.get("diff_sec") or 0) > 0
-                        and float(c.get("final_price") or 0) < cur_bid
+                        c for c in open_matches
+                        if float(c.get("final_price") or 0) < cur_bid
                         and get_condition_tier(c.get("condition")) == cond_tier
-                        and is_same_product(
-                            row_dict.get("title"), msrp, row_dict.get("photo_url"),
-                            c.get("title"), c.get("retail_price"), c.get("photo_url")
-                        )
                     ]
 
                 with grid_cols[col_idx]:
