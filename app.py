@@ -563,31 +563,7 @@ def show_item_history_dialog(item_row: dict):
 
 
 # --- SIDEBAR CONTROLS ---
-st.sidebar.title("🔨 Nellis Auction Lake")
-st.sidebar.caption("Phoenix & Mesa, AZ Analytics")
-
-try:
-    summary_df = con.execute("""
-        SELECT 
-            COUNT(*) AS total_lots,
-            ROUND(SUM(retail_price), 0) AS total_retail,
-            ROUND(AVG(discount_ratio), 3) AS avg_ratio
-        FROM fact_auctions
-    """).df()
-    total_lots = summary_df["total_lots"][0]
-    total_retail = summary_df["total_retail"][0]
-    avg_discount = (1.0 - summary_df["avg_ratio"][0]) * 100
-    st.sidebar.metric("Total Lake Lots", f"{total_lots:,}")
-    st.sidebar.metric("Total Retail MSRP", f"${total_retail:,.0f}")
-    st.sidebar.metric("Average Discount", f"{avg_discount:.1f}%")
-except Exception:
-    pass
-
-st.sidebar.markdown("---")
 view_mode = st.sidebar.radio("Navigation", ["🎯 Deal Finder", "📊 Analytics Hub", "💻 SQL Studio"])
-
-st.sidebar.markdown("---")
-st.sidebar.caption("Cloud Storage: Cloudflare R2 (S3)\nQuery Engine: DuckDB 2.0 (httpfs)\nLive Feed: Nellis Turbo-Stream API")
 
 
 # --- TAB 1: DEAL FINDER ---
@@ -595,7 +571,7 @@ if view_mode == "🎯 Deal Finder":
     # Build sorted list of primary categories for Left Sidebar Filter
     PRIMARY_CATEGORIES = ["All Categories"] + sorted({p for p, _, _ in CATEGORY_RULES} | {"Home & General"})
 
-    # Left Sidebar Filter Navigation (Nellis-style Desktop Left Nav; auto-collapses on Mobile)
+    # Left Sidebar Filter Navigation (Directly below Navigation)
     st.sidebar.markdown("---")
     st.sidebar.subheader("🎛️ Filter Listings")
     search_kw = st.sidebar.text_input("🔍 Search Keyword", placeholder="e.g. DeWalt, Dyson, Lego, Speaker...")
