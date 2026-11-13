@@ -42,10 +42,11 @@ def generate_product_id(title: str, retail_price: float) -> str:
 INCOMPLETE_DAMAGED_REGEX = re.compile(
     r"(?:"
     r"missing\s+(?:\d+\s+)?(?:box|boxes|piece|pieces|part|parts|hardware|screws|bolts|legs|cushion|cushions|shelf|shelves|door|doors|panel|panels|rail|rails|cable|cables|cord|remote|battery|batteries|charger|lid|cover|tray|drawer|wheel|wheels|item|items|set)"
-    r"|box\s+\d+\s*(?:of|or|/)\s*\d+(?:\s*only)?"
+    r"|(?:box|boxes|part|parts|piece|pieces|bag|bags|crate|crates|parcel|parcels|carton|cartons)\s*#?\d+\s*(?:of|or|/)\s*\d+(?:\s*only)?"
     r"|\bonly\s+\d+\s*(?:of|/)\s*\d+\b"
     r"|\b\d+\s*(?:of|/)\s*\d+\s+boxes?\s+only\b"
-    r"|\b(?:box|boxes|case|manual|remote|frame|stand|base|lid|cover|cushion|cushions|door|shelf|drawer|bag|hardware|parts?|pieces?)\s+only\b"
+    r"|\bonly\s+(?:box|boxes|part|parts|piece|pieces)\s*#?\d+\b"
+    r"|\b(?:box|boxes|case|manual|remote|frame|stand|base|lid|cover|cushion|cushions|door|shelf|drawer|bag|bags|crate|crates|parcel|parcels|carton|cartons|panel|panels|hardware|parts?|pieces?)\s*(?:#?\d+\s+)?only\b"
     r"|\bfor\s+parts\b"
     r"|\bpartial\s+set\b"
     r"|\bincomplete(?:\s+set)?\b"
