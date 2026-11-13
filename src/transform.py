@@ -39,17 +39,58 @@ def generate_product_id(title: str, retail_price: float) -> str:
     return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:32]
 
 
-def standardize_condition(cond_type: str, damage_type: str, rating: int) -> str:
-    """Standardize condition string into canonical category."""
+INCOMPLETE_DAMAGED_REGEX = re.compile(
+    r"(?:"
+    r"missing\s+(?:\d+\s+)?(?:box|boxes|piece|pieces|part|parts|hardware|screws|bolts|legs|cushion|cushions|shelf|shelves|door|doors|panel|panels|rail|rails|cable|cables|cord|remote|battery|batteries|charger|lid|cover|tray|drawer|wheel|wheels|item|items|set)"
+    r"|box\s+\d+\s*(?:of|or|/)\s*\d+(?:\s*only)?"
+    r"|\bonly\s+\d+\s*(?:of|/)\s*\d+\b"
+    r"|\b\d+\s*(?:of|/)\s*\d+\s+boxes?\s+only\b"
+    r"|\b(?:box|boxes|case|manual|remote|frame|stand|base|lid|cover|cushion|cushions|door|shelf|drawer|bag|hardware|parts?|pieces?)\s+only\b"
+    r"|\bfor\s+parts\b"
+    r"|\bpartial\s+set\b"
+    r"|\bincomplete(?:\s+set)?\b"
+    r"|\bnot\s+complete\b"
+    r"|\bno\s+(?:charger|battery|batteries|remote|cord|cable|power\s+supply|adapter|hardware|legs|cushions|mattress|stand|lid)\b"
+    r"|\b(?:major\s+damage|heavy\s+damage|damaged\s+(?:screen|box|frame|leg|corner|glass|panel|item|top|side)|cracked|shattered|broken|defective|malfunction|as[\s-]is|salvage|scrap)\b"
+    r"|\b(?:does\s+not\s+(?:work|turn\s+on|power\s+on)|won'?t\s+turn\s+on|needs\s+repair)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def is_incomplete_or_damaged(title: str = "", notes: str = "", damage_type: str = "", missing_parts: str = "", func_type: str = "", rating=None) -> bool:
+    """Detect whether an item is incomplete, missing boxes/pieces, parts-only, or damaged."""
+    d = str(damage_type or "").strip().lower()
+    mp = str(missing_parts or "").strip().lower()
+    f = str(func_type or "").strip().lower()
+
+    if any(k in d for k in ["major", "moderate", "minor", "damage", "broken", "cracked", "yes"]):
+        return True
+    if any(k in mp for k in ["yes", "partial", "missing"]):
+        return True
+    if f in ["no", "not functional", "broken", "does not work"]:
+        return True
+    try:
+        if rating is not None and int(rating) <= 2:
+            return True
+    except (ValueError, TypeError):
+        pass
+
+    combined_text = f"{title or ''} {notes or ''}"
+    return bool(INCOMPLETE_DAMAGED_REGEX.search(combined_text))
+
+
+def standardize_condition(cond_type: str, damage_type: str, rating: int, missing_parts: str = "", func_type: str = "", title: str = "", notes: str = "") -> str:
+    """Standardize condition string into canonical category, excluding incomplete/damaged items from Brand New."""
+    if is_incomplete_or_damaged(title=title, notes=notes, damage_type=damage_type, missing_parts=missing_parts, func_type=func_type, rating=rating):
+        return "Incomplete / Damaged / Parts"
+
     c = (cond_type or "").strip().lower()
-    d = (damage_type or "").strip().lower()
 
     if "new" in c:
         return "Brand New"
     if "open" in c:
         return "Open Box"
-    if "damage" in d or "major" in d or (rating and rating <= 2):
-        return "Damaged"
     if "used" in c:
         return "Used"
     if "untested" in c or "unknown" in c:
@@ -176,7 +217,10 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
         rating = item.get("condition_rating") or grade.get("rating")
         notes = (item.get("inspector_notes") or item.get("notes") or "").strip()
 
-        condition = standardize_condition(cond_raw, damage_raw, rating)
+        condition = standardize_condition(
+            cond_raw, damage_raw, rating,
+            missing_parts=missing_raw, func_type=func_raw, title=title, notes=notes
+        )
         completeness = standardize_completeness(missing_raw)
         functional_status = standardize_functionality(func_raw)
 
