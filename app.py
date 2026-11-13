@@ -1012,6 +1012,8 @@ if view_mode == "🎯 Deal Finder":
         if is_archive_mode
         else [
             "⏳ Closing Soonest (Sniper)",
+            "🔮 Predicted Best Steal (Lowest Hist Avg)",
+            "🔥 Highest Hist Avg % Off",
             "Highest Discount (%)",
             "Lowest Final Bid ($)",
             "Highest Retail MSRP ($)",
@@ -1019,10 +1021,27 @@ if view_mode == "🎯 Deal Finder":
     )
     sort_by = st.sidebar.selectbox("↕️ Sort By", sort_options)
 
+    predict_cheap_only = False
+    min_hist_sales = 2
+    min_hist_disc = 85
+    max_hist_avg = 25
+    if not is_archive_mode:
+        predict_cheap_only = st.sidebar.checkbox(
+            "🔮 Likely Cheap Tonight (Historical Steals)",
+            value=False,
+            key="predict_cheap_only",
+            help="Show active items that previously sold for cheap in the same condition tier.",
+        )
+        if predict_cheap_only:
+            min_hist_sales = st.sidebar.number_input("Min Past Sales", min_value=1, max_value=50, value=2, step=1, key="min_hist_sales")
+            min_hist_disc = st.sidebar.number_input("Min Historical Avg % Off", min_value=50, max_value=99, value=85, step=5, key="min_hist_disc")
+            max_hist_avg = st.sidebar.number_input("Max Historical Avg Price ($)", min_value=1, max_value=5000, value=25, step=5, key="max_hist_avg")
+
     # Active filter summary bar + floating always-accessible Refresh button
     kw_label = f" · 🔍 '{search_kw.strip()}'" if search_kw.strip() else ""
     cat_label = f" · 🏷️ {cat_filter}" if cat_filter != "All Categories" else ""
-    st.caption(f"**Active Filter:** {time_filter}{cat_label} · 📍 {loc_filter} · {cond_filter} · MSRP ≥ ${min_retail} · Bid ≤ ${max_bid}{kw_label}")
+    pred_label = f" · 🔮 Likely Cheap (≥{min_hist_sales} sales, Avg ≤${max_hist_avg}, ≥{min_hist_disc}% off)" if predict_cheap_only else ""
+    st.caption(f"**Active Filter:** {time_filter}{cat_label} · 📍 {loc_filter} · {cond_filter} · MSRP ≥ ${min_retail} · Bid ≤ ${max_bid}{kw_label}{pred_label}")
 
     st.markdown('<span id="nellis-refresh-anchor"></span>', unsafe_allow_html=True)
     if st.button("🔄 Refresh Live Data", key="refresh_live_btn", type="primary"):
@@ -1446,7 +1465,44 @@ if view_mode == "🎯 Deal Finder":
             if time_filter in max_sec_map:
                 filtered = filtered[filtered['diff_sec'] <= max_sec_map[time_filter]]
 
-            if sort_by == "Highest Discount (%)":
+            need_hist_scoring = (
+                predict_cheap_only
+                or sort_by in ("🔮 Predicted Best Steal (Lowest Hist Avg)", "🔥 Highest Hist Avg % Off")
+            )
+            if need_hist_scoring and not filtered.empty:
+                hist_index_for_pred = load_historical_price_index()
+                h_counts, h_avgs, h_discs = [], [], []
+                for r in filtered.to_dict("records"):
+                    ms = find_historical_matches(r, hist_index_for_pred, same_condition_only=True)
+                    if ms:
+                        avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
+                        msrp_v = float(r.get("retail_price") or 0)
+                        avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
+                        h_counts.append(len(ms))
+                        h_avgs.append(avg_p)
+                        h_discs.append(avg_d)
+                    else:
+                        h_counts.append(0)
+                        h_avgs.append(999999.0)
+                        h_discs.append(-1.0)
+                filtered = filtered.assign(
+                    _hist_count=h_counts,
+                    _hist_avg_price=h_avgs,
+                    _hist_avg_disc=h_discs,
+                    _has_hist=[c > 0 for c in h_counts],
+                )
+                if predict_cheap_only:
+                    filtered = filtered[
+                        (filtered["_hist_count"] >= min_hist_sales)
+                        & (filtered["_hist_avg_price"] <= max_hist_avg)
+                        & (filtered["_hist_avg_disc"] >= min_hist_disc)
+                    ]
+
+            if sort_by == "🔮 Predicted Best Steal (Lowest Hist Avg)" and "_hist_avg_price" in filtered.columns:
+                filtered = filtered.sort_values(by=["_has_hist", "_hist_avg_price", "_hist_avg_disc"], ascending=[False, True, False])
+            elif sort_by == "🔥 Highest Hist Avg % Off" and "_hist_avg_disc" in filtered.columns:
+                filtered = filtered.sort_values(by=["_has_hist", "_hist_avg_disc", "_hist_avg_price"], ascending=[False, False, True])
+            elif sort_by == "Highest Discount (%)":
                 filtered = filtered.sort_values(by="discount_pct", ascending=False)
             elif sort_by == "Lowest Final Bid ($)":
                 filtered = filtered.sort_values(by="final_price", ascending=True)
@@ -1459,7 +1515,10 @@ if view_mode == "🎯 Deal Finder":
 
     # Pagination: 100 items per page
     PAGE_SIZE = 100
-    filter_sig = (search_kw.strip(), time_filter, cat_filter, loc_filter, cond_filter, min_retail, max_bid, sort_by)
+    filter_sig = (
+        search_kw.strip(), time_filter, cat_filter, loc_filter, cond_filter,
+        min_retail, max_bid, sort_by, predict_cheap_only, min_hist_sales, min_hist_disc, max_hist_avg,
+    )
     if st.session_state.get("last_filter_sig") != filter_sig:
         st.session_state["last_filter_sig"] = filter_sig
         st.session_state["page_num"] = 1
@@ -1675,12 +1734,15 @@ if view_mode == "🎯 Deal Finder":
                             p_prices = [float(m.get("final_price") or 0) for m in past_matches]
                             min_won = min(p_prices)
                             avg_won = sum(p_prices) / len(p_prices)
+                            hist_avg_disc = ((msrp - avg_won) / msrp * 100.0) if msrp > 0 else 0.0
                             if cur_bid <= min_won:
                                 verdict = "🟢 **Below All-Time Low!**"
                             elif cur_bid <= avg_won:
                                 verdict = "🟢 **Below Avg Win**"
                             else:
                                 verdict = f"🔴 **Above Avg (${avg_won:.0f})**"
+                            if not is_archive_mode and len(past_matches) >= min_hist_sales and avg_won <= max_hist_avg and hist_avg_disc >= min_hist_disc:
+                                st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {len(past_matches)} sales)]**")
                             st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.0f} ({len(past_matches)}) · {verdict}")
                         else:
                             st.caption(f"📊 No past '{cond_tier}' sales yet")
