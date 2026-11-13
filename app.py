@@ -5,7 +5,9 @@ Cloud-ready Streamlit application queryable from phone, tablet, or desktop.
 """
 
 import ast
+import difflib
 import json
+import math
 import os
 import re
 import time
@@ -357,11 +359,79 @@ def parse_nellis_products_from_stream(data: list) -> list:
     return items
 
 
-@st.cache_data(ttl=5)
-def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by: str = "⏳ Closing Soonest (Sniper)", page_size: int = 120):
+def smart_fuzzy_search_score(query: str, title: str, notes: str = "") -> float:
     """
-    Fetch real-time active lots directly from Nellis Auction's API.
-    Supports live keyword search, warehouse location filter, and sorting.
+    Zero-cost typo-tolerant multi-token fuzzy search scorer.
+    Returns 1.0 when no query; otherwise returns 0.0..1.0 based on token coverage & edit similarity.
+    """
+    q = str(query or "").strip().lower()
+    if not q:
+        return 1.0
+
+    q_tokens = [w for w in re.findall(r"[a-z0-9]+", q) if len(w) >= 2]
+    if not q_tokens:
+        return 1.0
+
+    haystack_raw = f"{title or ''} {notes or ''}".lower()
+    if q in haystack_raw:
+        return 1.0
+
+    h_tokens = re.findall(r"[a-z0-9]+", haystack_raw)
+    if not h_tokens:
+        return 0.0
+
+    matched_score = 0.0
+    for qt in q_tokens:
+        if qt in haystack_raw:
+            matched_score += 1.0
+            continue
+
+        # Typo-tolerant similarity check against each word in title/notes
+        best_sim = 0.0
+        for ht in h_tokens:
+            if abs(len(ht) - len(qt)) > max(3, len(qt) // 2):
+                continue
+            sim = difflib.SequenceMatcher(None, qt, ht).ratio()
+            if sim > best_sim:
+                best_sim = sim
+            if best_sim >= 0.92:
+                break
+
+        threshold = 0.72 if len(qt) >= 4 else 0.78
+        if best_sim >= threshold:
+            matched_score += best_sim
+
+    return matched_score / len(q_tokens)
+
+
+def build_fuzzy_sql_where(query: str) -> str:
+    """
+    Build a typo-tolerant DuckDB SQL WHERE clause using 2-3 char prefix/suffix anchors
+    so misspelled queries still pull candidate rows before Python fuzzy scoring.
+    """
+    q_tokens = [w for w in re.findall(r"[a-z0-9]+", str(query or "").lower()) if len(w) >= 2]
+    if not q_tokens:
+        return ""
+
+    token_clauses = []
+    for qt in q_tokens[:4]:
+        safe_qt = qt.replace("'", "''")
+        if len(qt) <= 3:
+            token_clauses.append(f"(p.title ILIKE '%{safe_qt}%' OR f.damage_notes ILIKE '%{safe_qt}%')")
+        else:
+            p3 = safe_qt[:3]
+            s3 = safe_qt[-3:]
+            token_clauses.append(
+                f"(p.title ILIKE '%{p3}%' OR p.title ILIKE '%{s3}%' OR f.damage_notes ILIKE '%{p3}%')"
+            )
+    return "(" + " OR ".join(token_clauses) + ")"
+
+
+@st.cache_data(ttl=15)
+def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by: str = "⏳ Closing Soonest (Sniper)", page_size: int = 120, max_pages: int = 5):
+    """
+    Fetch real-time active lots directly from Nellis Auction's API (up to 600 lots across 5 pages).
+    Supports live keyword search (with typo fallback), warehouse location filter, and sorting.
     """
     try:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
@@ -379,19 +449,55 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
             "Highest Discount (%)": "time_remaining_asc"
         }.get(sort_by, "time_remaining_asc")
 
-        params = [("sortBy", nellis_sort), ("_p1", f"s:{page_size},n:1")]
-        if search_kw and search_kw.strip():
-            params.append(("query", search_kw.strip()))
-        if loc_filter in ["Phoenix", "Mesa"]:
-            params.append(("Location Name", loc_filter))
+        def _fetch_query(kw_str: str, pages: int):
+            collected = []
+            seen = set()
+            for page_num in range(1, pages + 1):
+                params = [("sortBy", nellis_sort), ("_p1", f"s:{page_size},n:{page_num}")]
+                if kw_str and kw_str.strip():
+                    params.append(("query", kw_str.strip()))
+                if loc_filter in ["Phoenix", "Mesa"]:
+                    params.append(("Location Name", loc_filter))
 
-        qs = urllib.parse.urlencode(params)
-        url = f'https://www.nellisauction.com/search.data?{qs}'
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with opener.open(req, timeout=10) as resp:
-            data = json.loads(resp.read().decode())
+                qs = urllib.parse.urlencode(params)
+                url = f'https://www.nellisauction.com/search.data?{qs}'
+                req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                with opener.open(req, timeout=10) as resp:
+                    data = json.loads(resp.read().decode())
 
-        items = parse_nellis_products_from_stream(data)
+                page_items = parse_nellis_products_from_stream(data)
+                if not page_items:
+                    break
+                new_added = 0
+                for it in page_items:
+                    aid = it.get("auction_id")
+                    if aid not in seen:
+                        seen.add(aid)
+                        collected.append(it)
+                        new_added += 1
+                if new_added == 0 or len(page_items) < page_size:
+                    break
+            return collected
+
+        items = _fetch_query(search_kw, max_pages)
+
+        # If search query had a typo or multi-word constraint that returned very few hits from Nellis,
+        # also fetch a broader live pool so our typo-tolerant fuzzy matcher can surface relevant items.
+        if search_kw and search_kw.strip() and len(items) < 25:
+            q_tokens = [w for w in re.findall(r"[a-z0-9]+", search_kw.strip().lower()) if len(w) >= 3]
+            seen_ids = {it.get("auction_id") for it in items}
+            if len(q_tokens) > 1:
+                longest_tok = max(q_tokens, key=len)
+                for extra in _fetch_query(longest_tok, 2):
+                    if extra.get("auction_id") not in seen_ids:
+                        seen_ids.add(extra.get("auction_id"))
+                        items.append(extra)
+            if len(items) < 25:
+                for extra in _fetch_query("", 3):
+                    if extra.get("auction_id") not in seen_ids:
+                        seen_ids.add(extra.get("auction_id"))
+                        items.append(extra)
+
         return pd.DataFrame(items)
     except Exception as e:
         print(f"Error fetching live sniper items: {e}")
@@ -725,6 +831,7 @@ if view_mode == "🎯 Deal Finder":
         return df_in
 
     results_df = pd.DataFrame()
+    filtered_all = pd.DataFrame()
     live_df = pd.DataFrame()
 
     if is_archive_mode:
@@ -740,8 +847,9 @@ if view_mode == "🎯 Deal Finder":
             if cond_filter != "All":
                 where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
             if search_kw.strip():
-                kw = search_kw.strip().replace("'", "''")
-                where_parts.append(f"(p.title ILIKE '%{kw}%' OR f.damage_notes ILIKE '%{kw}%')")
+                fuzzy_sql = build_fuzzy_sql_where(search_kw)
+                if fuzzy_sql:
+                    where_parts.append(fuzzy_sql)
 
             where_sql = " AND ".join(where_parts)
             sort_sql = {
@@ -772,14 +880,21 @@ if view_mode == "🎯 Deal Finder":
                 JOIN dim_products p ON f.product_id = p.product_id
                 WHERE {where_sql}
                 ORDER BY {sort_sql}
-                LIMIT 200;
+                LIMIT 2000;
             """
             try:
                 archive_df = con.execute(archive_query).df()
                 archive_df = enrich_categories(archive_df)
                 if not archive_df.empty and cat_filter != "All Categories":
                     archive_df = archive_df[archive_df["category_primary"] == cat_filter]
-                results_df = archive_df.head(60)
+                if not archive_df.empty and search_kw.strip():
+                    scores = [
+                        smart_fuzzy_search_score(search_kw, t, n)
+                        for t, n in zip(archive_df["title"].fillna(""), archive_df["damage_notes"].fillna(""))
+                    ]
+                    archive_df = archive_df.assign(_search_score=scores)
+                    archive_df = archive_df[archive_df["_search_score"] >= 0.65]
+                filtered_all = archive_df
             except Exception as e:
                 st.error(f"Error querying Historical Archive: {e}")
     else:
@@ -789,7 +904,8 @@ if view_mode == "🎯 Deal Finder":
                 search_kw=search_kw,
                 loc_filter=loc_filter,
                 sort_by=sort_by,
-                page_size=120
+                page_size=120,
+                max_pages=5
             )
 
             # If "All Active Lots" or "Ending Today", also union any active (closed_at > now()) lots in the Data Lake
@@ -806,8 +922,9 @@ if view_mode == "🎯 Deal Finder":
                 if cond_filter != "All":
                     where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
                 if search_kw.strip():
-                    kw = search_kw.strip().replace("'", "''")
-                    where_parts.append(f"(p.title ILIKE '%{kw}%' OR f.damage_notes ILIKE '%{kw}%')")
+                    fuzzy_sql = build_fuzzy_sql_where(search_kw)
+                    if fuzzy_sql:
+                        where_parts.append(fuzzy_sql)
 
                 where_sql = " AND ".join(where_parts)
                 sort_sql = {
@@ -838,7 +955,7 @@ if view_mode == "🎯 Deal Finder":
                     JOIN dim_products p ON f.product_id = p.product_id
                     WHERE {where_sql}
                     ORDER BY {sort_sql}
-                    LIMIT 120;
+                    LIMIT 2000;
                 """
                 try:
                     lake_active_df = con.execute(lake_active_query).df()
@@ -865,11 +982,13 @@ if view_mode == "🎯 Deal Finder":
                 filtered = filtered[filtered['location'].str.contains(loc_filter, case=False, na=False)]
             if cond_filter != "All":
                 filtered = filtered[filtered['condition'].str.contains(cond_filter, case=False, na=False)]
-            if search_kw.strip():
-                filtered = filtered[
-                    filtered['title'].str.contains(search_kw.strip(), case=False, na=False) |
-                    filtered['damage_notes'].str.contains(search_kw.strip(), case=False, na=False)
+            if search_kw.strip() and not filtered.empty:
+                scores = [
+                    smart_fuzzy_search_score(search_kw, t, n)
+                    for t, n in zip(filtered['title'].fillna(""), filtered['damage_notes'].fillna(""))
                 ]
+                filtered = filtered.assign(_search_score=scores)
+                filtered = filtered[filtered['_search_score'] >= 0.65]
 
             max_sec_map = {
                 "🔥 Ending in < 5 mins (Live)": 300,
@@ -890,14 +1009,55 @@ if view_mode == "🎯 Deal Finder":
             else:
                 filtered = filtered.sort_values(by="diff_sec", ascending=True)
 
-            results_df = filtered.head(60)
+            filtered_all = filtered
+
+    # Pagination: 100 items per page
+    PAGE_SIZE = 100
+    filter_sig = (search_kw.strip(), time_filter, cat_filter, loc_filter, cond_filter, min_retail, max_bid, sort_by)
+    if st.session_state.get("last_filter_sig") != filter_sig:
+        st.session_state["last_filter_sig"] = filter_sig
+        st.session_state["page_num"] = 1
+
+    total_results = len(filtered_all)
+    total_pages = max(1, math.ceil(total_results / PAGE_SIZE))
+    current_page = min(max(1, int(st.session_state.get("page_num", 1))), total_pages)
+    st.session_state["page_num"] = current_page
+
+    start_idx = (current_page - 1) * PAGE_SIZE
+    end_idx = min(start_idx + PAGE_SIZE, total_results)
+    results_df = filtered_all.iloc[start_idx:end_idx] if total_results > 0 else pd.DataFrame()
 
     # Load cached historical index for fast O(1) price history badges
     hist_index = load_historical_price_index()
     active_batch_records = live_df.to_dict("records") if not live_df.empty else []
 
+    def render_pagination_bar(key_prefix: str):
+        if total_results == 0:
+            return
+        p_col1, p_col2, p_col3 = st.columns([1.5, 3, 1.5])
+        with p_col1:
+            if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(current_page <= 1), use_container_width=True):
+                st.session_state["page_num"] = current_page - 1
+                st.rerun()
+        with p_col2:
+            st.markdown(
+                f"<div style='text-align:center; padding-top:6px; font-weight:600;'>"
+                f"Page {current_page} of {total_pages} &nbsp;·&nbsp; Showing {start_idx + 1}–{end_idx} of {total_results:,} lots"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        with p_col3:
+            if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(current_page >= total_pages), use_container_width=True):
+                st.session_state["page_num"] = current_page + 1
+                st.rerun()
+
     mode_noun = "closed historical lots" if is_archive_mode else "active lots"
-    st.write(f"**Showing {len(results_df)} {mode_noun}:**")
+    if total_results > 0:
+        st.write(f"**Found {total_results:,} {mode_noun}** (showing {start_idx + 1}–{end_idx}):")
+        if total_pages > 1:
+            render_pagination_bar("top")
+    else:
+        st.write(f"**Showing 0 {mode_noun}:**")
 
     if results_df.empty:
         st.info("No items match your filter criteria right now. Adjust the filters in the left sidebar to widen your search.")
@@ -1036,6 +1196,10 @@ if view_mode == "🎯 Deal Finder":
                         btn_label = f"🔍 History ({len(past_matches)}) & Active"
                         if st.button(btn_label, key=f"btn_hist_{auction_id}", use_container_width=True):
                             show_item_history_dialog(row_dict)
+
+        if total_pages > 1:
+            st.markdown("---")
+            render_pagination_bar("bottom")
 
         # Inject real-time ticking countdown JavaScript (only needed in active mode)
         if not is_archive_mode:
