@@ -16,12 +16,14 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+from src.transform import CATEGORY_RULES, classify_product_category
+
 # Page setup
 st.set_page_config(
     page_title="Nellis Auction Sniper",
     page_icon="🔨",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
 def get_secret(key, default=""):
@@ -327,10 +329,18 @@ def parse_nellis_products_from_stream(data: list) -> list:
                 photos = p.get('photos') or []
                 photo_url = photos[0].get('url', '') if photos and isinstance(photos[0], dict) else ''
                 condition_str = format_clean_condition(p.get('grade'))
+                title_str = p.get('title', 'Unknown Item')
+                cat_primary, cat_secondary = classify_product_category(
+                    title_str,
+                    p.get('taxonomyLevel1') or p.get('category') or "",
+                    p.get('taxonomyLevel2') or p.get('subcategory') or "",
+                )
 
                 items.append({
                     'auction_id': p.get('id'),
-                    'title': p.get('title', 'Unknown Item'),
+                    'title': title_str,
+                    'category_primary': cat_primary,
+                    'category_secondary': cat_secondary,
                     'location': loc_name,
                     'condition': condition_str,
                     'retail_price': retail,
@@ -452,7 +462,11 @@ def show_item_history_dialog(item_row: dict):
             st.image(photo, use_container_width=True)
     with h_col2:
         st.markdown(f"**[{title}]({item_url})**")
-        st.caption(f"Selected Lot ID: `{item_id}` · Condition: **{cond_display}** (`{cond_tier}`) · MSRP: **${msrp:.2f}** · Current Bid: **${cur_bid:.2f}**")
+        cat_p = item_row.get("category_primary") or ""
+        cat_s = item_row.get("category_secondary") or ""
+        if not cat_p:
+            cat_p, cat_s = classify_product_category(title)
+        st.caption(f"🏷️ **{cat_p} → {cat_s}** · Lot ID: `{item_id}` · Condition: **{cond_display}** (`{cond_tier}`) · MSRP: **${msrp:.2f}** · Bid: **${cur_bid:.2f}**")
         same_cond_only = st.checkbox(
             f"Like-for-Like Condition Only (Compare only against '{cond_tier}' items)",
             value=True,
@@ -578,86 +592,160 @@ st.sidebar.caption("Cloud Storage: Cloudflare R2 (S3)\nQuery Engine: DuckDB 2.0 
 
 # --- TAB 1: DEAL FINDER ---
 if view_mode == "🎯 Deal Finder":
+    # Build sorted list of primary categories for Left Sidebar Filter
+    PRIMARY_CATEGORIES = ["All Categories"] + sorted({p for p, _, _ in CATEGORY_RULES} | {"Home & General"})
+
+    # Left Sidebar Filter Navigation (Nellis-style Desktop Left Nav; auto-collapses on Mobile)
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("🎛️ Filter Listings")
+    search_kw = st.sidebar.text_input("🔍 Search Keyword", placeholder="e.g. DeWalt, Dyson, Lego, Speaker...")
+    time_filter = st.sidebar.selectbox(
+        "⏳ Time Remaining / Status",
+        [
+            "🔥 Ending in < 5 mins (Live)",
+            "⚡ Ending in < 15 mins (Live)",
+            "⏳ Ending in < 30 mins (Live)",
+            "🕒 Ending in < 1 hour (Live)",
+            "📅 Ending Today (< 24 hrs)",
+            "All Active Lots",
+            "🗄️ Closed / Historical Archive",
+        ]
+    )
+    is_archive_mode = (time_filter == "🗄️ Closed / Historical Archive")
+
+    cat_filter = st.sidebar.selectbox("🏷️ Category", PRIMARY_CATEGORIES)
+    loc_filter = st.sidebar.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"])
+    cond_filter = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Damaged"])
+    min_retail = st.sidebar.number_input(
+        "Minimum Retail MSRP ($)",
+        min_value=0,
+        max_value=50000,
+        value=0,
+        step=10
+    )
+    max_bid = st.sidebar.number_input(
+        "Maximum Current / Winning Bid ($)",
+        min_value=1,
+        max_value=50000,
+        value=1000,
+        step=25
+    )
+    sort_options = (
+        [
+            "🕒 Most Recently Closed",
+            "Highest Discount (%)",
+            "Lowest Winning Bid ($)",
+            "Highest Retail MSRP ($)",
+        ]
+        if is_archive_mode
+        else [
+            "⏳ Closing Soonest (Sniper)",
+            "Highest Discount (%)",
+            "Lowest Final Bid ($)",
+            "Highest Retail MSRP ($)",
+        ]
+    )
+    sort_by = st.sidebar.selectbox("↕️ Sort By", sort_options)
+
     # Always-visible top bar with Refresh button
-    top_bar_left, top_bar_right = st.columns([3.5, 1.5])
+    top_bar_left, top_bar_right = st.columns([3.8, 1.2])
     with top_bar_right:
         if st.button("🔄 Refresh Live Data", use_container_width=True, type="primary"):
             fetch_live_nellis_lots.clear()
             search_live_active_duplicates.clear()
             st.rerun()
 
-    # Collapsible Filter & Sort Options
-    with st.expander("⚙️ Filter & Sort Options", expanded=False):
-        col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 2.5, 2.5])
-        with col1:
-            search_kw = st.text_input("🔍 Search Keyword", placeholder="e.g. DeWalt, Dyson, Lego, Monitor...")
-        with col2:
-            loc_filter = st.selectbox("Warehouse", ["All", "Phoenix", "Mesa"])
-        with col3:
-            cond_filter = st.selectbox("Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Damaged"])
-        with col4:
-            time_filter = st.selectbox(
-                "⏳ Time Remaining",
-                [
-                    "🔥 Ending in < 5 mins (Live)",
-                    "⚡ Ending in < 15 mins (Live)",
-                    "⏳ Ending in < 30 mins (Live)",
-                    "🕒 Ending in < 1 hour (Live)",
-                    "📅 Ending Today (< 24 hrs)",
-                    "All Active Lots"
-                ]
-            )
-        with col5:
-            sort_by = st.selectbox(
-                "Sort By",
-                [
-                    "⏳ Closing Soonest (Sniper)",
-                    "Highest Discount (%)",
-                    "Lowest Final Bid ($)",
-                    "Highest Retail MSRP ($)"
-                ]
-            )
-
-        col_p1, col_p2 = st.columns(2)
-        with col_p1:
-            min_retail = st.number_input(
-                "Minimum Retail MSRP ($)",
-                min_value=0,
-                max_value=50000,
-                value=0,
-                step=10
-            )
-        with col_p2:
-            max_bid = st.number_input(
-                "Maximum Current / Winning Bid ($)",
-                min_value=1,
-                max_value=50000,
-                value=1000,
-                step=25
-            )
-
     with top_bar_left:
         kw_label = f" · 🔍 '{search_kw.strip()}'" if search_kw.strip() else ""
-        st.caption(f"**Active Filter:** {time_filter} · 📍 {loc_filter} · {cond_filter} · MSRP ≥ ${min_retail} · Bid ≤ ${max_bid}{kw_label}")
+        cat_label = f" · 🏷️ {cat_filter}" if cat_filter != "All Categories" else ""
+        st.caption(f"**Active Filter:** {time_filter}{cat_label} · 📍 {loc_filter} · {cond_filter} · MSRP ≥ ${min_retail} · Bid ≤ ${max_bid}{kw_label}")
 
-    # Fetch active lots (Always guarantees only ACTIVE lots are shown, never lots that ended last night)
-    with st.spinner("Fetching active lots..."):
-        live_df = fetch_live_nellis_lots(
-            search_kw=search_kw,
-            loc_filter=loc_filter,
-            sort_by=sort_by,
-            page_size=120
-        )
+    # Inject clean card styling for uniform 4-column desktop grid
+    st.markdown(
+        """
+        <style>
+        .nellis-card-img-wrap {
+            width: 100%;
+            height: 170px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #ffffff;
+            border-radius: 8px;
+            overflow: hidden;
+            margin-bottom: 8px;
+            padding: 6px;
+        }
+        .nellis-card-img-wrap img {
+            max-height: 158px;
+            max-width: 100%;
+            object-fit: contain;
+        }
+        .nellis-cat-pill {
+            display: inline-block;
+            font-size: 11px;
+            font-weight: 600;
+            color: #93c5fd;
+            background: #1e293b;
+            border: 1px solid #334155;
+            border-radius: 999px;
+            padding: 2px 8px;
+            margin-bottom: 6px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            max-width: 100%;
+        }
+        .nellis-card-title {
+            font-size: 14px;
+            font-weight: 600;
+            line-height: 1.35;
+            height: 38px;
+            overflow: hidden;
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            margin-bottom: 6px;
+        }
+        .nellis-card-title a {
+            text-decoration: none;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-        # If "All Active Lots" or "Ending Today", also union any active (closed_at > now()) lots in the Data Lake
-        if time_filter in ["All Active Lots", "📅 Ending Today (< 24 hrs)"]:
+    def enrich_categories(df_in: pd.DataFrame) -> pd.DataFrame:
+        if df_in.empty:
+            return df_in
+        if "category_primary" not in df_in.columns:
+            df_in["category_primary"] = ""
+        if "category_secondary" not in df_in.columns:
+            df_in["category_secondary"] = ""
+
+        cats = [
+            classify_product_category(t, cp, cs)
+            for t, cp, cs in zip(
+                df_in["title"].fillna(""),
+                df_in["category_primary"].fillna(""),
+                df_in["category_secondary"].fillna(""),
+            )
+        ]
+        df_in["category_primary"] = [c[0] for c in cats]
+        df_in["category_secondary"] = [c[1] for c in cats]
+        return df_in
+
+    results_df = pd.DataFrame()
+    live_df = pd.DataFrame()
+
+    if is_archive_mode:
+        # Query Closed / Historical Archive directly from Cloudflare R2 Data Lake
+        with st.spinner("Searching historical closed auctions in Data Lake..."):
             where_parts = [
-                "f.closed_at > now()",
+                "f.closed_at <= now()",
                 f"f.retail_price >= {min_retail}",
-                f"f.final_price <= {max_bid}"
+                f"f.final_price <= {max_bid}",
             ]
-            if time_filter == "📅 Ending Today (< 24 hrs)":
-                where_parts.append("f.closed_at <= now() + INTERVAL 24 HOUR")
             if loc_filter != "All":
                 where_parts.append(f"f.location = '{loc_filter}'")
             if cond_filter != "All":
@@ -668,16 +756,18 @@ if view_mode == "🎯 Deal Finder":
 
             where_sql = " AND ".join(where_parts)
             sort_sql = {
-                "⏳ Closing Soonest (Sniper)": "f.closed_at ASC",
+                "🕒 Most Recently Closed": "f.closed_at DESC",
                 "Highest Discount (%)": "f.discount_ratio ASC",
-                "Lowest Final Bid ($)": "f.final_price ASC",
-                "Highest Retail MSRP ($)": "f.retail_price DESC"
-            }.get(sort_by, "f.closed_at ASC")
+                "Lowest Winning Bid ($)": "f.final_price ASC",
+                "Highest Retail MSRP ($)": "f.retail_price DESC",
+            }.get(sort_by, "f.closed_at DESC")
 
-            lake_active_query = f"""
+            archive_query = f"""
                 SELECT 
                     f.auction_id,
                     p.title,
+                    p.category_primary,
+                    p.category_secondary,
                     f.location,
                     f.condition,
                     f.retail_price,
@@ -688,249 +778,348 @@ if view_mode == "🎯 Deal Finder":
                     f.closed_at,
                     f.photo_url,
                     CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms,
-                    (CAST(epoch_ms(f.closed_at) AS DOUBLE) - {int(time.time()*1000)}) / 1000.0 AS diff_sec
+                    -1.0 AS diff_sec
                 FROM fact_auctions f
                 JOIN dim_products p ON f.product_id = p.product_id
                 WHERE {where_sql}
                 ORDER BY {sort_sql}
-                LIMIT 100;
+                LIMIT 200;
             """
             try:
-                lake_active_df = con.execute(lake_active_query).df()
-                if not lake_active_df.empty:
-                    if live_df.empty:
-                        live_df = lake_active_df
-                    else:
-                        live_df = pd.concat([live_df, lake_active_df], ignore_index=True)
-                        live_df = live_df.drop_duplicates(subset=["auction_id"], keep="first")
-            except Exception:
-                pass
+                archive_df = con.execute(archive_query).df()
+                archive_df = enrich_categories(archive_df)
+                if not archive_df.empty and cat_filter != "All Categories":
+                    archive_df = archive_df[archive_df["category_primary"] == cat_filter]
+                results_df = archive_df.head(60)
+            except Exception as e:
+                st.error(f"Error querying Historical Archive: {e}")
+    else:
+        # Fetch active lots (Always guarantees only ACTIVE lots are shown, never lots that ended last night)
+        with st.spinner("Fetching active lots..."):
+            live_df = fetch_live_nellis_lots(
+                search_kw=search_kw,
+                loc_filter=loc_filter,
+                sort_by=sort_by,
+                page_size=120
+            )
 
-    results_df = pd.DataFrame()
-    if not live_df.empty:
-        # Strict filter: Only currently active lots (diff_sec > 0)
-        filtered = live_df[
-            (live_df['diff_sec'] > 0) &
-            (live_df['retail_price'] >= min_retail) &
-            (live_df['final_price'] <= max_bid)
-        ]
-        if loc_filter != "All":
-            filtered = filtered[filtered['location'].str.contains(loc_filter, case=False, na=False)]
-        if cond_filter != "All":
-            filtered = filtered[filtered['condition'].str.contains(cond_filter, case=False, na=False)]
-        if search_kw.strip():
-            filtered = filtered[
-                filtered['title'].str.contains(search_kw.strip(), case=False, na=False) |
-                filtered['damage_notes'].str.contains(search_kw.strip(), case=False, na=False)
+            # If "All Active Lots" or "Ending Today", also union any active (closed_at > now()) lots in the Data Lake
+            if time_filter in ["All Active Lots", "📅 Ending Today (< 24 hrs)"]:
+                where_parts = [
+                    "f.closed_at > now()",
+                    f"f.retail_price >= {min_retail}",
+                    f"f.final_price <= {max_bid}"
+                ]
+                if time_filter == "📅 Ending Today (< 24 hrs)":
+                    where_parts.append("f.closed_at <= now() + INTERVAL 24 HOUR")
+                if loc_filter != "All":
+                    where_parts.append(f"f.location = '{loc_filter}'")
+                if cond_filter != "All":
+                    where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
+                if search_kw.strip():
+                    kw = search_kw.strip().replace("'", "''")
+                    where_parts.append(f"(p.title ILIKE '%{kw}%' OR f.damage_notes ILIKE '%{kw}%')")
+
+                where_sql = " AND ".join(where_parts)
+                sort_sql = {
+                    "⏳ Closing Soonest (Sniper)": "f.closed_at ASC",
+                    "Highest Discount (%)": "f.discount_ratio ASC",
+                    "Lowest Final Bid ($)": "f.final_price ASC",
+                    "Highest Retail MSRP ($)": "f.retail_price DESC"
+                }.get(sort_by, "f.closed_at ASC")
+
+                lake_active_query = f"""
+                    SELECT 
+                        f.auction_id,
+                        p.title,
+                        p.category_primary,
+                        p.category_secondary,
+                        f.location,
+                        f.condition,
+                        f.retail_price,
+                        f.final_price,
+                        ROUND((1.0 - f.discount_ratio) * 100.0, 1) AS discount_pct,
+                        f.bid_count,
+                        f.damage_notes,
+                        f.closed_at,
+                        f.photo_url,
+                        CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms,
+                        (CAST(epoch_ms(f.closed_at) AS DOUBLE) - {int(time.time()*1000)}) / 1000.0 AS diff_sec
+                    FROM fact_auctions f
+                    JOIN dim_products p ON f.product_id = p.product_id
+                    WHERE {where_sql}
+                    ORDER BY {sort_sql}
+                    LIMIT 120;
+                """
+                try:
+                    lake_active_df = con.execute(lake_active_query).df()
+                    if not lake_active_df.empty:
+                        if live_df.empty:
+                            live_df = lake_active_df
+                        else:
+                            live_df = pd.concat([live_df, lake_active_df], ignore_index=True)
+                            live_df = live_df.drop_duplicates(subset=["auction_id"], keep="first")
+                except Exception:
+                    pass
+
+        if not live_df.empty:
+            live_df = enrich_categories(live_df)
+            # Strict filter: Only currently active lots (diff_sec > 0)
+            filtered = live_df[
+                (live_df['diff_sec'] > 0) &
+                (live_df['retail_price'] >= min_retail) &
+                (live_df['final_price'] <= max_bid)
             ]
+            if cat_filter != "All Categories":
+                filtered = filtered[filtered['category_primary'] == cat_filter]
+            if loc_filter != "All":
+                filtered = filtered[filtered['location'].str.contains(loc_filter, case=False, na=False)]
+            if cond_filter != "All":
+                filtered = filtered[filtered['condition'].str.contains(cond_filter, case=False, na=False)]
+            if search_kw.strip():
+                filtered = filtered[
+                    filtered['title'].str.contains(search_kw.strip(), case=False, na=False) |
+                    filtered['damage_notes'].str.contains(search_kw.strip(), case=False, na=False)
+                ]
 
-        max_sec_map = {
-            "🔥 Ending in < 5 mins (Live)": 300,
-            "⚡ Ending in < 15 mins (Live)": 900,
-            "⏳ Ending in < 30 mins (Live)": 1800,
-            "🕒 Ending in < 1 hour (Live)": 3600,
-            "📅 Ending Today (< 24 hrs)": 86400
-        }
-        if time_filter in max_sec_map:
-            filtered = filtered[filtered['diff_sec'] <= max_sec_map[time_filter]]
+            max_sec_map = {
+                "🔥 Ending in < 5 mins (Live)": 300,
+                "⚡ Ending in < 15 mins (Live)": 900,
+                "⏳ Ending in < 30 mins (Live)": 1800,
+                "🕒 Ending in < 1 hour (Live)": 3600,
+                "📅 Ending Today (< 24 hrs)": 86400
+            }
+            if time_filter in max_sec_map:
+                filtered = filtered[filtered['diff_sec'] <= max_sec_map[time_filter]]
 
-        if sort_by == "Highest Discount (%)":
-            filtered = filtered.sort_values(by="discount_pct", ascending=False)
-        elif sort_by == "Lowest Final Bid ($)":
-            filtered = filtered.sort_values(by="final_price", ascending=True)
-        elif sort_by == "Highest Retail MSRP ($)":
-            filtered = filtered.sort_values(by="retail_price", ascending=False)
-        else:
-            filtered = filtered.sort_values(by="diff_sec", ascending=True)
+            if sort_by == "Highest Discount (%)":
+                filtered = filtered.sort_values(by="discount_pct", ascending=False)
+            elif sort_by == "Lowest Final Bid ($)":
+                filtered = filtered.sort_values(by="final_price", ascending=True)
+            elif sort_by == "Highest Retail MSRP ($)":
+                filtered = filtered.sort_values(by="retail_price", ascending=False)
+            else:
+                filtered = filtered.sort_values(by="diff_sec", ascending=True)
 
-        results_df = filtered.head(50)
+            results_df = filtered.head(60)
 
     # Load cached historical index for fast O(1) price history badges
     hist_index = load_historical_price_index()
     active_batch_records = live_df.to_dict("records") if not live_df.empty else []
 
-    st.write(f"**Showing {len(results_df)} active lots:**")
+    mode_noun = "closed historical lots" if is_archive_mode else "active lots"
+    st.write(f"**Showing {len(results_df)} {mode_noun}:**")
 
     if results_df.empty:
-        st.info("No active items match your filter criteria right now. Open '⚙️ Filter & Sort Options' to expand the time window or adjust filters.")
+        st.info("No items match your filter criteria right now. Adjust the filters in the left sidebar to widen your search.")
     else:
-        for idx, row in results_df.iterrows():
-            row_dict = row.to_dict()
-            auction_id = int(row_dict['auction_id'])
-            item_url = f"https://www.nellisauction.com/p/item/{auction_id}"
-            cur_bid = float(row_dict.get('final_price') or 0)
-            msrp = float(row_dict.get('retail_price') or 0)
-            cond_display = format_clean_condition(row_dict.get('condition'))
-            cond_tier = get_condition_tier(cond_display)
+        records = results_df.to_dict("records")
+        for row_start in range(0, len(records), 4):
+            grid_cols = st.columns(4)
+            for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
+                auction_id = int(row_dict['auction_id'])
+                item_url = f"https://www.nellisauction.com/p/item/{auction_id}"
+                cur_bid = float(row_dict.get('final_price') or 0)
+                msrp = float(row_dict.get('retail_price') or 0)
+                cond_display = format_clean_condition(row_dict.get('condition'))
+                cond_tier = get_condition_tier(cond_display)
+                cat_primary = row_dict.get('category_primary') or 'Home & General'
+                cat_secondary = row_dict.get('category_secondary') or 'Miscellaneous'
 
-            # Calculate initial time badge
-            time_badge = ""
-            try:
-                diff_sec = float(row_dict.get('diff_sec') or 0)
-                if diff_sec <= 0:
-                    time_badge = "🔴 **POTENTIALLY CLOSED**"
-                elif diff_sec < 180:
-                    mins = int(diff_sec // 60)
-                    secs = int(diff_sec % 60)
-                    time_badge = f"🔥 **{mins}m {secs:02d}s left (SNIPE NOW!)**"
-                elif diff_sec < 600:
-                    mins = int(diff_sec // 60)
-                    secs = int(diff_sec % 60)
-                    time_badge = f"⚡ **{mins}m {secs:02d}s left**"
-                elif diff_sec < 3600:
-                    mins = int(diff_sec // 60)
-                    time_badge = f"⏳ **{mins}m left**"
+                # Calculate initial time badge
+                if is_archive_mode:
+                    time_badge = f"🏁 Closed: {str(row_dict.get('closed_at'))[:16]}"
                 else:
-                    hours = int(diff_sec // 3600)
-                    mins = int((diff_sec % 3600) // 60)
-                    time_badge = f"🕒 **{hours}h {mins}m left**"
-            except Exception:
-                time_badge = f"Closes: {str(row_dict.get('closed_at'))[:16]}"
-
-            # 1. Lookup Historical Closed Matches (Like-for-Like Condition)
-            past_matches = find_historical_matches(row_dict, hist_index, same_condition_only=True)
-
-            # 2. Check for cheaper active copies in current batch
-            cheaper_in_batch = [
-                c for c in active_batch_records
-                if int(c.get("auction_id") or 0) != auction_id
-                and float(c.get("diff_sec") or 0) > 0
-                and float(c.get("final_price") or 0) < cur_bid
-                and get_condition_tier(c.get("condition")) == cond_tier
-                and is_same_product(
-                    row_dict.get("title"), msrp, row_dict.get("photo_url"),
-                    c.get("title"), c.get("retail_price"), c.get("photo_url")
-                )
-            ]
-
-            with st.container():
-                c_img, c_card1, c_card2, c_card3 = st.columns([1.4, 4.2, 2.6, 2.8])
-
-                with c_img:
-                    photo = row_dict.get("photo_url")
-                    if photo and str(photo) != "nan" and str(photo).strip():
-                        st.image(photo, use_container_width=True)
-                    else:
-                        st.caption("📷 No photo")
-
-                with c_card1:
-                    st.markdown(f"**[{row_dict['title']}]({item_url})**")
-                    notes = row_dict.get('damage_notes')
-                    if notes and str(notes) != "nan" and str(notes).strip():
-                        st.caption(f"⚠️ **Notes:** {notes}")
-                    st.markdown(f"[👉 **Place Bid on Nellis Auction ↗**]({item_url})")
-
-                with c_card2:
-                    cond_color = "🟢" if cond_tier == "New" else "🟡"
-                    st.write(f"{cond_color} **{cond_display}** · 📍 {row_dict['location']}")
-                    close_epoch_ms = int(row_dict.get('close_ms') or 0)
-                    time_badge_html = f"""<div class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" style="display:inline-block; font-weight:700; padding:3px 9px; border-radius:6px; font-size:12px; margin-top:4px; margin-bottom:4px; background-color:#450a0a; color:#fca5a5; border:1px solid #ef4444;">{time_badge}</div>"""
-                    st.markdown(time_badge_html, unsafe_allow_html=True)
-                    st.caption(f"Bids: **{row_dict['bid_count']}** · Closes: {str(row_dict['closed_at'])[:19]}")
-
-                with c_card3:
-                    st.metric(
-                        label="Current Bid",
-                        value=f"${cur_bid:.2f}",
-                        delta=f"{float(row_dict['discount_pct']):.0f}% off (${msrp:.0f} MSRP)"
-                    )
-
-                    # Price History & Cheaper Active Copies Summary Badge
-                    if past_matches:
-                        p_prices = [float(m.get("final_price") or 0) for m in past_matches]
-                        min_won = min(p_prices)
-                        avg_won = sum(p_prices) / len(p_prices)
-                        if cur_bid <= min_won:
-                            verdict = "🟢 **Below All-Time Low!**"
-                        elif cur_bid <= avg_won:
-                            verdict = "🟢 **Below Avg Winning Price**"
+                    try:
+                        diff_sec = float(row_dict.get('diff_sec') or 0)
+                        if diff_sec <= 0:
+                            time_badge = "🔴 **POTENTIALLY CLOSED**"
+                        elif diff_sec < 180:
+                            mins = int(diff_sec // 60)
+                            secs = int(diff_sec % 60)
+                            time_badge = f"🔥 **{mins}m {secs:02d}s left (SNIPE!)**"
+                        elif diff_sec < 600:
+                            mins = int(diff_sec // 60)
+                            secs = int(diff_sec % 60)
+                            time_badge = f"⚡ **{mins}m {secs:02d}s left**"
+                        elif diff_sec < 3600:
+                            mins = int(diff_sec // 60)
+                            time_badge = f"⏳ **{mins}m left**"
                         else:
-                            verdict = f"🔴 **Above Avg (${avg_won:.0f})**"
-                        st.caption(f"🏆 **Cheapest Won ({cond_tier}):** **${min_won:.2f}** · Avg ${avg_won:.0f} *({len(past_matches)} sold)*\n\n{verdict}")
-                    else:
-                        st.caption(f"📊 No past '{cond_tier}' sales in lake yet")
+                            hours = int(diff_sec // 3600)
+                            mins = int((diff_sec % 3600) // 60)
+                            time_badge = f"🕒 **{hours}h {mins}m left**"
+                    except Exception:
+                        time_badge = f"Closes: {str(row_dict.get('closed_at'))[:16]}"
 
-                    if cheaper_in_batch:
-                        cheapest_open = min(float(c.get("final_price") or 0) for c in cheaper_in_batch)
-                        st.markdown(f"💡 **:green[{len(cheaper_in_batch)} Cheaper Open (From ${cheapest_open:.2f})!]**")
+                # 1. Lookup Historical Closed Matches (Like-for-Like Condition)
+                past_matches = find_historical_matches(row_dict, hist_index, same_condition_only=True)
 
-                    btn_label = f"🔍 History ({len(past_matches)}) & Active Copies"
-                    if st.button(btn_label, key=f"btn_hist_{auction_id}", use_container_width=True):
-                        show_item_history_dialog(row_dict)
+                # 2. Check for cheaper active copies in current batch (when not in archive mode)
+                cheaper_in_batch = []
+                if not is_archive_mode:
+                    cheaper_in_batch = [
+                        c for c in active_batch_records
+                        if int(c.get("auction_id") or 0) != auction_id
+                        and float(c.get("diff_sec") or 0) > 0
+                        and float(c.get("final_price") or 0) < cur_bid
+                        and get_condition_tier(c.get("condition")) == cond_tier
+                        and is_same_product(
+                            row_dict.get("title"), msrp, row_dict.get("photo_url"),
+                            c.get("title"), c.get("retail_price"), c.get("photo_url")
+                        )
+                    ]
 
-                st.markdown("---")
+                with grid_cols[col_idx]:
+                    with st.container(border=True):
+                        # 1. Uniform Product Image
+                        photo = row_dict.get("photo_url")
+                        img_src = str(photo).strip() if photo and str(photo) != "nan" and str(photo).strip() else "https://placehold.co/300x200?text=No+Photo"
+                        st.markdown(
+                            f'<a href="{item_url}" target="_blank"><div class="nellis-card-img-wrap"><img src="{img_src}" alt="Item"/></div></a>',
+                            unsafe_allow_html=True,
+                        )
 
-        # Inject real-time ticking countdown JavaScript
-        components.html(
-            """
-            <script>
-            (function() {
-                function tickCountdowns() {
-                    try {
-                        const parentDoc = window.parent.document;
-                        if (!parentDoc) return;
-                        const badges = parentDoc.querySelectorAll('.nellis-countdown-badge[data-close-ms]');
-                        const now = Date.now();
-                        
-                        badges.forEach(badge => {
-                            const closeMs = parseInt(badge.getAttribute('data-close-ms'));
-                            if (!closeMs || isNaN(closeMs)) return;
+                        # 2. Category Breadcrumb Pill
+                        st.markdown(
+                            f'<div class="nellis-cat-pill" title="{cat_primary} → {cat_secondary}">🏷️ {cat_primary} → {cat_secondary}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # 3. Title (2-line clamp)
+                        safe_title = str(row_dict.get('title') or 'Untitled').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+                        st.markdown(
+                            f'<div class="nellis-card-title" title="{safe_title}"><a href="{item_url}" target="_blank">{safe_title}</a></div>',
+                            unsafe_allow_html=True,
+                        )
+
+                        # 4. Condition & Location
+                        cond_color = "🟢" if cond_tier == "New" else "🟡"
+                        st.caption(f"{cond_color} **{cond_display}** · 📍 {row_dict['location']}")
+
+                        # 5. Dynamic Countdown or Closed Timestamp
+                        if is_archive_mode:
+                            st.markdown(
+                                f'<div style="display:inline-block; font-weight:700; padding:3px 8px; border-radius:6px; font-size:11.5px; margin:2px 0 6px 0; background-color:#1e293b; color:#cbd5e1; border:1px solid #475569;">{time_badge}</div>',
+                                unsafe_allow_html=True,
+                            )
+                        else:
+                            close_epoch_ms = int(row_dict.get('close_ms') or 0)
+                            time_badge_html = f"""<div class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" style="display:inline-block; font-weight:700; padding:3px 8px; border-radius:6px; font-size:11.5px; margin:2px 0 6px 0; background-color:#450a0a; color:#fca5a5; border:1px solid #ef4444;">{time_badge}</div>"""
+                            st.markdown(time_badge_html, unsafe_allow_html=True)
+
+                        # 6. Price, MSRP, Discount & Bids
+                        bid_label = "Winning Bid" if is_archive_mode else "Current Bid"
+                        disc_pct_val = float(row_dict.get('discount_pct') or 0)
+                        st.markdown(
+                            f"**{bid_label}:** <span style='font-size:18px; font-weight:800;'>${cur_bid:.2f}</span> "
+                            f"<span style='color:#4ade80; font-size:12px; font-weight:600;'>({disc_pct_val:.0f}% off · ${msrp:.0f} MSRP)</span>",
+                            unsafe_allow_html=True,
+                        )
+                        st.caption(f"Bids: **{row_dict['bid_count']}** · Lot `#{auction_id}`")
+
+                        notes = row_dict.get('damage_notes')
+                        if notes and str(notes) != "nan" and str(notes).strip():
+                            st.caption(f"⚠️ **Notes:** {str(notes)[:80]}")
+
+                        # 7. Price History & Cheaper Active Copies Summary
+                        if past_matches:
+                            p_prices = [float(m.get("final_price") or 0) for m in past_matches]
+                            min_won = min(p_prices)
+                            avg_won = sum(p_prices) / len(p_prices)
+                            if cur_bid <= min_won:
+                                verdict = "🟢 **Below All-Time Low!**"
+                            elif cur_bid <= avg_won:
+                                verdict = "🟢 **Below Avg Win**"
+                            else:
+                                verdict = f"🔴 **Above Avg (${avg_won:.0f})**"
+                            st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.0f} ({len(past_matches)}) · {verdict}")
+                        else:
+                            st.caption(f"📊 No past '{cond_tier}' sales yet")
+
+                        if cheaper_in_batch:
+                            cheapest_open = min(float(c.get("final_price") or 0) for c in cheaper_in_batch)
+                            st.markdown(f"💡 **:green[{len(cheaper_in_batch)} Cheaper Open (${cheapest_open:.2f})!]**")
+
+                        # 8. Card Action Links & History Modal Button
+                        action_label = "🔗 View Closed Lot ↗" if is_archive_mode else "👉 Place Bid on Nellis ↗"
+                        st.markdown(f"[{action_label}]({item_url})")
+                        btn_label = f"🔍 History ({len(past_matches)}) & Active"
+                        if st.button(btn_label, key=f"btn_hist_{auction_id}", use_container_width=True):
+                            show_item_history_dialog(row_dict)
+
+        # Inject real-time ticking countdown JavaScript (only needed in active mode)
+        if not is_archive_mode:
+            components.html(
+                """
+                <script>
+                (function() {
+                    function tickCountdowns() {
+                        try {
+                            const parentDoc = window.parent.document;
+                            if (!parentDoc) return;
+                            const badges = parentDoc.querySelectorAll('.nellis-countdown-badge[data-close-ms]');
+                            const now = Date.now();
                             
-                            const diff = closeMs - now;
-                            const totalSec = Math.floor(diff / 1000);
-                            
-                            if (totalSec <= 0) {
-                                badge.innerHTML = "🔴 <b>POTENTIALLY CLOSED</b> <span style='font-size:10px; opacity:0.8;'>(anti-snipe check)</span>";
-                                badge.style.backgroundColor = "#334155";
-                                badge.style.color = "#cbd5e1";
-                                badge.style.borderColor = "#64748b";
-                            } else {
-                                const mins = Math.floor(totalSec / 60);
-                                const secs = totalSec % 60;
-                                const secStr = secs < 10 ? '0' + secs : secs;
+                            badges.forEach(badge => {
+                                const closeMs = parseInt(badge.getAttribute('data-close-ms'));
+                                if (!closeMs || isNaN(closeMs)) return;
                                 
-                                if (totalSec < 180) {
-                                    badge.innerHTML = "🔥 <b>" + mins + "m " + secStr + "s left (SNIPE NOW!)</b>";
-                                    badge.style.backgroundColor = "#450a0a";
-                                    badge.style.color = "#fca5a5";
-                                    badge.style.borderColor = "#ef4444";
-                                } else if (totalSec < 600) {
-                                    badge.innerHTML = "⚡ <b>" + mins + "m " + secStr + "s left</b>";
-                                    badge.style.backgroundColor = "#451a03";
-                                    badge.style.color = "#fcd34d";
-                                    badge.style.borderColor = "#f59e0b";
-                                } else if (totalSec < 3600) {
-                                    badge.innerHTML = "⏳ <b>" + mins + "m left</b>";
-                                    badge.style.backgroundColor = "#172554";
-                                    badge.style.color = "#93c5fd";
-                                    badge.style.borderColor = "#3b82f6";
-                                } else {
-                                    const hours = Math.floor(totalSec / 3600);
-                                    const remMins = Math.floor((totalSec % 3600) / 60);
-                                    badge.innerHTML = "🕒 <b>" + hours + "h " + remMins + "m left</b>";
-                                    badge.style.backgroundColor = "#0f172a";
+                                const diff = closeMs - now;
+                                const totalSec = Math.floor(diff / 1000);
+                                
+                                if (totalSec <= 0) {
+                                    badge.innerHTML = "🔴 <b>POTENTIALLY CLOSED</b> <span style='font-size:10px; opacity:0.8;'>(anti-snipe)</span>";
+                                    badge.style.backgroundColor = "#334155";
                                     badge.style.color = "#cbd5e1";
-                                    badge.style.borderColor = "#334155";
+                                    badge.style.borderColor = "#64748b";
+                                } else {
+                                    const mins = Math.floor(totalSec / 60);
+                                    const secs = totalSec % 60;
+                                    const secStr = secs < 10 ? '0' + secs : secs;
+                                    
+                                    if (totalSec < 180) {
+                                        badge.innerHTML = "🔥 <b>" + mins + "m " + secStr + "s left (SNIPE!)</b>";
+                                        badge.style.backgroundColor = "#450a0a";
+                                        badge.style.color = "#fca5a5";
+                                        badge.style.borderColor = "#ef4444";
+                                    } else if (totalSec < 600) {
+                                        badge.innerHTML = "⚡ <b>" + mins + "m " + secStr + "s left</b>";
+                                        badge.style.backgroundColor = "#451a03";
+                                        badge.style.color = "#fcd34d";
+                                        badge.style.borderColor = "#f59e0b";
+                                    } else if (totalSec < 3600) {
+                                        badge.innerHTML = "⏳ <b>" + mins + "m left</b>";
+                                        badge.style.backgroundColor = "#172554";
+                                        badge.style.color = "#93c5fd";
+                                        badge.style.borderColor = "#3b82f6";
+                                    } else {
+                                        const hours = Math.floor(totalSec / 3600);
+                                        const remMins = Math.floor((totalSec % 3600) / 60);
+                                        badge.innerHTML = "🕒 <b>" + hours + "h " + remMins + "m left</b>";
+                                        badge.style.backgroundColor = "#0f172a";
+                                        badge.style.color = "#cbd5e1";
+                                        badge.style.borderColor = "#334155";
+                                    }
                                 }
-                            }
-                        });
-                    } catch (e) {
-                        // ignore sandbox warnings
+                            });
+                        } catch (e) {
+                            // ignore sandbox warnings
+                        }
                     }
-                }
-                
-                tickCountdowns();
-                if (window.parent && !window.parent.__nellisTimer) {
-                    window.parent.__nellisTimer = setInterval(tickCountdowns, 1000);
-                } else if (!window.__nellisTimer) {
-                    window.__nellisTimer = setInterval(tickCountdowns, 1000);
-                }
-            })();
-            </script>
-            """,
-            height=0,
-            width=0
-        )
+                    
+                    tickCountdowns();
+                    if (window.parent && !window.parent.__nellisTimer) {
+                        window.parent.__nellisTimer = setInterval(tickCountdowns, 1000);
+                    } else if (!window.__nellisTimer) {
+                        window.__nellisTimer = setInterval(tickCountdowns, 1000);
+                    }
+                })();
+                </script>
+                """,
+                height=0,
+                width=0
+            )
 
 
 # --- TAB 2: ANALYTICS HUB ---
