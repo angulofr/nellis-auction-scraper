@@ -1284,6 +1284,8 @@ if view_mode == "🎯 Deal Finder":
                     p.category_secondary,
                     f.location,
                     f.condition,
+                    f.completeness,
+                    f.functional_status,
                     f.retail_price,
                     f.final_price,
                     ROUND((1.0 - f.discount_ratio) * 100.0, 1) AS discount_pct,
@@ -1304,9 +1306,13 @@ if view_mode == "🎯 Deal Finder":
                 archive_df = enrich_categories(archive_df)
                 if not archive_df.empty:
                     notes_col = archive_df["damage_notes"].fillna("") if "damage_notes" in archive_df.columns else [""] * len(archive_df)
+                    comp_col = archive_df["completeness"].fillna("") if "completeness" in archive_df.columns else [""] * len(archive_df)
+                    func_col = archive_df["functional_status"].fillna("") if "functional_status" in archive_df.columns else [""] * len(archive_df)
                     archive_df["condition"] = [
-                        format_clean_condition(c, t, n)
-                        for c, t, n in zip(archive_df["condition"].fillna(""), archive_df["title"].fillna(""), notes_col)
+                        "Incomplete / Damaged / Parts"
+                        if (str(cp).lower() in ("incomplete", "partial") or str(fn).lower() in ("non-functional", "broken"))
+                        else format_clean_condition(c, t, n)
+                        for c, t, n, cp, fn in zip(archive_df["condition"].fillna(""), archive_df["title"].fillna(""), notes_col, comp_col, func_col)
                     ]
                     if cond_filter != "All":
                         archive_df = archive_df[archive_df["condition"].str.contains(cond_filter, case=False, na=False)]
@@ -1367,6 +1373,8 @@ if view_mode == "🎯 Deal Finder":
                         p.category_secondary,
                         f.location,
                         f.condition,
+                        f.completeness,
+                        f.functional_status,
                         f.retail_price,
                         f.final_price,
                         ROUND((1.0 - f.discount_ratio) * 100.0, 1) AS discount_pct,
@@ -1396,9 +1404,13 @@ if view_mode == "🎯 Deal Finder":
         if not live_df.empty:
             live_df = enrich_categories(live_df)
             notes_col = live_df["damage_notes"].fillna("") if "damage_notes" in live_df.columns else [""] * len(live_df)
+            comp_col = live_df["completeness"].fillna("") if "completeness" in live_df.columns else [""] * len(live_df)
+            func_col = live_df["functional_status"].fillna("") if "functional_status" in live_df.columns else [""] * len(live_df)
             live_df["condition"] = [
-                format_clean_condition(c, t, n)
-                for c, t, n in zip(live_df["condition"].fillna(""), live_df["title"].fillna(""), notes_col)
+                "Incomplete / Damaged / Parts"
+                if (str(cp).lower() in ("incomplete", "partial") or str(fn).lower() in ("non-functional", "broken"))
+                else format_clean_condition(c, t, n)
+                for c, t, n, cp, fn in zip(live_df["condition"].fillna(""), live_df["title"].fillna(""), notes_col, comp_col, func_col)
             ]
             # Strict filter: Only currently active lots (diff_sec > 0)
             filtered = live_df[
@@ -1879,6 +1891,8 @@ elif view_mode == "🏆 Best Past Deals":
             p.category_secondary,
             f.location,
             f.condition,
+            f.completeness,
+            f.functional_status,
             f.retail_price,
             f.final_price,
             ROUND(f.retail_price - f.final_price, 2) AS dollar_savings,
@@ -1914,9 +1928,13 @@ elif view_mode == "🏆 Best Past Deals":
         pd_df["category_secondary"] = [c[1] for c in cats]
 
         notes_col = pd_df["damage_notes"].fillna("") if "damage_notes" in pd_df.columns else [""] * len(pd_df)
+        comp_col = pd_df["completeness"].fillna("") if "completeness" in pd_df.columns else [""] * len(pd_df)
+        func_col = pd_df["functional_status"].fillna("") if "functional_status" in pd_df.columns else [""] * len(pd_df)
         pd_df["condition"] = [
-            format_clean_condition(c, t, n)
-            for c, t, n in zip(pd_df["condition"].fillna(""), pd_df["title"].fillna(""), notes_col)
+            "Incomplete / Damaged / Parts"
+            if (str(cp).lower() in ("incomplete", "partial") or str(fn).lower() in ("non-functional", "broken"))
+            else format_clean_condition(c, t, n)
+            for c, t, n, cp, fn in zip(pd_df["condition"].fillna(""), pd_df["title"].fillna(""), notes_col, comp_col, func_col)
         ]
         if pd_cond != "All":
             pd_df = pd_df[pd_df["condition"].str.contains(pd_cond, case=False, na=False)]
