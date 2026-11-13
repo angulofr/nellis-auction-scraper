@@ -217,6 +217,10 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
         missing_raw = item.get("missing_parts") or grade.get("missingPartsType", {}).get("description")
         rating = item.get("condition_rating") or grade.get("rating")
         notes = (item.get("inspector_notes") or item.get("notes") or "").strip()
+        if damage_raw and str(damage_raw).strip().lower() not in ("", "none", "no", "null"):
+            dmg_tag = f"[Damage: {str(damage_raw).strip()}]"
+            if dmg_tag.lower() not in notes.lower():
+                notes = f"{notes} {dmg_tag}".strip()
 
         condition = standardize_condition(
             cond_raw, damage_raw, rating,
