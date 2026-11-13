@@ -958,6 +958,9 @@ def inject_nellis_card_css():
     )
 
 
+st.markdown('<div id="nellis-top-anchor"></div>', unsafe_allow_html=True)
+
+
 # --- SIDEBAR CONTROLS ---
 view_mode = st.sidebar.radio("Navigation", ["🎯 Deal Finder", "🏆 Best Past Deals", "📊 Analytics Hub", "💻 SQL Studio"])
 
@@ -2374,14 +2377,21 @@ LIMIT 25;"""
 
 
 if st.session_state.pop("_scroll_to_top", False):
+    scroll_nonce = int(st.session_state.get("_scroll_nonce", 0)) + 1
+    st.session_state["_scroll_nonce"] = scroll_nonce
     components.html(
-        """
+        f"""
+        <!-- scroll_nonce: {scroll_nonce} -->
         <script>
-        (function() {
-            function scrollTopNow() {
-                try {
+        (function() {{
+            function scrollTopNow() {{
+                try {{
                     const p = window.parent;
                     const doc = p.document;
+                    const anchor = doc.getElementById('nellis-top-anchor');
+                    if (anchor && anchor.scrollIntoView) {{
+                        anchor.scrollIntoView({{ behavior: 'instant', block: 'start' }});
+                    }}
                     const selectors = [
                         'section.stMain',
                         'section.main',
@@ -2389,19 +2399,20 @@ if st.session_state.pop("_scroll_to_top", False):
                         '[data-testid="stMain"]',
                         '.main'
                     ];
-                    selectors.forEach(sel => {
+                    selectors.forEach(sel => {{
                         const el = doc.querySelector(sel);
                         if (el) el.scrollTop = 0;
-                    });
+                    }});
                     if (doc.documentElement) doc.documentElement.scrollTop = 0;
                     if (doc.body) doc.body.scrollTop = 0;
                     p.scrollTo(0, 0);
-                } catch (e) {}
-            }
+                }} catch (e) {{}}
+            }}
             scrollTopNow();
-            setTimeout(scrollTopNow, 80);
-            setTimeout(scrollTopNow, 250);
-        })();
+            setTimeout(scrollTopNow, 100);
+            setTimeout(scrollTopNow, 300);
+            setTimeout(scrollTopNow, 600);
+        }})();
         </script>
         """,
         height=0,
