@@ -52,18 +52,18 @@ STOP_WORDS = {
 
 
 @st.cache_resource
-def get_duckdb_con():
+def get_duckdb_con(_v=2):
     """Create and cache persistent DuckDB connection with Cloudflare R2 httpfs."""
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     host = R2_ENDPOINT_URL.replace("https://", "").replace("http://", "").strip("/")
     con.execute(f"""
-        SET s3_endpoint = '{host}';
-        SET s3_access_key_id = '{R2_ACCESS_KEY_ID}';
-        SET s3_secret_access_key = '{R2_SECRET_ACCESS_KEY}';
-        SET s3_url_style = 'path';
-        SET s3_region = 'auto';
-        SET s3_use_ssl = true;
+        SET GLOBAL s3_endpoint = '{host}';
+        SET GLOBAL s3_access_key_id = '{R2_ACCESS_KEY_ID}';
+        SET GLOBAL s3_secret_access_key = '{R2_SECRET_ACCESS_KEY}';
+        SET GLOBAL s3_url_style = 'path';
+        SET GLOBAL s3_region = 'auto';
+        SET GLOBAL s3_use_ssl = true;
     """)
     con.execute(f"CREATE OR REPLACE VIEW fact_auctions AS SELECT * FROM read_parquet('s3://{R2_BUCKET_NAME}/fact_auctions/*/*/*.parquet');")
     con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('s3://{R2_BUCKET_NAME}/dim_products/products_catalog.parquet');")
