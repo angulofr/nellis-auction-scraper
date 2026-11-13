@@ -599,123 +599,173 @@ def search_live_active_duplicates(title: str, retail_price: float, photo_url: st
 
 # --- POPUP MODAL OVERLAY FOR PRICE HISTORY & CHEAPER ACTIVE COPIES ---
 
-@st.dialog("🔍 Item Price History & Active Copies", width="large")
+@st.dialog("🔍 Price History & Active Copies", width="large")
 def show_item_history_dialog(item_row: dict):
-    """Modal popup displaying cheaper active copies to bid on + past winning price history."""
+    """Compact, mobile-first modal popup displaying active copies and past winning price history."""
     item_id = int(item_row.get("auction_id") or 0)
-    title = item_row.get("title") or "Unknown Item"
+    title = str(item_row.get("title") or "Unknown Item")
     cur_bid = float(item_row.get("final_price") or 0)
     msrp = float(item_row.get("retail_price") or 0)
     cond_display = format_clean_condition(item_row.get("condition"))
     cond_tier = get_condition_tier(cond_display)
-    photo = item_row.get("photo_url") or ""
+    photo = str(item_row.get("photo_url") or "").strip()
+    notes_str = str(item_row.get("damage_notes") or "").strip()
+    if notes_str.lower() == "nan":
+        notes_str = ""
     item_url = f"https://www.nellisauction.com/p/item/{item_id}"
+    safe_title = title.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
+    img_src = photo if photo and photo.lower() != "nan" else "https://placehold.co/120x120?text=No+Photo"
 
-    # Header summary of selected item
-    h_col1, h_col2 = st.columns([1, 4])
-    with h_col1:
-        if photo and str(photo) != "nan":
-            st.image(photo, use_container_width=True)
-    with h_col2:
-        st.markdown(f"**[{title}]({item_url})**")
-        cat_p = item_row.get("category_primary") or ""
-        cat_s = item_row.get("category_secondary") or ""
-        if not cat_p:
-            cat_p, cat_s = classify_product_category(title)
-        st.caption(f"🏷️ **{cat_p} → {cat_s}** · Lot ID: `{item_id}` · Condition: **{cond_display}** (`{cond_tier}`) · MSRP: **${msrp:.2f}** · Bid: **${cur_bid:.2f}**")
-        same_cond_only = st.checkbox(
-            f"Like-for-Like Condition Only (Compare only against '{cond_tier}' items)",
-            value=True,
-            key=f"dlg_cond_toggle_{item_id}"
-        )
+    cat_p = item_row.get("category_primary") or ""
+    cat_s = item_row.get("category_secondary") or ""
+    if not cat_p:
+        cat_p, cat_s = classify_product_category(title)
 
-    st.markdown("---")
+    # Compact side-by-side header (stays horizontal on both mobile and desktop)
+    st.markdown(
+        f"""
+        <div style="display:flex; gap:12px; align-items:center; background:#0f172a; border:1px solid #334155; border-radius:12px; padding:10px 12px; margin-bottom:10px;">
+            <div style="flex:0 0 72px; width:72px; height:72px; background:#ffffff; border-radius:8px; display:flex; align-items:center; justify-content:center; padding:4px;">
+                <img src="{img_src}" style="max-width:100%; max-height:100%; object-fit:contain;" alt="Item"/>
+            </div>
+            <div style="flex:1; min-width:0;">
+                <div style="font-size:14px; font-weight:700; line-height:1.3; margin-bottom:4px;">
+                    <a href="{item_url}" target="_blank" style="color:#f8fafc; text-decoration:none;">{safe_title} ↗</a>
+                </div>
+                <div style="font-size:12px; color:#cbd5e1; line-height:1.4;">
+                    <b>Bid:</b> ${cur_bid:,.2f} &nbsp;·&nbsp; <b>MSRP:</b> ${msrp:,.2f} &nbsp;·&nbsp; <b>{cond_display}</b>
+                </div>
+                <div style="font-size:11px; color:#94a3b8; margin-top:2px;">
+                    🏷️ {cat_p} → {cat_s} &nbsp;·&nbsp; Lot #{item_id}
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # 1. LIVE ACTIVE COPIES SECTION
-    st.subheader("🟢 Currently Open Copies on Nellis (Pick the Cheapest!)")
-    with st.spinner("Checking Nellis live catalog for identical open copies..."):
+    if notes_str:
+        st.warning(f"⚠️ **Notes:** {notes_str}")
+
+    same_cond_only = st.checkbox(
+        f"Compare only '{cond_tier}' condition",
+        value=True,
+        key=f"dlg_cond_toggle_{item_id}",
+    )
+
+    # Fetch both active copies and past matches
+    with st.spinner("Checking live copies & price history..."):
         live_copies = search_live_active_duplicates(title, msrp, photo)
         other_active = [
             c for c in live_copies
             if int(c.get("auction_id") or 0) != item_id
             and (not same_cond_only or get_condition_tier(c.get("condition")) == cond_tier)
         ]
+        hist_index = load_historical_price_index()
+        past_matches = find_historical_matches(item_row, hist_index, same_condition_only=same_cond_only)
 
-    if not other_active:
-        st.info(f"No other open copies of this item in **{cond_tier}** condition were found right now.")
-    else:
-        cheaper_copies = [c for c in other_active if float(c.get("final_price") or 0) < cur_bid]
-        if cheaper_copies:
-            lowest_active = float(cheaper_copies[0].get("final_price") or 0)
-            savings = cur_bid - lowest_active
-            st.success(f"💡 **Found {len(cheaper_copies)} cheaper active {'copy' if len(cheaper_copies)==1 else 'copies'}!** Lowest is currently **${lowest_active:.2f}** (${savings:.2f} cheaper than this lot).")
+    # Quick Tab Switcher inside modal for clean mobile reading
+    tab_hist, tab_active = st.tabs([
+        f"🏆 Past Sales ({len(past_matches)})",
+        f"🟢 Active Copies ({len(other_active)})",
+    ])
+
+    with tab_hist:
+        if not past_matches:
+            st.info(f"No past closed lots recorded yet in **{cond_tier if same_cond_only else 'any'}** condition.")
         else:
-            st.caption(f"Found {len(other_active)} other open {'copy' if len(other_active)==1 else 'copies'} (this lot at ${cur_bid:.2f} is currently the cheapest):")
+            prices = [float(m.get("final_price") or 0) for m in past_matches]
+            min_won = min(prices)
+            avg_won = sum(prices) / len(prices)
+            max_won = max(prices)
 
-        for idx, copy in enumerate(other_active[:6], start=1):
-            c_id = copy.get("auction_id")
-            c_url = f"https://www.nellisauction.com/p/item/{c_id}"
-            c_price = float(copy.get("final_price") or 0)
-            c_disc = float(copy.get("discount_pct") or 0)
-            c_loc = copy.get("location") or "AZ"
-            c_cond = format_clean_condition(copy.get("condition"))
-            c_bids = copy.get("bid_count", 0)
-            c_sec = float(copy.get("diff_sec") or 0)
-            if c_sec < 3600:
-                c_time_str = f"{max(1, int(c_sec // 60))}m left"
+            if cur_bid <= min_won:
+                st.success(f"🟢 **Great Price:** Current ${cur_bid:,.2f} is at/below all-time low (${min_won:,.2f})!")
+            elif cur_bid <= avg_won:
+                st.info(f"🟢 **Good Price:** Below historical average of **${avg_won:,.2f}**.")
             else:
-                c_time_str = f"{int(c_sec // 3600)}h {int((c_sec % 3600) // 60)}m left"
+                st.warning(f"🔴 **Above Avg:** Current ${cur_bid:,.2f} is above historical avg **${avg_won:,.2f}**.")
 
-            price_tag = f"🔥 **${c_price:.2f}**" if c_price < cur_bid else f"**${c_price:.2f}**"
-            a1, a2, a3 = st.columns([2.2, 3.8, 2])
-            with a1:
-                st.markdown(f"{idx}. {price_tag} *({c_disc:.0f}% off)*")
-            with a2:
-                st.markdown(f"📍 **{c_loc}** · {c_cond} · ⏳ {c_time_str} *({c_bids} bids)*")
-            with a3:
-                st.markdown(f"[👉 **Bid on Copy ↗**]({c_url})")
+            st.markdown(
+                f"""
+                <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(110px, 1fr)); gap:8px; margin-bottom:12px;">
+                    <div class="nellis-stat-box"><div class="nellis-stat-label">Cheapest</div><div class="nellis-stat-val">${min_won:,.2f}</div></div>
+                    <div class="nellis-stat-box"><div class="nellis-stat-label">Average</div><div class="nellis-stat-val">${avg_won:,.2f}</div></div>
+                    <div class="nellis-stat-box"><div class="nellis-stat-label">Highest</div><div class="nellis-stat-val">${max_won:,.2f}</div></div>
+                    <div class="nellis-stat-box"><div class="nellis-stat-label">Total Sold</div><div class="nellis-stat-val">{len(past_matches)}</div></div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
 
-    st.markdown("---")
+            rows_html = []
+            for rank, past in enumerate(past_matches[:8], start=1):
+                p_id = past.get("auction_id")
+                p_url = f"https://www.nellisauction.com/p/item/{p_id}"
+                p_price = float(past.get("final_price") or 0)
+                p_msrp = float(past.get("retail_price") or msrp or 0)
+                p_disc = ((p_msrp - p_price) / p_msrp * 100.0) if p_msrp > 0 else 0
+                p_date = str(past.get("closed_at") or "")[:10]
+                p_loc = past.get("location") or "AZ"
+                p_cond = past.get("clean_cond") or format_clean_condition(past.get("condition"))
+                p_bids = past.get("bid_count") or 0
+                rows_html.append(
+                    f"""
+                    <div style="border:1px solid #334155; background:#0f172a; border-radius:10px; padding:9px 12px; margin-bottom:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                            <div style="font-size:14px; font-weight:800; color:#f8fafc;">
+                                #{rank} &nbsp; ${p_price:,.2f} <span style="color:#4ade80; font-size:12px;">({p_disc:.0f}% off)</span>
+                            </div>
+                            <a href="{p_url}" target="_blank" style="background:#334155; color:#ffffff; text-decoration:none; font-size:12px; font-weight:700; padding:4px 10px; border-radius:6px; white-space:nowrap;">View ↗</a>
+                        </div>
+                        <div style="font-size:12px; color:#94a3b8; margin-top:4px;">
+                            📅 {p_date} &nbsp;·&nbsp; 📍 {p_loc} &nbsp;·&nbsp; {p_cond} &nbsp;·&nbsp; {p_bids} bids
+                        </div>
+                    </div>
+                    """
+                )
+            st.markdown("".join(rows_html), unsafe_allow_html=True)
 
-    # 2. PAST WINNING PRICE HISTORY SECTION
-    st.subheader("🏆 Past Winning Price History (Lowest to Highest)")
-    hist_index = load_historical_price_index()
-    past_matches = find_historical_matches(item_row, hist_index, same_condition_only=same_cond_only)
+    with tab_active:
+        if not other_active:
+            st.info(f"No other open copies in **{cond_tier if same_cond_only else 'any'}** condition right now.")
+        else:
+            cheaper_copies = [c for c in other_active if float(c.get("final_price") or 0) < cur_bid]
+            if cheaper_copies:
+                lowest_active = float(cheaper_copies[0].get("final_price") or 0)
+                savings = cur_bid - lowest_active
+                st.success(f"💡 **Found {len(cheaper_copies)} cheaper active {'copy' if len(cheaper_copies)==1 else 'copies'}!** Lowest is **${lowest_active:,.2f}** (${savings:,.2f} cheaper).")
+            else:
+                st.caption(f"Found {len(other_active)} other open {'copy' if len(other_active)==1 else 'copies'} (this lot at ${cur_bid:,.2f} is currently the cheapest):")
 
-    if not past_matches:
-        st.info(f"No past closed lots recorded yet for this item in **{cond_tier if same_cond_only else 'any'}** condition.")
-    else:
-        prices = [float(m.get("final_price") or 0) for m in past_matches]
-        min_won = min(prices)
-        avg_won = sum(prices) / len(prices)
-        max_won = max(prices)
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Cheapest Won", f"${min_won:.2f}")
-        m2.metric("Average Won", f"${avg_won:.2f}")
-        m3.metric("Highest Won", f"${max_won:.2f}")
-        m4.metric("Total Sold", f"{len(past_matches)}")
-
-        st.caption(f"Showing top {min(5, len(past_matches))} lowest winning prices (click any link to inspect the closed lot on Nellis):")
-
-        for rank, past in enumerate(past_matches[:5], start=1):
-            p_id = past.get("auction_id")
-            p_url = f"https://www.nellisauction.com/p/item/{p_id}"
-            p_price = float(past.get("final_price") or 0)
-            p_msrp = float(past.get("retail_price") or msrp or 0)
-            p_disc = ((p_msrp - p_price) / p_msrp * 100.0) if p_msrp > 0 else 0
-            p_date = str(past.get("closed_at") or "")[:16]
-            p_loc = past.get("location") or "AZ"
-            p_cond = past.get("clean_cond") or format_clean_condition(past.get("condition"))
-            p_bids = past.get("bid_count") or 0
-
-            pcol1, pcol2, pcol3 = st.columns([2.2, 3.8, 2])
-            with pcol1:
-                st.markdown(f"**#{rank} — ${p_price:.2f}** *({p_disc:.0f}% off)*")
-            with pcol2:
-                st.markdown(f"📅 {p_date} · 📍 {p_loc} · {p_cond} *({p_bids} bids)*")
-            with pcol3:
-                st.markdown(f"[🔗 **View on Nellis ↗**]({p_url})")
+            active_html = []
+            for idx, copy in enumerate(other_active[:8], start=1):
+                c_id = copy.get("auction_id")
+                c_url = f"https://www.nellisauction.com/p/item/{c_id}"
+                c_price = float(copy.get("final_price") or 0)
+                c_disc = float(copy.get("discount_pct") or 0)
+                c_loc = copy.get("location") or "AZ"
+                c_cond = format_clean_condition(copy.get("condition"))
+                c_bids = copy.get("bid_count", 0)
+                c_sec = float(copy.get("diff_sec") or 0)
+                c_time_str = f"{max(1, int(c_sec // 60))}m left" if c_sec < 3600 else f"{int(c_sec // 3600)}h {int((c_sec % 3600) // 60)}m left"
+                cheaper_badge = ' <span style="background:#14532d; color:#86efac; font-size:10.5px; padding:2px 6px; border-radius:4px;">CHEAPER</span>' if c_price < cur_bid else ""
+                active_html.append(
+                    f"""
+                    <div style="border:1px solid #334155; background:#0f172a; border-radius:10px; padding:9px 12px; margin-bottom:8px;">
+                        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+                            <div style="font-size:14px; font-weight:800; color:#f8fafc;">
+                                #{idx} &nbsp; ${c_price:,.2f} <span style="color:#4ade80; font-size:12px;">({c_disc:.0f}% off)</span>{cheaper_badge}
+                            </div>
+                            <a href="{c_url}" target="_blank" style="background:#b91c1c; color:#ffffff; text-decoration:none; font-size:12px; font-weight:700; padding:4px 10px; border-radius:6px; white-space:nowrap;">Bid ↗</a>
+                        </div>
+                        <div style="font-size:12px; color:#94a3b8; margin-top:4px;">
+                            📍 {c_loc} &nbsp;·&nbsp; ⏳ {c_time_str} &nbsp;·&nbsp; {c_cond} &nbsp;·&nbsp; {c_bids} bids
+                        </div>
+                    </div>
+                    """
+                )
+            st.markdown("".join(active_html), unsafe_allow_html=True)
 
 
 def find_open_radar_matches(item_row: dict, open_index: dict) -> list:
