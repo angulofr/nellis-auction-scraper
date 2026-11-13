@@ -747,8 +747,10 @@ if view_mode == "🎯 Deal Finder":
         .st-key-refresh_live_btn,
         div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] {
             position: fixed !important;
-            bottom: 22px !important;
-            right: 22px !important;
+            top: 64px !important;
+            right: 18px !important;
+            bottom: auto !important;
+            left: auto !important;
             z-index: 9999 !important;
             width: auto !important;
         }
