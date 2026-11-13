@@ -1,0 +1,40 @@
+name: Backfill Condition & Damage Tags
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_files:
+        description: 'Max Parquet files to process (0 = all files, newest first)'
+        required: false
+        default: '0'
+      workers:
+        description: 'Concurrent HTTP workers'
+        required: false
+        default: '24'
+
+jobs:
+  backfill-r2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Retroactive Condition & Damage Backfill
+        env:
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT_URL: ${{ secrets.R2_ENDPOINT_URL }}
+          R2_BUCKET_NAME: ${{ secrets.R2_BUCKET_NAME }}
+        run: |
+          python -m src.backfill_conditions --max-files "${{ github.event.inputs.max_files || '0' }}" --workers "${{ github.event.inputs.workers || '24' }}"
