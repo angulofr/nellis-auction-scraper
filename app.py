@@ -359,9 +359,23 @@ def parse_nellis_products_from_stream(data: list) -> list:
     return items
 
 
+SEARCH_SYNONYMS = {
+    "shoes": {"sneaker", "sneakers", "shoe", "shoes", "boot", "boots", "loafer", "loafers", "sandal", "sandals", "heel", "heels", "footwear", "slipper", "slippers"},
+    "shoe": {"sneaker", "sneakers", "shoe", "shoes", "boot", "boots", "loafer", "loafers", "sandal", "sandals", "heel", "heels", "footwear", "slipper", "slippers"},
+    "sneakers": {"sneaker", "sneakers", "shoe", "shoes", "footwear"},
+    "tv": {"tv", "television", "oled", "qled", "smart tv"},
+    "couch": {"couch", "sofa", "sectional", "loveseat"},
+    "sofa": {"couch", "sofa", "sectional", "loveseat"},
+    "fridge": {"fridge", "refrigerator", "freezer", "cooler"},
+    "laptop": {"laptop", "notebook", "macbook", "chromebook"},
+    "earbuds": {"earbuds", "earbud", "headphone", "headphones", "airpods", "earphones"},
+    "headphones": {"headphone", "headphones", "earbuds", "earbud", "headset"},
+}
+
+
 def smart_fuzzy_search_score(query: str, title: str, notes: str = "") -> float:
     """
-    Zero-cost typo-tolerant multi-token fuzzy search scorer.
+    Zero-cost typo-tolerant multi-token fuzzy search scorer with retail synonym expansion.
     Returns 1.0 when no query; otherwise returns 0.0..1.0 based on token coverage & edit similarity.
     """
     q = str(query or "").strip().lower()
@@ -379,11 +393,18 @@ def smart_fuzzy_search_score(query: str, title: str, notes: str = "") -> float:
     h_tokens = re.findall(r"[a-z0-9]+", haystack_raw)
     if not h_tokens:
         return 0.0
+    h_set = set(h_tokens)
 
     matched_score = 0.0
     for qt in q_tokens:
         if qt in haystack_raw:
             matched_score += 1.0
+            continue
+
+        # Check retail synonym equivalence (e.g., "shoes" -> "sneakers")
+        syns = SEARCH_SYNONYMS.get(qt)
+        if syns and (syns & h_set):
+            matched_score += 0.95
             continue
 
         # Typo-tolerant similarity check against each word in title/notes
@@ -449,10 +470,10 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
             "Highest Discount (%)": "time_remaining_asc"
         }.get(sort_by, "time_remaining_asc")
 
-        def _fetch_query(kw_str: str, pages: int):
+        def _fetch_query(kw_str: str, pages: int, direct_match: bool = False):
             collected = []
             seen = set()
-            for page_num in range(1, pages + 1):
+            for page_num in range(0, pages):
                 params = [("sortBy", nellis_sort), ("_p1", f"s:{page_size},n:{page_num}")]
                 if kw_str and kw_str.strip():
                     params.append(("query", kw_str.strip()))
@@ -473,13 +494,14 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
                     aid = it.get("auction_id")
                     if aid not in seen:
                         seen.add(aid)
+                        it["_direct_nellis_match"] = direct_match
                         collected.append(it)
                         new_added += 1
                 if new_added == 0 or len(page_items) < page_size:
                     break
             return collected
 
-        items = _fetch_query(search_kw, max_pages)
+        items = _fetch_query(search_kw, max_pages, direct_match=bool(search_kw and search_kw.strip()))
 
         # If search query had a typo or multi-word constraint that returned very few hits from Nellis,
         # also fetch a broader live pool so our typo-tolerant fuzzy matcher can surface relevant items.
@@ -488,12 +510,12 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
             seen_ids = {it.get("auction_id") for it in items}
             if len(q_tokens) > 1:
                 longest_tok = max(q_tokens, key=len)
-                for extra in _fetch_query(longest_tok, 2):
+                for extra in _fetch_query(longest_tok, 2, direct_match=False):
                     if extra.get("auction_id") not in seen_ids:
                         seen_ids.add(extra.get("auction_id"))
                         items.append(extra)
             if len(items) < 25:
-                for extra in _fetch_query("", 3):
+                for extra in _fetch_query("", 3, direct_match=False):
                     if extra.get("auction_id") not in seen_ids:
                         seen_ids.add(extra.get("auction_id"))
                         items.append(extra)
@@ -525,7 +547,7 @@ def search_live_active_duplicates(title: str, retail_price: float, photo_url: st
         qs = urllib.parse.urlencode({
             "query": kw,
             "sortBy": "current_price_asc",
-            "_p1": "s:40,n:1"
+            "_p1": "s:40,n:0"
         })
         url = f"https://www.nellisauction.com/search.data?{qs}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
@@ -1111,8 +1133,12 @@ if view_mode == "🎯 Deal Finder":
                 filtered = filtered[filtered['condition'].str.contains(cond_filter, case=False, na=False)]
             if search_kw.strip() and not filtered.empty:
                 scores = [
-                    smart_fuzzy_search_score(search_kw, t, n)
-                    for t, n in zip(filtered['title'].fillna(""), filtered['damage_notes'].fillna(""))
+                    1.0 if direct else smart_fuzzy_search_score(search_kw, t, n)
+                    for direct, t, n in zip(
+                        filtered.get('_direct_nellis_match', pd.Series([False] * len(filtered))).fillna(False),
+                        filtered['title'].fillna(""),
+                        filtered['damage_notes'].fillna("")
+                    )
                 ]
                 filtered = filtered.assign(_search_score=scores)
                 filtered = filtered[filtered['_search_score'] >= 0.65]
