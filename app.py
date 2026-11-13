@@ -623,23 +623,36 @@ if view_mode == "🎯 Deal Finder":
     )
     sort_by = st.sidebar.selectbox("↕️ Sort By", sort_options)
 
-    # Always-visible top bar with Refresh button
-    top_bar_left, top_bar_right = st.columns([3.8, 1.2])
-    with top_bar_right:
-        if st.button("🔄 Refresh Live Data", use_container_width=True, type="primary"):
-            fetch_live_nellis_lots.clear()
-            search_live_active_duplicates.clear()
-            st.rerun()
+    # Active filter summary bar + floating always-accessible Refresh button
+    kw_label = f" · 🔍 '{search_kw.strip()}'" if search_kw.strip() else ""
+    cat_label = f" · 🏷️ {cat_filter}" if cat_filter != "All Categories" else ""
+    st.caption(f"**Active Filter:** {time_filter}{cat_label} · 📍 {loc_filter} · {cond_filter} · MSRP ≥ ${min_retail} · Bid ≤ ${max_bid}{kw_label}")
 
-    with top_bar_left:
-        kw_label = f" · 🔍 '{search_kw.strip()}'" if search_kw.strip() else ""
-        cat_label = f" · 🏷️ {cat_filter}" if cat_filter != "All Categories" else ""
-        st.caption(f"**Active Filter:** {time_filter}{cat_label} · 📍 {loc_filter} · {cond_filter} · MSRP ≥ ${min_retail} · Bid ≤ ${max_bid}{kw_label}")
+    st.markdown('<span id="nellis-refresh-anchor"></span>', unsafe_allow_html=True)
+    if st.button("🔄 Refresh Live Data", key="refresh_live_btn", type="primary"):
+        fetch_live_nellis_lots.clear()
+        search_live_active_duplicates.clear()
+        st.rerun()
 
-    # Inject clean card styling for uniform 4-column desktop grid
+    # Inject clean card styling for uniform 4-column desktop grid + floating Refresh FAB
     st.markdown(
         """
         <style>
+        .st-key-refresh_live_btn,
+        div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] {
+            position: fixed !important;
+            bottom: 22px !important;
+            right: 22px !important;
+            z-index: 9999 !important;
+            width: auto !important;
+        }
+        .st-key-refresh_live_btn button,
+        div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] button {
+            border-radius: 999px !important;
+            padding: 0.55rem 1.25rem !important;
+            font-weight: 700 !important;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45) !important;
+        }
         .nellis-card-img-wrap {
             width: 100%;
             height: 170px;
