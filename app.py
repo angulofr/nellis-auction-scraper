@@ -18,6 +18,10 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
+import importlib
+import src.transform as _transform_mod
+if not hasattr(_transform_mod, "is_incomplete_or_damaged"):
+    importlib.reload(_transform_mod)
 from src.transform import CATEGORY_RULES, classify_product_category, is_incomplete_or_damaged
 
 # Page setup
