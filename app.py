@@ -2459,7 +2459,7 @@ elif view_mode == "💻 SQL Studio":
             "- Always JOIN dim_products p ON f.product_id = p.product_id when using title, brand, or category.\n"
             "- Closed/past auctions satisfy f.closed_at <= now(). 'Last night' means f.closed_at >= now() - INTERVAL 24 HOUR AND f.closed_at <= now().\n"
             "- 'New' condition means f.condition = 'Brand New'.\n"
-            "- CRITICAL for product keyword matching: NEVER put a multi-word product phrase in one contiguous ILIKE '%a b c%'. Split into separate AND p.title ILIKE '%word%' clauses for the core product words, and handle hyphen/space variants with OR (e.g., '(p.title ILIKE ''%usb-c%'' OR p.title ILIKE ''%usb c%'' OR p.title ILIKE ''%type-c%'') AND p.title ILIKE ''%cable%''').\n"
+            "- CRITICAL for product keyword matching: NEVER put a multi-word product phrase in one contiguous ILIKE '%a b c%'. Split into separate AND p.title ILIKE '%word%' clauses for the core product words, and handle hyphen/space variants with OR using standard single quotes (e.g., (p.title ILIKE '%usb-c%' OR p.title ILIKE '%usb c%' OR p.title ILIKE '%type-c%') AND p.title ILIKE '%cable%').\n"
             "- For aggregations (AVG, MIN, MAX), ALWAYS use ROUND(..., 2), give clean aliases (e.g. AS avg_price, AS min_price), and also include COUNT(*) AS matching_lots.\n"
             "- Include LIMIT 200 on row-level queries (omit LIMIT on single-row aggregates).\n\n"
             f"User question: {question}"
@@ -2467,7 +2467,11 @@ elif view_mode == "💻 SQL Studio":
         endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key)}"
         payload = json.dumps({
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 600},
+            "generationConfig": {
+                "temperature": 0.0,
+                "maxOutputTokens": 2048,
+                "thinkingConfig": {"thinkingBudget": 0},
+            },
         }).encode("utf-8")
         req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
         with urllib.request.urlopen(req, timeout=20) as resp:
