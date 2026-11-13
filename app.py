@@ -2414,7 +2414,64 @@ elif view_mode == "📊 Analytics Hub":
 # --- TAB 3: SQL STUDIO ---
 elif view_mode == "💻 SQL Studio":
     st.title("💻 Interactive DuckDB SQL Studio")
-    st.caption("Run custom analytical SQL queries directly against `fact_auctions` and `dim_products` on Cloudflare R2.")
+    st.caption("Ask questions in plain English (powered by Gemini Free Tier) or run custom SQL directly against `fact_auctions` and `dim_products` on Cloudflare R2.")
+
+    SCHEMA_PROMPT = """Tables in DuckDB:
+1. fact_auctions f:
+   - auction_id (BIGINT)
+   - product_id (VARCHAR, joins to dim_products.product_id)
+   - location (VARCHAR: 'Phoenix' or 'Mesa')
+   - condition (VARCHAR: 'Brand New', 'Like New', 'Open Box', 'Used', 'Incomplete / Damaged / Parts', 'Untested')
+   - completeness (VARCHAR: 'Complete', 'Incomplete', 'Partial')
+   - functional_status (VARCHAR: 'Functional', 'Tested - Works', 'Non-Functional')
+   - damage_notes (VARCHAR)
+   - retail_price (DOUBLE)
+   - final_price (DOUBLE)
+   - discount_ratio (DOUBLE = final_price / retail_price; discount % off = ROUND((1.0 - f.discount_ratio) * 100, 1))
+   - bid_count (INTEGER)
+   - unique_bidders (INTEGER)
+   - closed_at (TIMESTAMPTZ, Arizona MST)
+   - close_day_of_week (TINYINT: 0=Sunday..6=Saturday)
+   - close_hour (TINYINT: 0..23)
+   - scraped_date (DATE)
+   - photo_url (VARCHAR)
+2. dim_products p:
+   - product_id (VARCHAR)
+   - title (VARCHAR)
+   - category_primary (VARCHAR)
+   - category_secondary (VARCHAR)
+   - brand (VARCHAR)"""
+
+    def validate_readonly_sql(sql_text: str) -> str:
+        s = re.sub(r"^```(?:sql)?\s*|\s*```$", "", (sql_text or "").strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+        if not re.match(r"^(SELECT|WITH)\b", s, re.IGNORECASE):
+            raise ValueError("Generated query must start with SELECT or WITH.")
+        if re.search(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|ATTACH|DETACH|COPY|TRUNCATE|PRAGMA)\b", s, re.IGNORECASE):
+            raise ValueError("Only read-only SELECT queries are permitted.")
+        return s
+
+    def generate_sql_from_english(question: str, api_key: str) -> str:
+        prompt = (
+            "You are a DuckDB SQL expert for a Nellis Auction database.\n"
+            f"{SCHEMA_PROMPT}\n\n"
+            "Rules:\n"
+            "- Output ONLY a single valid DuckDB SELECT (or WITH ... SELECT) SQL query. No markdown, no explanations.\n"
+            "- Always JOIN dim_products p ON f.product_id = p.product_id when using title, brand, or category.\n"
+            "- Closed/past auctions satisfy f.closed_at <= now(). 'Last night' means f.closed_at >= now() - INTERVAL 24 HOUR AND f.closed_at <= now().\n"
+            "- 'New' condition means f.condition = 'Brand New'. Use ILIKE '%...%' for keyword matching on p.title.\n"
+            "- Include LIMIT 200 on row-level queries (omit LIMIT on single-row aggregates like COUNT/MIN/AVG).\n\n"
+            f"User question: {question}"
+        )
+        endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={urllib.parse.quote(api_key)}"
+        payload = json.dumps({
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 600},
+        }).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        text = body["candidates"][0]["content"]["parts"][0]["text"]
+        return validate_readonly_sql(text)
 
     default_sql = """SELECT 
     p.title,
@@ -2431,13 +2488,58 @@ WHERE f.condition = 'Brand New'
 ORDER BY f.discount_ratio ASC
 LIMIT 25;"""
 
-    custom_sql = st.text_area("SQL Query Editor", value=default_sql, height=200)
+    if "sql_editor_text" not in st.session_state:
+        st.session_state["sql_editor_text"] = default_sql
+    if "ai_sql_question" not in st.session_state:
+        st.session_state["ai_sql_question"] = ""
 
-    if st.button("▶ Execute SQL Query", type="primary"):
+    with st.expander("📋 Table & Column Reference", expanded=False):
+        st.code(SCHEMA_PROMPT, language="text")
+
+    st.subheader("✨ Ask in Plain English")
+    gemini_key = get_secret("GEMINI_API_KEY", "").strip()
+    if not gemini_key:
+        st.info("Add `GEMINI_API_KEY` (free from [Google AI Studio](https://aistudio.google.com/)) to Streamlit Secrets, or paste one below for this session.")
+        gemini_key = st.text_input("Temporary Gemini API Key", type="password", key="temp_gemini_key").strip()
+
+    ex_cols = st.columns(3)
+    examples = [
+        "How many Brand New items from last night ended up with 0 bids?",
+        "What's the cheapest final price seen for a Brand New usb-c drive?",
+        "Top 10 categories by average discount % on Brand New items over $100 retail",
+    ]
+    for idx_ex, ex_text in enumerate(examples):
+        if ex_cols[idx_ex].button(f"💡 {ex_text[:38]}...", key=f"sql_ex_{idx_ex}", use_container_width=True):
+            st.session_state["ai_sql_question"] = ex_text
+
+    ai_question = st.text_input(
+        "Your Question",
+        key="ai_sql_question",
+        placeholder="e.g. How many Brand New items from last night ended up with 0 bids?",
+    )
+
+    ai_col1, ai_col2 = st.columns([1.5, 4])
+    run_ai_clicked = ai_col1.button("✨ Generate & Run SQL", type="primary", disabled=(not gemini_key or not ai_question.strip()), use_container_width=True)
+
+    if run_ai_clicked:
+        with st.spinner("Translating English to DuckDB SQL..."):
+            try:
+                generated_sql = generate_sql_from_english(ai_question.strip(), gemini_key)
+                st.session_state["sql_editor_text"] = generated_sql
+                st.session_state["_run_generated_sql"] = True
+            except Exception as e:
+                st.error(f"AI SQL Generation Error: {e}")
+
+    st.markdown("---")
+    custom_sql = st.text_area("SQL Query Editor", key="sql_editor_text", height=180)
+    run_manual_clicked = st.button("▶ Execute SQL Query")
+
+    if st.session_state.pop("_run_generated_sql", False) or run_manual_clicked:
         with st.spinner("Executing query on DuckDB..."):
             try:
-                res_df = run_duckdb_query(custom_sql)
-                st.success(f"Returned {len(res_df)} rows.")
+                safe_sql = validate_readonly_sql(custom_sql)
+                res_df = run_duckdb_query(safe_sql)
+                st.success(f"Returned {len(res_df):,} rows.")
                 st.dataframe(res_df, use_container_width=True)
             except Exception as e:
                 st.error(f"SQL Error: {e}")
