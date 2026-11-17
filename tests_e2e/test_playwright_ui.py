@@ -187,7 +187,17 @@ class TestPlaywrightBrowserE2E(unittest.TestCase):
             page.close()
 
     def test_03_floating_refresh_and_responsive_viewports(self):
-        """TC-E2E-009 & TC-E2E-010: Refresh button clears cache for updated lots across desktop & mobile."""
+        """TC-E2E-009 & TC-E2E-010: Refresh button clears cache across Desktop (1440x900) & Mobile (390x844)."""
+        # 1. Verify Desktop layout + Refresh visibility
+        desktop = self.browser.new_page(viewport={"width": 1440, "height": 900})
+        try:
+            desktop.goto(self.app_url, wait_until="domcontentloaded")
+            desktop.locator("button:has-text('Refresh Live Data')").wait_for(state="visible", timeout=25_000)
+            self.assertEqual(desktop.locator("[data-testid='stException']").count(), 0)
+        finally:
+            desktop.close()
+
+        # 2. Verify Mobile layout starts unblocked (sidebar auto-collapsed) & Refresh button updates feed
         page = self.browser.new_page(viewport={"width": 390, "height": 844})
         try:
             page.goto(self.app_url, wait_until="domcontentloaded")

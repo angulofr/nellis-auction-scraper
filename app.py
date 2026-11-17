@@ -30,7 +30,7 @@ st.set_page_config(
     page_title="Nellis Auction Sniper",
     page_icon="🔨",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="auto"
 )
 
 def get_secret(key, default=""):
