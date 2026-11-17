@@ -109,6 +109,26 @@ class TestBidAnalyticsPipeline(unittest.TestCase):
         self.assertEqual(ot_rows[0]["time_bucket"], "Last 60s")
         self.assertEqual(ot_rows[1]["time_bucket"], "Overtime (Anti-Snipe)")
 
+    def test_build_bid_analytics_zero_bids(self):
+        """TC-UNIT-021: Zero-bid / empty bidHistory settles cleanly with empty bid_rows."""
+        close_ms = 1_794_542_700_000
+        res_zero = {
+            "auction_id": 138959999,
+            "open_ms": close_ms - 86_400_000,
+            "initial_close_ms": close_ms,
+            "close_ms": close_ms,
+            "final_price": 0.0,
+            "bid_count": 0,
+            "bid_history": [],
+        }
+        bid_rows, summary = build_bid_analytics(res_zero, product_id="prod_zero", scraped_date="2026-11-12")
+        self.assertEqual(bid_rows, [])
+        self.assertEqual(summary["unique_bidders"], 0)
+        self.assertEqual(summary["bids_last_5m"], 0)
+        self.assertEqual(summary["bids_last_60s"], 0)
+        self.assertIsNone(summary["first_bid_price"])
+        self.assertTrue(summary["bids_captured"])
+
     def test_transform_records_timing_fields(self):
         init_close_ms = 1_794_532_860_000
         raw_items = [

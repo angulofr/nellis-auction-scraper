@@ -19,9 +19,9 @@ def normalize_title(title: str) -> str:
     """Normalize product title for deterministic hashing and deduplication."""
     if not title:
         return ""
-    # Remove leading/trailing inspector tags like ** FACTORY SEALED **, (broken corner), etc.
-    t = re.sub(r"^\*+.*?\*+", "", title)
-    t = re.sub(r"^\(.*?\)", "", t)
+    # Remove leading inspector tags like ** FACTORY SEALED **, (broken corner), etc.
+    t = re.sub(r"^\s*\*+.*?\*+\s*", "", title)
+    t = re.sub(r"^\s*\(.*?\)\s*", "", t)
     # Lowercase, collapse spaces, remove special non-alphanumeric punctuation
     t = re.sub(r"[^\w\s]", " ", t.lower())
     t = re.sub(r"\s+", " ", t).strip()
@@ -218,7 +218,7 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
 
         # Condition & inspection attributes
         grade = item.get("grade") if isinstance(item.get("grade"), dict) else {}
-        cond_raw = item.get("condition_type") or grade.get("conditionType", {}).get("description")
+        cond_raw = item.get("condition_type") or item.get("condition") or grade.get("conditionType", {}).get("description")
         damage_raw = item.get("damage_type") or grade.get("damageType", {}).get("description")
         func_raw = item.get("is_functional") or grade.get("functionalType", {}).get("description")
         missing_raw = item.get("missing_parts") or grade.get("missingPartsType", {}).get("description")

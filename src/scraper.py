@@ -20,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from src.transform import transform_records
 from src.r2_loader import write_fact_auctions, merge_dim_products, is_r2_configured
 
-BASE_URL = "https://www.nellisauction.com"
+BASE_URL = os.environ.get("NELLIS_API_BASE", "https://www.nellisauction.com").rstrip("/")
 PHOENIX_LOCATION_ID = 2  # Shopping location ID for Phoenix, AZ (Phoenix & Mesa warehouses)
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 MST_TZ = datetime.timezone(datetime.timedelta(hours=-7))

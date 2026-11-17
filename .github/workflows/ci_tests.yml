@@ -1,0 +1,40 @@
+name: QA & UAT Automated Test Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  qa-automated-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install App Dependencies & Playwright Chromium
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install playwright
+          python -m playwright install chromium --with-deps
+
+      - name: Compile Check All Python Entrypoints & Tests
+        run: |
+          python -m py_compile app.py src/scraper.py src/transform.py src/r2_loader.py src/settlement.py src/query_lake.py scripts/smoke_live_uat.py
+
+      - name: Run Unit, Integration & Streamlit AppTest Suites
+        run: |
+          python -m unittest discover -v -s tests
+
+      - name: Run Headless Chromium Playwright E2E Suite
+        run: |
+          python -m unittest discover -v -s tests_e2e

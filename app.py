@@ -45,6 +45,7 @@ R2_ACCESS_KEY_ID = get_secret("R2_ACCESS_KEY_ID", "")
 R2_SECRET_ACCESS_KEY = get_secret("R2_SECRET_ACCESS_KEY", "")
 R2_ENDPOINT_URL = get_secret("R2_ENDPOINT_URL", "https://965a5411101d1521c551d99d9421a145.r2.cloudflarestorage.com")
 R2_BUCKET_NAME = get_secret("R2_BUCKET_NAME", "nellis-auction-lake")
+NELLIS_API_BASE = os.environ.get("NELLIS_API_BASE", "https://www.nellisauction.com").rstrip("/")
 
 STOP_WORDS = {
     "with", "for", "and", "the", "in", "to", "of", "by", "on", "at", "from",
@@ -52,23 +53,121 @@ STOP_WORDS = {
 }
 
 
-@st.cache_resource
-def get_duckdb_con(_v=4):
-    """Create and cache persistent DuckDB connection with Cloudflare R2 httpfs & deduped star-schema views."""
-    con = duckdb.connect()
-    con.execute("INSTALL httpfs; LOAD httpfs;")
-    host = R2_ENDPOINT_URL.replace("https://", "").replace("http://", "").strip("/")
-    con.execute(f"""
-        SET GLOBAL s3_endpoint = '{host}';
-        SET GLOBAL s3_access_key_id = '{R2_ACCESS_KEY_ID}';
-        SET GLOBAL s3_secret_access_key = '{R2_SECRET_ACCESS_KEY}';
-        SET GLOBAL s3_url_style = 'path';
-        SET GLOBAL s3_region = 'auto';
-        SET GLOBAL s3_use_ssl = true;
+def _create_empty_fact_auctions_view(con):
+    con.execute("""
+        CREATE OR REPLACE VIEW fact_auctions AS
+        SELECT
+            CAST(NULL AS BIGINT) AS auction_id,
+            CAST(NULL AS VARCHAR) AS product_id,
+            CAST(NULL AS VARCHAR) AS location,
+            CAST(NULL AS VARCHAR) AS condition,
+            CAST(NULL AS VARCHAR) AS completeness,
+            CAST(NULL AS VARCHAR) AS functional_status,
+            CAST(NULL AS VARCHAR) AS damage_notes,
+            CAST(NULL AS DOUBLE) AS retail_price,
+            CAST(NULL AS DOUBLE) AS final_price,
+            CAST(NULL AS DOUBLE) AS discount_ratio,
+            CAST(NULL AS INTEGER) AS bid_count,
+            CAST(NULL AS INTEGER) AS unique_bidders,
+            CAST(NULL AS TIMESTAMPTZ) AS closed_at,
+            CAST(NULL AS TINYINT) AS close_day_of_week,
+            CAST(NULL AS TINYINT) AS close_hour,
+            CAST(NULL AS DATE) AS scraped_date,
+            CAST(NULL AS VARCHAR) AS photo_url,
+            CAST(NULL AS BOOLEAN) AS is_closed,
+            CAST('unverified' AS VARCHAR) AS market_status,
+            CAST(NULL AS TIMESTAMPTZ) AS open_at,
+            CAST(NULL AS TIMESTAMPTZ) AS initial_closed_at,
+            CAST(NULL AS BOOLEAN) AS was_extended,
+            CAST(NULL AS INTEGER) AS extension_seconds,
+            CAST(NULL AS DOUBLE) AS first_bid_price,
+            CAST(NULL AS DOUBLE) AS price_at_1h_left,
+            CAST(NULL AS DOUBLE) AS price_at_5m_left,
+            CAST(NULL AS DOUBLE) AS price_at_1m_left,
+            CAST(NULL AS INTEGER) AS bids_last_5m,
+            CAST(NULL AS INTEGER) AS bids_last_60s,
+            CAST(NULL AS DOUBLE) AS winning_bid_sec_before_close,
+            CAST(FALSE AS BOOLEAN) AS bids_captured
+        WHERE FALSE;
     """)
-    facts_glob = f"s3://{R2_BUCKET_NAME}/fact_auctions/*/*/*.parquet"
-    desc_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{facts_glob}', union_by_name=true);").fetchall()
-    raw_cols = {str(r[0]).lower() for r in desc_rows}
+
+
+def _create_empty_fact_bids_view(con):
+    con.execute("""
+        CREATE OR REPLACE VIEW fact_bids AS
+        SELECT
+            CAST(NULL AS BIGINT) AS auction_id,
+            CAST(NULL AS VARCHAR) AS product_id,
+            CAST(NULL AS SMALLINT) AS bid_seq,
+            CAST(NULL AS VARCHAR) AS bidder_label,
+            CAST(NULL AS SMALLINT) AS bidder_num,
+            CAST(NULL AS DOUBLE) AS bid_amount,
+            CAST(NULL AS DOUBLE) AS bid_increment,
+            CAST(NULL AS VARCHAR) AS bid_status,
+            CAST(NULL AS BOOLEAN) AS is_winning_bid,
+            CAST(NULL AS TIMESTAMPTZ) AS bid_time,
+            CAST(NULL AS TINYINT) AS bid_hour,
+            CAST(NULL AS DOUBLE) AS seconds_before_close,
+            CAST(NULL AS DOUBLE) AS seconds_before_initial_close,
+            CAST(NULL AS VARCHAR) AS time_bucket,
+            CAST(NULL AS DOUBLE) AS auction_final_price,
+            CAST(NULL AS DOUBLE) AS pct_of_final_price,
+            CAST(NULL AS DATE) AS scraped_date
+        WHERE FALSE;
+    """)
+
+
+def _create_empty_dim_products_view(con):
+    con.execute("""
+        CREATE OR REPLACE VIEW dim_products AS
+        SELECT
+            CAST(NULL AS VARCHAR) AS product_id,
+            CAST(NULL AS VARCHAR) AS title,
+            CAST(NULL AS VARCHAR) AS brand,
+            CAST(NULL AS VARCHAR) AS category_primary,
+            CAST(NULL AS VARCHAR) AS category_secondary,
+            CAST(NULL AS DOUBLE) AS base_retail_price,
+            CAST(NULL AS VARCHAR) AS description,
+            CAST(NULL AS DATE) AS first_seen_date,
+            CAST(NULL AS VARCHAR) AS photo_url
+        WHERE FALSE;
+    """)
+
+
+@st.cache_resource
+def get_duckdb_con(_v=5):
+    """Create and cache persistent DuckDB connection with Cloudflare R2, local lake, or empty fallback views."""
+    con = duckdb.connect()
+    use_local = os.environ.get("NELLIS_USE_LOCAL_LAKE") == "1"
+    lake_dir = os.environ.get("NELLIS_LAKE_DIR", "data_lake").replace("\\", "/").rstrip("/")
+    r2_key = get_secret("R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID)
+    r2_secret = get_secret("R2_SECRET_ACCESS_KEY", R2_SECRET_ACCESS_KEY)
+    r2_endpoint = get_secret("R2_ENDPOINT_URL", R2_ENDPOINT_URL)
+    r2_bucket = get_secret("R2_BUCKET_NAME", R2_BUCKET_NAME)
+
+    if (not use_local) and r2_key and r2_secret:
+        try:
+            con.execute("INSTALL httpfs; LOAD httpfs;")
+            host = r2_endpoint.replace("https://", "").replace("http://", "").strip("/")
+            con.execute(f"""
+                SET GLOBAL s3_endpoint = '{host}';
+                SET GLOBAL s3_access_key_id = '{r2_key}';
+                SET GLOBAL s3_secret_access_key = '{r2_secret}';
+                SET GLOBAL s3_url_style = 'path';
+                SET GLOBAL s3_region = 'auto';
+                SET GLOBAL s3_use_ssl = true;
+            """)
+            facts_glob = f"s3://{r2_bucket}/fact_auctions/*/*/*.parquet"
+            bids_glob = f"s3://{r2_bucket}/fact_bids/*/*/*.parquet"
+            dim_glob = f"s3://{r2_bucket}/dim_products/products_catalog.parquet"
+        except Exception:
+            facts_glob = f"{lake_dir}/fact_auctions/*/*/*.parquet"
+            bids_glob = f"{lake_dir}/fact_bids/*/*/*.parquet"
+            dim_glob = f"{lake_dir}/dim_products/products_catalog.parquet"
+    else:
+        facts_glob = f"{lake_dir}/fact_auctions/*/*/*.parquet"
+        bids_glob = f"{lake_dir}/fact_bids/*/*/*.parquet"
+        dim_glob = f"{lake_dir}/dim_products/products_catalog.parquet"
 
     optional_fact_cols = [
         ("is_closed", "CAST(NULL AS BOOLEAN)"),
@@ -86,19 +185,23 @@ def get_duckdb_con(_v=4):
         ("winning_bid_sec_before_close", "CAST(NULL AS DOUBLE)"),
         ("bids_captured", "CAST(FALSE AS BOOLEAN)"),
     ]
-    extra_cols = [f"{expr} AS {col}" for col, expr in optional_fact_cols if col not in raw_cols]
-    extra_sql = (", " + ", ".join(extra_cols)) if extra_cols else ""
-    bids_order = "COALESCE(bids_captured, FALSE) DESC, " if "bids_captured" in raw_cols else ""
-    settled_order = "COALESCE(is_closed, FALSE) DESC, " if "is_closed" in raw_cols else ""
 
-    con.execute(f"""
-        CREATE OR REPLACE VIEW fact_auctions AS
-        SELECT DISTINCT ON (auction_id) *{extra_sql}
-        FROM read_parquet('{facts_glob}', union_by_name=true)
-        ORDER BY auction_id, {bids_order}{settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
-    """)
+    try:
+        desc_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{facts_glob}', union_by_name=true);").fetchall()
+        raw_cols = {str(r[0]).lower() for r in desc_rows}
+        extra_cols = [f"{expr} AS {col}" for col, expr in optional_fact_cols if col not in raw_cols]
+        extra_sql = (", " + ", ".join(extra_cols)) if extra_cols else ""
+        bids_order = "COALESCE(bids_captured, FALSE) DESC, " if "bids_captured" in raw_cols else ""
+        settled_order = "COALESCE(is_closed, FALSE) DESC, " if "is_closed" in raw_cols else ""
+        con.execute(f"""
+            CREATE OR REPLACE VIEW fact_auctions AS
+            SELECT DISTINCT ON (auction_id) *{extra_sql}
+            FROM read_parquet('{facts_glob}', union_by_name=true)
+            ORDER BY auction_id, {bids_order}{settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
+        """)
+    except Exception:
+        _create_empty_fact_auctions_view(con)
 
-    bids_glob = f"s3://{R2_BUCKET_NAME}/fact_bids/*/*/*.parquet"
     try:
         con.execute(f"""
             CREATE OR REPLACE VIEW fact_bids AS
@@ -107,30 +210,13 @@ def get_duckdb_con(_v=4):
             ORDER BY auction_id, bid_seq, scraped_date DESC;
         """)
     except Exception:
-        con.execute("""
-            CREATE OR REPLACE VIEW fact_bids AS
-            SELECT
-                CAST(NULL AS BIGINT) AS auction_id,
-                CAST(NULL AS VARCHAR) AS product_id,
-                CAST(NULL AS SMALLINT) AS bid_seq,
-                CAST(NULL AS VARCHAR) AS bidder_label,
-                CAST(NULL AS SMALLINT) AS bidder_num,
-                CAST(NULL AS DOUBLE) AS bid_amount,
-                CAST(NULL AS DOUBLE) AS bid_increment,
-                CAST(NULL AS VARCHAR) AS bid_status,
-                CAST(NULL AS BOOLEAN) AS is_winning_bid,
-                CAST(NULL AS TIMESTAMPTZ) AS bid_time,
-                CAST(NULL AS TINYINT) AS bid_hour,
-                CAST(NULL AS DOUBLE) AS seconds_before_close,
-                CAST(NULL AS DOUBLE) AS seconds_before_initial_close,
-                CAST(NULL AS VARCHAR) AS time_bucket,
-                CAST(NULL AS DOUBLE) AS auction_final_price,
-                CAST(NULL AS DOUBLE) AS pct_of_final_price,
-                CAST(NULL AS DATE) AS scraped_date
-            WHERE FALSE;
-        """)
+        _create_empty_fact_bids_view(con)
 
-    con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('s3://{R2_BUCKET_NAME}/dim_products/products_catalog.parquet');")
+    try:
+        con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('{dim_glob}');")
+    except Exception:
+        _create_empty_dim_products_view(con)
+
     return con
 
 
@@ -609,7 +695,7 @@ def fetch_live_nellis_lots(
     try:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
         req_loc = urllib.request.Request(
-            'https://www.nellisauction.com/change-shopping-location',
+            f'{NELLIS_API_BASE}/change-shopping-location',
             data=b'shoppingLocationId=2',
             headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded'}
         )
@@ -642,7 +728,7 @@ def fetch_live_nellis_lots(
                     params.append(("Location Name", loc_filter))
 
                 qs = urllib.parse.urlencode(params)
-                url = f'https://www.nellisauction.com/search.data?{qs}'
+                url = f'{NELLIS_API_BASE}/search.data?{qs}'
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
                 with opener.open(req, timeout=12) as resp:
                     data = json.loads(resp.read().decode())
@@ -721,7 +807,7 @@ def search_live_active_duplicates(title: str, retail_price: float, photo_url: st
     try:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
         req_loc = urllib.request.Request(
-            'https://www.nellisauction.com/change-shopping-location',
+            f'{NELLIS_API_BASE}/change-shopping-location',
             data=b'shoppingLocationId=2',
             headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded'}
         )
@@ -732,7 +818,7 @@ def search_live_active_duplicates(title: str, retail_price: float, photo_url: st
             "sortBy": "current_price_asc",
             "_p1": "s:40,n:0"
         })
-        url = f"https://www.nellisauction.com/search.data?{qs}"
+        url = f"{NELLIS_API_BASE}/search.data?{qs}"
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
         with opener.open(req, timeout=8) as resp:
             data = json.loads(resp.read().decode())
@@ -2883,9 +2969,12 @@ elif view_mode == "💻 SQL Studio":
 
     def validate_readonly_sql(sql_text: str) -> str:
         s = re.sub(r"^```(?:sql)?\s*|\s*```$", "", (sql_text or "").strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+        s = re.sub(r";+\s*$", "", s).strip()
+        if ";" in s:
+            raise ValueError("Only a single read-only SELECT statement is permitted.")
         if not re.match(r"^(SELECT|WITH)\b", s, re.IGNORECASE):
             raise ValueError("Generated query must start with SELECT or WITH.")
-        if re.search(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|ATTACH|DETACH|COPY|TRUNCATE|PRAGMA)\b", s, re.IGNORECASE):
+        if re.search(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|ATTACH|DETACH|COPY|TRUNCATE|PRAGMA|EXPORT|IMPORT|CALL|INSTALL|LOAD)\b", s, re.IGNORECASE):
             raise ValueError("Only read-only SELECT queries are permitted.")
         return s
 

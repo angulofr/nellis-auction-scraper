@@ -13,6 +13,7 @@ import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import io
+import os
 import re
 import time
 from typing import Dict, Iterable, List, Optional, Tuple
@@ -276,7 +277,8 @@ def _to_int_ms(val) -> int:
 def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session] = None, timeout: int = 10) -> Optional[Dict]:
     """Fetch authoritative post-close state & full bidHistory of a lot from Nellis .data endpoint."""
     aid = int(auction_id)
-    url = f"https://www.nellisauction.com/p/item/{aid}.data"
+    base_url = os.environ.get("NELLIS_API_BASE", "https://www.nellisauction.com").rstrip("/")
+    url = f"{base_url}/p/item/{aid}.data"
     owns_sess = session is None
     sess = session or _build_pooled_session(4)
 
