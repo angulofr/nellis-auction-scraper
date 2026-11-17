@@ -53,8 +53,8 @@ STOP_WORDS = {
 
 
 @st.cache_resource
-def get_duckdb_con(_v=3):
-    """Create and cache persistent DuckDB connection with Cloudflare R2 httpfs & deduped fact view."""
+def get_duckdb_con(_v=4):
+    """Create and cache persistent DuckDB connection with Cloudflare R2 httpfs & deduped star-schema views."""
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     host = R2_ENDPOINT_URL.replace("https://", "").replace("http://", "").strip("/")
@@ -70,20 +70,66 @@ def get_duckdb_con(_v=3):
     desc_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{facts_glob}', union_by_name=true);").fetchall()
     raw_cols = {str(r[0]).lower() for r in desc_rows}
 
-    extra_cols = []
-    if "is_closed" not in raw_cols:
-        extra_cols.append("CAST(NULL AS BOOLEAN) AS is_closed")
-    if "market_status" not in raw_cols:
-        extra_cols.append("CAST('unverified' AS VARCHAR) AS market_status")
+    optional_fact_cols = [
+        ("is_closed", "CAST(NULL AS BOOLEAN)"),
+        ("market_status", "CAST('unverified' AS VARCHAR)"),
+        ("open_at", "CAST(NULL AS TIMESTAMPTZ)"),
+        ("initial_closed_at", "CAST(NULL AS TIMESTAMPTZ)"),
+        ("was_extended", "CAST(NULL AS BOOLEAN)"),
+        ("extension_seconds", "CAST(NULL AS INTEGER)"),
+        ("first_bid_price", "CAST(NULL AS DOUBLE)"),
+        ("price_at_1h_left", "CAST(NULL AS DOUBLE)"),
+        ("price_at_5m_left", "CAST(NULL AS DOUBLE)"),
+        ("price_at_1m_left", "CAST(NULL AS DOUBLE)"),
+        ("bids_last_5m", "CAST(NULL AS INTEGER)"),
+        ("bids_last_60s", "CAST(NULL AS INTEGER)"),
+        ("winning_bid_sec_before_close", "CAST(NULL AS DOUBLE)"),
+        ("bids_captured", "CAST(FALSE AS BOOLEAN)"),
+    ]
+    extra_cols = [f"{expr} AS {col}" for col, expr in optional_fact_cols if col not in raw_cols]
     extra_sql = (", " + ", ".join(extra_cols)) if extra_cols else ""
+    bids_order = "COALESCE(bids_captured, FALSE) DESC, " if "bids_captured" in raw_cols else ""
     settled_order = "COALESCE(is_closed, FALSE) DESC, " if "is_closed" in raw_cols else ""
 
     con.execute(f"""
         CREATE OR REPLACE VIEW fact_auctions AS
         SELECT DISTINCT ON (auction_id) *{extra_sql}
         FROM read_parquet('{facts_glob}', union_by_name=true)
-        ORDER BY auction_id, {settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
+        ORDER BY auction_id, {bids_order}{settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
     """)
+
+    bids_glob = f"s3://{R2_BUCKET_NAME}/fact_bids/*/*/*.parquet"
+    try:
+        con.execute(f"""
+            CREATE OR REPLACE VIEW fact_bids AS
+            SELECT DISTINCT ON (auction_id, bid_seq) *
+            FROM read_parquet('{bids_glob}', union_by_name=true)
+            ORDER BY auction_id, bid_seq, scraped_date DESC;
+        """)
+    except Exception:
+        con.execute("""
+            CREATE OR REPLACE VIEW fact_bids AS
+            SELECT
+                CAST(NULL AS BIGINT) AS auction_id,
+                CAST(NULL AS VARCHAR) AS product_id,
+                CAST(NULL AS SMALLINT) AS bid_seq,
+                CAST(NULL AS VARCHAR) AS bidder_label,
+                CAST(NULL AS SMALLINT) AS bidder_num,
+                CAST(NULL AS DOUBLE) AS bid_amount,
+                CAST(NULL AS DOUBLE) AS bid_increment,
+                CAST(NULL AS VARCHAR) AS bid_status,
+                CAST(NULL AS BOOLEAN) AS is_winning_bid,
+                CAST(NULL AS TIMESTAMPTZ) AS bid_time,
+                CAST(NULL AS TINYINT) AS bid_hour,
+                CAST(NULL AS DOUBLE) AS seconds_before_close,
+                CAST(NULL AS DOUBLE) AS seconds_before_initial_close,
+                CAST(NULL AS VARCHAR) AS time_bucket,
+                CAST(NULL AS DOUBLE) AS auction_final_price,
+                CAST(NULL AS DOUBLE) AS pct_of_final_price,
+                CAST(NULL AS DATE) AS scraped_date
+            WHERE FALSE;
+        """)
+
     con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('s3://{R2_BUCKET_NAME}/dim_products/products_catalog.parquet');")
     return con
 
@@ -2582,7 +2628,8 @@ elif view_mode == "📊 Analytics Hub":
             "1. Condition Risk Arbitrage (Brand New vs. Used vs. Damaged)",
             "2. Category & Brand Value Spreads (Lowest Median Discount Ratio)",
             "3. Temporal Sweet Spots (Arizona Day & Hour Competition Heatmap)",
-            "4. Sleeper Lot Hunter (High Retail, Low Bids, Heavy Discount)"
+            "4. Sleeper Lot Hunter (High Retail, Low Bids, Heavy Discount)",
+            "5. Sniping & Bid Timing Curve (Last 60s vs 5m vs 1h)",
         ]
     )
 
@@ -2693,11 +2740,88 @@ elif view_mode == "📊 Analytics Hub":
         df = run_duckdb_query(sql)
         st.dataframe(df, use_container_width=True)
 
+    else:
+        st.subheader("⏱️ Sniping & Bid Timing Curve")
+        st.caption("How prices evolve before close, how often anti-snipe extensions trigger, and when winning bids are placed.")
+
+        summary_sql = f"""
+            SELECT
+                COUNT(*) AS lots_with_bid_history,
+                ROUND(100.0 * AVG(CASE WHEN f.was_extended THEN 1.0 ELSE 0.0 END), 1) AS pct_anti_snipe_extended,
+                ROUND(AVG(f.price_at_1h_left), 2) AS avg_price_1h_left,
+                ROUND(AVG(f.price_at_5m_left), 2) AS avg_price_5m_left,
+                ROUND(AVG(f.final_price), 2) AS avg_final_price,
+                ROUND(AVG(f.final_price - COALESCE(f.price_at_5m_left, 0)), 2) AS avg_last_5m_jump,
+                ROUND(AVG(f.winning_bid_sec_before_close), 1) AS avg_win_bid_sec_left
+            FROM fact_auctions f
+            WHERE {settled_where}
+              AND COALESCE(f.bids_captured, FALSE) = TRUE
+              AND f.bid_count > 0;
+        """
+        summary_df = run_duckdb_query(summary_sql)
+        if summary_df.empty or int(summary_df.iloc[0]["lots_with_bid_history"] or 0) == 0:
+            st.info("Per-bid timing analytics (`fact_bids`) are still being populated. Check back shortly after the backfill or next daily scrape finishes!")
+        else:
+            row_s = summary_df.iloc[0]
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Lots With Bid Curves", f"{int(row_s['lots_with_bid_history']):,}")
+            k2.metric("Anti-Snipe Extended", f"{row_s['pct_anti_snipe_extended']}%")
+            k3.metric("Avg Last-5m Jump", f"+${row_s['avg_last_5m_jump']:.2f}")
+            k4.metric("Avg Win Bid Timing", f"{row_s['avg_win_bid_sec_left']:.0f}s left")
+
+            curve_sql = f"""
+                SELECT
+                    b.time_bucket,
+                    COUNT(*) AS total_bids,
+                    COUNT(DISTINCT b.auction_id) AS auctions,
+                    ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS pct_of_all_bids,
+                    ROUND(AVG(b.pct_of_final_price) * 100, 1) AS avg_pct_of_final_price,
+                    SUM(CASE WHEN b.is_winning_bid THEN 1 ELSE 0 END) AS winning_bids_placed_here
+                FROM fact_bids b
+                JOIN fact_auctions f ON b.auction_id = f.auction_id
+                WHERE {settled_where}
+                  AND f.bid_count > 0
+                GROUP BY b.time_bucket
+                ORDER BY CASE b.time_bucket
+                    WHEN 'Early (> 6h left)' THEN 1
+                    WHEN '1h - 6h left' THEN 2
+                    WHEN '15m - 1h left' THEN 3
+                    WHEN '5m - 15m left' THEN 4
+                    WHEN '1m - 5m left' THEN 5
+                    WHEN 'Last 60s' THEN 6
+                    WHEN 'Overtime (Anti-Snipe)' THEN 7
+                    ELSE 8
+                END;
+            """
+            st.markdown("##### 📊 Bid Activity & Price Progression by Time Window")
+            curve_df = run_duckdb_query(curve_sql)
+            st.dataframe(curve_df, use_container_width=True)
+
+            ext_sql = f"""
+                SELECT
+                    CASE WHEN COALESCE(f.was_extended, FALSE) THEN 'Extended (Anti-Snipe)' ELSE 'Not Extended' END AS close_behavior,
+                    COUNT(*) AS lots,
+                    ROUND(AVG(f.bid_count), 1) AS avg_bids,
+                    ROUND(AVG(f.unique_bidders), 1) AS avg_bidders,
+                    ROUND(AVG(f.bids_last_60s), 2) AS avg_bids_last_60s,
+                    ROUND(AVG(f.price_at_5m_left), 2) AS avg_price_5m_left,
+                    ROUND(AVG(f.final_price), 2) AS avg_final_price
+                FROM fact_auctions f
+                WHERE {settled_where}
+                  AND COALESCE(f.bids_captured, FALSE) = TRUE
+                  AND f.bid_count > 0
+                GROUP BY close_behavior
+                ORDER BY lots DESC;
+            """
+            st.markdown("##### ⏳ Anti-Snipe Extension Impact")
+            ext_df = run_duckdb_query(ext_sql)
+            st.dataframe(ext_df, use_container_width=True)
+
 
 # --- TAB 3: SQL STUDIO ---
 elif view_mode == "💻 SQL Studio":
     st.title("💻 Interactive DuckDB SQL Studio")
-    st.caption("Ask questions in plain English (powered by Gemini Free Tier) or run custom SQL directly against `fact_auctions` and `dim_products` on Cloudflare R2.")
+    st.caption("Ask questions in plain English (powered by Gemini Free Tier) or run custom SQL directly against `fact_auctions`, `fact_bids`, and `dim_products` on Cloudflare R2.")
 
     SCHEMA_PROMPT = """Tables in DuckDB:
 1. fact_auctions f:
@@ -2712,8 +2836,20 @@ elif view_mode == "💻 SQL Studio":
    - final_price (DOUBLE)
    - discount_ratio (DOUBLE = final_price / retail_price; discount % off = ROUND((1.0 - f.discount_ratio) * 100, 1))
    - bid_count (INTEGER)
-   - unique_bidders (INTEGER)
-   - closed_at (TIMESTAMPTZ, Arizona MST)
+   - unique_bidders (INTEGER; distinct sequential Bidder #N count inside this lot)
+   - open_at (TIMESTAMPTZ, Arizona MST)
+   - initial_closed_at (TIMESTAMPTZ, scheduled close before any anti-snipe extensions)
+   - closed_at (TIMESTAMPTZ, actual final close in Arizona MST)
+   - was_extended (BOOLEAN; TRUE if anti-snipe extended close past initial_closed_at)
+   - extension_seconds (INTEGER)
+   - first_bid_price (DOUBLE)
+   - price_at_1h_left (DOUBLE; highest bid price at 60 min before final closed_at)
+   - price_at_5m_left (DOUBLE; highest bid price at 5 min before final closed_at)
+   - price_at_1m_left (DOUBLE; highest bid price at 60 sec before final closed_at)
+   - bids_last_5m (INTEGER; bids placed < 300s before final closed_at)
+   - bids_last_60s (INTEGER; bids placed <= 60s before final close)
+   - winning_bid_sec_before_close (DOUBLE; seconds before final close when winning bid was placed)
+   - bids_captured (BOOLEAN; TRUE if per-bid timing & curve columns are populated)
    - close_day_of_week (TINYINT: 0=Sunday..6=Saturday)
    - close_hour (TINYINT: 0..23)
    - scraped_date (DATE)
@@ -2725,7 +2861,25 @@ elif view_mode == "💻 SQL Studio":
    - title (VARCHAR)
    - category_primary (VARCHAR)
    - category_secondary (VARCHAR)
-   - brand (VARCHAR)"""
+   - brand (VARCHAR)
+3. fact_bids b (one row per chronological bid, joins to fact_auctions on auction_id and dim_products on product_id):
+   - auction_id (BIGINT)
+   - product_id (VARCHAR)
+   - bid_seq (SMALLINT: 1 = earliest bid)
+   - bidder_label (VARCHAR: e.g. 'Bidder #1'; PER-LOT anonymous label, NOT global across auctions)
+   - bidder_num (SMALLINT: 1, 2, ... within that lot)
+   - bid_amount (DOUBLE)
+   - bid_increment (DOUBLE: jump over previous highest bid in lot)
+   - bid_status (VARCHAR: 'Outbid' or 'Winning')
+   - is_winning_bid (BOOLEAN)
+   - bid_time (TIMESTAMPTZ)
+   - bid_hour (TINYINT: 0..23 Arizona MST)
+   - seconds_before_close (DOUBLE: seconds before final closed_at)
+   - seconds_before_initial_close (DOUBLE: seconds before scheduled initial_closed_at; negative = placed during anti-snipe extension)
+   - time_bucket (VARCHAR: 'Early (> 6h left)', '1h - 6h left', '15m - 1h left', '5m - 15m left', '1m - 5m left', 'Last 60s', 'Overtime (Anti-Snipe)')
+   - auction_final_price (DOUBLE)
+   - pct_of_final_price (DOUBLE: bid_amount / auction_final_price)
+   - scraped_date (DATE)"""
 
     def validate_readonly_sql(sql_text: str) -> str:
         s = re.sub(r"^```(?:sql)?\s*|\s*```$", "", (sql_text or "").strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
@@ -2741,8 +2895,9 @@ elif view_mode == "💻 SQL Studio":
             f"{SCHEMA_PROMPT}\n\n"
             "Rules:\n"
             "- Output ONLY a single valid DuckDB SELECT (or WITH ... SELECT) SQL query. No markdown, no explanations.\n"
-            "- Always JOIN dim_products p ON f.product_id = p.product_id when using title, brand, or category.\n"
+            "- Always JOIN dim_products p ON f.product_id = p.product_id (or b.product_id = p.product_id) when using title, brand, or category.\n"
             "- Closed/past sold auctions satisfy f.closed_at <= now() AND COALESCE(f.is_closed, TRUE) = TRUE AND COALESCE(f.market_status, 'sold') NOT IN ('relisted', 'canceled', 'cancelled', 'void', 'unsold', 'active'). For winning-price averages, require f.bid_count > 0 AND f.final_price > 0. 'Last night' means f.closed_at >= now() - INTERVAL 24 HOUR AND f.closed_at <= now().\n"
+            "- For bid timing / curve questions, filter COALESCE(f.bids_captured, FALSE) = TRUE or query fact_bids b JOIN fact_auctions f ON b.auction_id = f.auction_id. Remember bidder_label / bidder_num are PER-LOT anonymous numbers (not global account IDs across auctions).\n"
             "- 'New' condition means f.condition = 'Brand New'.\n"
             "- CRITICAL for product keyword matching: NEVER put a multi-word product phrase in one contiguous ILIKE '%a b c%'. Split into separate AND p.title ILIKE '%word%' clauses for the core product words, and handle hyphen/space variants with OR using standard single quotes (e.g., (p.title ILIKE '%usb-c%' OR p.title ILIKE '%usb c%' OR p.title ILIKE '%type-c%') AND p.title ILIKE '%cable%').\n"
             "- For aggregations (AVG, MIN, MAX), ALWAYS use ROUND(..., 2), give clean aliases (e.g. AS avg_price, AS min_price), and also include COUNT(*) AS matching_lots.\n"
@@ -2790,11 +2945,12 @@ LIMIT 25;"""
         st.info("Add `GEMINI_API_KEY` (free from [Google AI Studio](https://aistudio.google.com/)) to Streamlit Secrets, or paste one below for this session.")
         gemini_key = st.text_input("Temporary Gemini API Key", type="password", key="temp_gemini_key").strip()
 
-    ex_cols = st.columns(3)
+    ex_cols = st.columns(4)
     examples = [
         ("0-Bid Brand New Last Night", "How many Brand New items from last night ended up with 0 bids?"),
         ("Cheapest New USB-C Drive", "What's the cheapest final price seen for a Brand New usb-c drive?"),
         ("Top Categories by % Off", "Top 10 categories by average discount % on Brand New items over $100 retail"),
+        ("Sniping in Last 60s", "What percentage of bids are placed in each time bucket before auction close?"),
     ]
     for idx_ex, (label_ex, ex_text) in enumerate(examples):
         if ex_cols[idx_ex].button(f"💡 {label_ex}", key=f"sql_ex_{idx_ex}", use_container_width=True):

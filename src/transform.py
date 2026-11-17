@@ -193,6 +193,8 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
 
         # Timestamps and temporal analysis
         close_ms = item.get("closeTime") or item.get("close_time_ms") or 0
+        open_ms = item.get("openTime") or 0
+        init_close_ms = item.get("initialCloseTime") or 0
         if close_ms:
             close_dt_mst = datetime.datetime.fromtimestamp(close_ms / 1000.0, tz=MST_TZ)
             close_day_of_week = (close_dt_mst.weekday() + 1) % 7  # 0=Sunday through 6=Saturday
@@ -202,6 +204,11 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
             closed_at_iso = None
             close_day_of_week = None
             close_hour = None
+
+        open_at_iso = datetime.datetime.fromtimestamp(open_ms / 1000.0, tz=MST_TZ).isoformat() if open_ms else None
+        init_closed_at_iso = datetime.datetime.fromtimestamp(init_close_ms / 1000.0, tz=MST_TZ).isoformat() if init_close_ms else None
+        ext_sec = int(max(0, round((close_ms - init_close_ms) / 1000.0))) if (close_ms and init_close_ms and close_ms > init_close_ms) else 0
+        was_extended = bool(ext_sec >= 5)
 
         # Computed discount ratio (final_price / retail_price)
         if retail_price > 0 and final_price >= 0:
@@ -268,6 +275,18 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
             "photo_url": photo_url,
             "is_closed": raw_is_closed,
             "market_status": raw_mkt_status,
+            "open_at": open_at_iso,
+            "initial_closed_at": init_closed_at_iso,
+            "was_extended": was_extended,
+            "extension_seconds": ext_sec,
+            "first_bid_price": None,
+            "price_at_1h_left": None,
+            "price_at_5m_left": None,
+            "price_at_1m_left": None,
+            "bids_last_5m": 0,
+            "bids_last_60s": 0,
+            "winning_bid_sec_before_close": None,
+            "bids_captured": False,
         }
         fact_auctions.append(fact_record)
 

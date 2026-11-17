@@ -21,7 +21,7 @@ def get_r2_host():
 
 
 def get_duckdb_lake_conn(use_local: bool = False):
-    """Initialize DuckDB with httpfs S3/R2 credentials or local fallback."""
+    """Initialize DuckDB with httpfs S3/R2 credentials or local fallback and deduped lake views."""
     con = duckdb.connect()
     if not use_local and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
         con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -35,13 +35,76 @@ def get_duckdb_lake_conn(use_local: bool = False):
             SET s3_use_ssl = true;
         """)
         facts_pattern = f"s3://{R2_BUCKET_NAME}/fact_auctions/*/*/*.parquet"
+        bids_pattern = f"s3://{R2_BUCKET_NAME}/fact_bids/*/*/*.parquet"
         dim_catalog = f"s3://{R2_BUCKET_NAME}/dim_products/products_catalog.parquet"
     else:
         facts_pattern = "data_lake/fact_auctions/*/*/*.parquet"
+        bids_pattern = "data_lake/fact_bids/*/*/*.parquet"
         dim_catalog = "data_lake/dim_products/products_catalog.parquet"
 
-    # Create convenient views so queries can just use 'fact_auctions' and 'dim_products'
-    con.execute(f"CREATE OR REPLACE VIEW fact_auctions AS SELECT * FROM read_parquet('{facts_pattern}');")
+    # Project missing optional columns cleanly when mixed legacy/new partitions exist
+    desc_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{facts_pattern}', union_by_name=true);").fetchall()
+    raw_cols = {str(r[0]).lower() for r in desc_rows}
+    optional_fact_cols = [
+        ("is_closed", "CAST(NULL AS BOOLEAN)"),
+        ("market_status", "CAST('unverified' AS VARCHAR)"),
+        ("open_at", "CAST(NULL AS TIMESTAMPTZ)"),
+        ("initial_closed_at", "CAST(NULL AS TIMESTAMPTZ)"),
+        ("was_extended", "CAST(NULL AS BOOLEAN)"),
+        ("extension_seconds", "CAST(NULL AS INTEGER)"),
+        ("first_bid_price", "CAST(NULL AS DOUBLE)"),
+        ("price_at_1h_left", "CAST(NULL AS DOUBLE)"),
+        ("price_at_5m_left", "CAST(NULL AS DOUBLE)"),
+        ("price_at_1m_left", "CAST(NULL AS DOUBLE)"),
+        ("bids_last_5m", "CAST(NULL AS INTEGER)"),
+        ("bids_last_60s", "CAST(NULL AS INTEGER)"),
+        ("winning_bid_sec_before_close", "CAST(NULL AS DOUBLE)"),
+        ("bids_captured", "CAST(FALSE AS BOOLEAN)"),
+    ]
+    extra_cols = [f"{expr} AS {col}" for col, expr in optional_fact_cols if col not in raw_cols]
+    extra_sql = (", " + ", ".join(extra_cols)) if extra_cols else ""
+    bids_order = "COALESCE(bids_captured, FALSE) DESC, " if "bids_captured" in raw_cols else ""
+    settled_order = "COALESCE(is_closed, FALSE) DESC, " if "is_closed" in raw_cols else ""
+
+    con.execute(f"""
+        CREATE OR REPLACE VIEW fact_auctions AS
+        SELECT DISTINCT ON (auction_id) *{extra_sql}
+        FROM read_parquet('{facts_pattern}', union_by_name=true)
+        ORDER BY auction_id, {bids_order}{settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
+    """)
+
+    try:
+        con.execute(f"""
+            CREATE OR REPLACE VIEW fact_bids AS
+            SELECT DISTINCT ON (auction_id, bid_seq) *
+            FROM read_parquet('{bids_pattern}', union_by_name=true)
+            ORDER BY auction_id, bid_seq, scraped_date DESC;
+        """)
+    except Exception:
+        # Empty typed view before the first bids_*.parquet partition is uploaded
+        con.execute("""
+            CREATE OR REPLACE VIEW fact_bids AS
+            SELECT
+                CAST(NULL AS BIGINT) AS auction_id,
+                CAST(NULL AS VARCHAR) AS product_id,
+                CAST(NULL AS SMALLINT) AS bid_seq,
+                CAST(NULL AS VARCHAR) AS bidder_label,
+                CAST(NULL AS SMALLINT) AS bidder_num,
+                CAST(NULL AS DOUBLE) AS bid_amount,
+                CAST(NULL AS DOUBLE) AS bid_increment,
+                CAST(NULL AS VARCHAR) AS bid_status,
+                CAST(NULL AS BOOLEAN) AS is_winning_bid,
+                CAST(NULL AS TIMESTAMPTZ) AS bid_time,
+                CAST(NULL AS TINYINT) AS bid_hour,
+                CAST(NULL AS DOUBLE) AS seconds_before_close,
+                CAST(NULL AS DOUBLE) AS seconds_before_initial_close,
+                CAST(NULL AS VARCHAR) AS time_bucket,
+                CAST(NULL AS DOUBLE) AS auction_final_price,
+                CAST(NULL AS DOUBLE) AS pct_of_final_price,
+                CAST(NULL AS DATE) AS scraped_date
+            WHERE FALSE;
+        """)
+
     con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('{dim_catalog}');")
     return con
 
@@ -136,6 +199,33 @@ PRESET_QUERIES = {
               AND f.condition IN ('Brand New', 'Like New', 'Open Box')
             ORDER BY f.retail_price DESC
             LIMIT 30;
+        """
+    },
+    "bid-timing": {
+        "description": "When do bids & price jumps happen relative to auction close?",
+        "sql": """
+            SELECT
+                b.time_bucket AS "Time Window Before Close",
+                COUNT(*) AS "Total Bids",
+                COUNT(DISTINCT b.auction_id) AS "Auctions",
+                ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1) AS "% of All Bids",
+                ROUND(AVG(b.pct_of_final_price) * 100, 1) AS "Avg % of Final Price",
+                SUM(CASE WHEN b.is_winning_bid THEN 1 ELSE 0 END) AS "Winning Bids Placed Here"
+            FROM fact_bids b
+            JOIN fact_auctions f ON b.auction_id = f.auction_id
+            WHERE COALESCE(f.is_closed, FALSE) = TRUE
+              AND COALESCE(f.market_status, 'sold') = 'sold'
+            GROUP BY b.time_bucket
+            ORDER BY CASE b.time_bucket
+                WHEN 'Early (> 6h left)' THEN 1
+                WHEN '1h - 6h left' THEN 2
+                WHEN '15m - 1h left' THEN 3
+                WHEN '5m - 15m left' THEN 4
+                WHEN '1m - 5m left' THEN 5
+                WHEN 'Last 60s' THEN 6
+                WHEN 'Overtime (Anti-Snipe)' THEN 7
+                ELSE 8
+            END;
         """
     }
 }

@@ -1,23 +1,21 @@
 #!/usr/bin/env python3
 """
-Nellis Auction Post-Close Settlement & Final Price Verifier
+Nellis Auction Post-Close Settlement, Bid History Extractor & Final Price Verifier
 Queries https://www.nellisauction.com/p/item/{auction_id}.data for closed auctions
-to resolve true final WON FOR price, final bid count, marketStatus (sold/relisted),
-anti-snipe closeTime, and inspection condition/notes.
-
-Used both:
-  - In real-time by app.py when opening Price History on unverified rows
-  - In batch by daily ingestion (--settle-recent) & historical R2 backfill workflow
+to resolve:
+  1. True WON FOR final price, final bid count, marketStatus, closeTime, grade/notes
+  2. Complete chronological bidHistory events -> normalized fact_bids Parquet table
+  3. Pre-aggregated timing & bidder metrics on fact_auctions (price at 1h/5m/1m left,
+     anti-snipe extensions, last-minute bid velocity, exact unique bidders)
 """
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime
 import io
-import json
-import os
+import re
 import time
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -77,6 +75,186 @@ def unflatten_stream_val(val, raw, memo=None):
     return val
 
 
+def parse_bid_dollar_amount(val) -> float:
+    """Parse Nellis bid amount strings like '$9', '$1,250.50', or numeric values into float."""
+    if val is None or val == "":
+        return 0.0
+    if isinstance(val, (int, float)):
+        return float(val)
+    cleaned = re.sub(r"[$,\s]", "", str(val))
+    try:
+        return float(cleaned) if cleaned else 0.0
+    except ValueError:
+        return 0.0
+
+
+def parse_bidder_num(label: str) -> int:
+    """Extract sequential lot bidder integer from labels like 'Bidder #7' -> 7."""
+    m = re.search(r"(\d+)", str(label or ""))
+    return int(m.group(1)) if m else 0
+
+
+def classify_bid_time_bucket(sec_before_close: float, sec_before_init_close: float) -> str:
+    """Bucket a bid timestamp relative to auction close for fast GROUP BY analytics."""
+    if sec_before_init_close < 0:
+        return "Overtime (Anti-Snipe)"
+    if sec_before_close <= 60:
+        return "Last 60s"
+    if sec_before_close <= 300:
+        return "1m - 5m left"
+    if sec_before_close <= 900:
+        return "5m - 15m left"
+    if sec_before_close <= 3600:
+        return "15m - 1h left"
+    if sec_before_close <= 21600:
+        return "1h - 6h left"
+    return "Early (> 6h left)"
+
+
+def build_bid_analytics(res: Dict, product_id: str = "", scraped_date=None) -> Tuple[List[Dict], Dict]:
+    """
+    Transform raw decoded bidHistory + auction close timestamps into:
+      1. Clean chronological fact_bids rows (for bid-curve & sniping analytics)
+      2. Pre-aggregated auction timing & bidder metrics (for fast fact_auctions queries)
+    Handles proxy/auto-bid ordering accurately using running high-water price cutoffs.
+    """
+    aid = int(res.get("auction_id") or 0)
+    close_ms = int(res.get("close_ms") or 0)
+    init_close_ms = int(res.get("initial_close_ms") or close_ms or 0)
+    open_ms = int(res.get("open_ms") or 0)
+    final_price = float(res.get("final_price") or 0.0)
+    raw_bids = res.get("bid_history") or []
+
+    open_dt = pd.Timestamp(datetime.datetime.fromtimestamp(open_ms / 1000.0, tz=MST_TZ)) if open_ms > 0 else pd.NaT
+    init_close_dt = pd.Timestamp(datetime.datetime.fromtimestamp(init_close_ms / 1000.0, tz=MST_TZ)) if init_close_ms > 0 else pd.NaT
+    ext_sec = int(max(0, round((close_ms - init_close_ms) / 1000.0))) if (close_ms and init_close_ms and close_ms > init_close_ms) else 0
+    was_extended = bool(ext_sec >= 5)
+
+    parsed_entries = []
+    for idx, entry in enumerate(raw_bids):
+        if not isinstance(entry, dict):
+            continue
+        t_ms = entry.get("time")
+        try:
+            t_ms_int = int(t_ms) if t_ms is not None else 0
+        except (ValueError, TypeError):
+            t_ms_int = 0
+        if t_ms_int <= 0:
+            continue
+
+        amt = round(parse_bid_dollar_amount(entry.get("amount")), 2)
+        label = str(entry.get("name") or "").strip()
+        status = str(entry.get("type") or "").strip()
+        parsed_entries.append({
+            "time_ms": t_ms_int,
+            "orig_idx": idx,
+            "bidder_label": label,
+            "bidder_num": parse_bidder_num(label),
+            "bid_amount": amt,
+            "bid_status": status,
+        })
+
+    # Sort strictly chronologically ascending (oldest opening bid first, winning bid last)
+    parsed_entries.sort(key=lambda b: (b["time_ms"], b["bid_amount"], -b["orig_idx"]))
+
+    bid_rows: List[Dict] = []
+    distinct_bidders = set()
+    running_high = 0.0
+    price_1h = None
+    price_5m = None
+    price_1m = None
+    bids_5m = 0
+    bids_60s = 0
+    winning_sec = None
+
+    for seq, b in enumerate(parsed_entries, start=1):
+        t_ms = b["time_ms"]
+        amt = b["bid_amount"]
+        label = b["bidder_label"]
+        if label:
+            distinct_bidders.add(label)
+
+        inc = round(max(0.0, amt - running_high), 2)
+        if amt > running_high:
+            running_high = amt
+
+        sec_close = round((close_ms - t_ms) / 1000.0, 2) if close_ms > 0 else None
+        sec_init = round((init_close_ms - t_ms) / 1000.0, 2) if init_close_ms > 0 else sec_close
+        dt_mst = datetime.datetime.fromtimestamp(t_ms / 1000.0, tz=MST_TZ)
+
+        is_win = b["bid_status"].lower() == "winning"
+        if is_win and sec_close is not None:
+            winning_sec = sec_close
+
+        if sec_close is not None:
+            if sec_close >= 3600:
+                price_1h = max(price_1h or 0.0, amt)
+            if sec_close >= 300:
+                price_5m = max(price_5m or 0.0, amt)
+            else:
+                bids_5m += 1
+            if sec_close >= 60:
+                price_1m = max(price_1m or 0.0, amt)
+            else:
+                bids_60s += 1
+
+        pct_final = round(amt / final_price, 4) if final_price > 0 else None
+        bucket = (
+            classify_bid_time_bucket(sec_close, sec_init if sec_init is not None else sec_close)
+            if sec_close is not None
+            else "Unknown"
+        )
+
+        bid_rows.append({
+            "auction_id": aid,
+            "product_id": str(product_id or ""),
+            "bid_seq": seq,
+            "bidder_label": label,
+            "bidder_num": b["bidder_num"],
+            "bid_amount": amt,
+            "bid_increment": inc,
+            "bid_status": b["bid_status"],
+            "is_winning_bid": is_win,
+            "bid_time": dt_mst.isoformat(),
+            "bid_hour": dt_mst.hour,
+            "seconds_before_close": sec_close,
+            "seconds_before_initial_close": sec_init,
+            "time_bucket": bucket,
+            "auction_final_price": round(final_price, 2),
+            "pct_of_final_price": pct_final,
+            "scraped_date": scraped_date or datetime.datetime.now(MST_TZ).date(),
+        })
+
+    # For auctions that had bids, fill running pre-cutoff highs monotonically (if no bids in final window, standing price carries forward)
+    first_bid = parsed_entries[0]["bid_amount"] if parsed_entries else None
+    if parsed_entries:
+        if price_1h is None:
+            price_1h = 0.0
+        if price_5m is None:
+            price_5m = price_1h
+        if price_1m is None:
+            price_1m = price_5m
+        if winning_sec is None and bid_rows:
+            winning_sec = bid_rows[-1]["seconds_before_close"]
+
+    summary = {
+        "unique_bidders": len(distinct_bidders) if distinct_bidders else int(res.get("bid_count") or 0),
+        "open_at": open_dt,
+        "initial_closed_at": init_close_dt,
+        "was_extended": was_extended,
+        "extension_seconds": ext_sec,
+        "first_bid_price": first_bid,
+        "price_at_1h_left": price_1h,
+        "price_at_5m_left": price_5m,
+        "price_at_1m_left": price_1m,
+        "bids_last_5m": int(bids_5m),
+        "bids_last_60s": int(bids_60s),
+        "winning_bid_sec_before_close": winning_sec,
+        "bids_captured": True,
+    }
+    return bid_rows, summary
+
+
 def _build_pooled_session(pool_size: int = 40) -> requests.Session:
     sess = requests.Session()
     adapter = HTTPAdapter(pool_connections=pool_size, pool_maxsize=pool_size)
@@ -86,8 +264,17 @@ def _build_pooled_session(pool_size: int = 40) -> requests.Session:
     return sess
 
 
+def _to_int_ms(val) -> int:
+    if isinstance(val, list) and val:
+        val = val[0]
+    try:
+        return int(val) if val is not None else 0
+    except (ValueError, TypeError):
+        return 0
+
+
 def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session] = None, timeout: int = 10) -> Optional[Dict]:
-    """Fetch authoritative current/final state of a single lot from Nellis .data endpoint."""
+    """Fetch authoritative post-close state & full bidHistory of a lot from Nellis .data endpoint."""
     aid = int(auction_id)
     url = f"https://www.nellisauction.com/p/item/{aid}.data"
     owns_sess = session is None
@@ -103,55 +290,61 @@ def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session]
                         "is_closed": True,
                         "market_status": "archived_unverified",
                         "not_found": True,
+                        "bid_history": [],
                     }
                 resp.raise_for_status()
                 data = resp.json()
                 if not isinstance(data, list):
                     return None
 
+                p = None
+                bid_history = []
                 for i, el in enumerate(data):
-                    if el == "product" and i + 1 < len(data):
+                    if el == "product" and i + 1 < len(data) and p is None:
                         p = unflatten_stream_val(data[i + 1], data)
-                        if not isinstance(p, dict):
-                            return None
+                    elif el == "bidHistory" and i + 1 < len(data) and not bid_history:
+                        bh = unflatten_stream_val(data[i + 1], data)
+                        if isinstance(bh, list):
+                            bid_history = bh
 
-                        raw_close = p.get("closeTime")
-                        if isinstance(raw_close, list) and raw_close:
-                            raw_close = raw_close[0]
-                        try:
-                            close_ms = int(raw_close) if raw_close is not None else 0
-                        except (ValueError, TypeError):
-                            close_ms = 0
+                if not isinstance(p, dict):
+                    return None
 
-                        grade = p.get("grade") if isinstance(p.get("grade"), dict) else {}
-                        cond_raw = (grade.get("conditionType") or {}).get("description", "") if isinstance(grade.get("conditionType"), dict) else ""
-                        dmg_raw = (grade.get("damageType") or {}).get("description", "") if isinstance(grade.get("damageType"), dict) else ""
-                        mp_raw = (grade.get("missingPartsType") or {}).get("description", "") if isinstance(grade.get("missingPartsType"), dict) else ""
-                        func_raw = (grade.get("functionalType") or {}).get("description", "") if isinstance(grade.get("functionalType"), dict) else ""
-                        rating = grade.get("rating") if isinstance(grade.get("rating"), int) else None
+                close_ms = _to_int_ms(p.get("closeTime"))
+                init_close_ms = _to_int_ms(p.get("initialCloseTime")) or close_ms
+                open_ms = _to_int_ms(p.get("openTime"))
 
-                        is_closed = bool(p.get("isClosed", False))
-                        if not is_closed and close_ms > 0 and close_ms < (time.time() * 1000 - 30000):
-                            is_closed = True
+                grade = p.get("grade") if isinstance(p.get("grade"), dict) else {}
+                cond_raw = (grade.get("conditionType") or {}).get("description", "") if isinstance(grade.get("conditionType"), dict) else ""
+                dmg_raw = (grade.get("damageType") or {}).get("description", "") if isinstance(grade.get("damageType"), dict) else ""
+                mp_raw = (grade.get("missingPartsType") or {}).get("description", "") if isinstance(grade.get("missingPartsType"), dict) else ""
+                func_raw = (grade.get("functionalType") or {}).get("description", "") if isinstance(grade.get("functionalType"), dict) else ""
+                rating = grade.get("rating") if isinstance(grade.get("rating"), int) else None
 
-                        return {
-                            "auction_id": aid,
-                            "is_closed": is_closed,
-                            "market_status": str(p.get("marketStatus") or ("sold" if is_closed else "active")).strip().lower(),
-                            "final_price": round(float(p.get("currentPrice") or 0.0), 2),
-                            "retail_price": round(float(p.get("retailPrice") or 0.0), 2),
-                            "bid_count": int(p.get("bidCount") or 0),
-                            "close_ms": close_ms,
-                            "title": str(p.get("title") or "").strip(),
-                            "cond_raw": cond_raw,
-                            "dmg_raw": dmg_raw,
-                            "mp_raw": mp_raw,
-                            "func_raw": func_raw,
-                            "rating": rating,
-                            "notes": str(p.get("notes") or "").strip(),
-                            "not_found": False,
-                        }
-                return None
+                is_closed = bool(p.get("isClosed", False))
+                if not is_closed and close_ms > 0 and close_ms < (time.time() * 1000 - 30000):
+                    is_closed = True
+
+                return {
+                    "auction_id": aid,
+                    "is_closed": is_closed,
+                    "market_status": str(p.get("marketStatus") or ("sold" if is_closed else "active")).strip().lower(),
+                    "final_price": round(float(p.get("currentPrice") or 0.0), 2),
+                    "retail_price": round(float(p.get("retailPrice") or 0.0), 2),
+                    "bid_count": int(p.get("bidCount") or 0),
+                    "close_ms": close_ms,
+                    "initial_close_ms": init_close_ms,
+                    "open_ms": open_ms,
+                    "bid_history": bid_history,
+                    "title": str(p.get("title") or "").strip(),
+                    "cond_raw": cond_raw,
+                    "dmg_raw": dmg_raw,
+                    "mp_raw": mp_raw,
+                    "func_raw": func_raw,
+                    "rating": rating,
+                    "notes": str(p.get("notes") or "").strip(),
+                    "not_found": False,
+                }
             except Exception:
                 if attempt == 0:
                     time.sleep(0.3)
@@ -162,7 +355,7 @@ def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session]
 
 
 def fetch_closed_lots_batch(auction_ids: Iterable[int], workers: int = 24) -> Dict[int, Dict]:
-    """Concurrently fetch authoritative post-close status & winning prices for a batch of IDs."""
+    """Concurrently fetch authoritative post-close status, winning prices & bidHistory for a batch of IDs."""
     unique_ids = []
     seen = set()
     for x in auction_ids:
@@ -216,8 +409,9 @@ def settle_r2_partitions(
     only_unsettled: bool = True,
 ) -> int:
     """
-    Scan R2 fact_auctions Parquet partitions newest-first and update all closed auctions
-    whose final WON FOR price has not yet been settled after close.
+    Scan R2 fact_auctions Parquet partitions newest-first:
+      1. Resolve final WON FOR prices, bid counts, market_status, and timing metrics
+      2. Save full per-bid chronological events into parallel fact_bids Parquet partitions
     """
     import boto3
     from src.r2_loader import (
@@ -225,6 +419,8 @@ def settle_r2_partitions(
         R2_BUCKET_NAME,
         R2_ENDPOINT_URL,
         R2_SECRET_ACCESS_KEY,
+        enforce_fact_auctions_schema,
+        enforce_fact_bids_schema,
         is_r2_configured,
     )
 
@@ -239,7 +435,6 @@ def settle_r2_partitions(
         region_name="auto",
     )
 
-    # Load product titles once for complete condition checks
     titles_map: Dict[str, str] = {}
     try:
         obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key="dim_products/products_catalog.parquet")
@@ -262,8 +457,10 @@ def settle_r2_partitions(
     now_utc = pd.Timestamp.utcnow()
     cutoff_utc = now_utc - pd.Timedelta(minutes=buffer_minutes)
     settled_cache: Dict[int, Dict] = {}
+    bids_emitted_aids = set()
     total_updated = 0
     total_fetched = 0
+    total_bids_saved = 0
 
     for idx_file, key in enumerate(keys, 1):
         t0 = time.time()
@@ -272,21 +469,12 @@ def settle_r2_partitions(
         if df.empty:
             continue
 
-        df = df.copy()
-        if "is_closed" not in df.columns:
-            df["is_closed"] = False
-        else:
-            df["is_closed"] = df["is_closed"].fillna(False).astype(bool)
-
-        if "market_status" not in df.columns:
-            df["market_status"] = "unverified"
-        else:
-            df["market_status"] = df["market_status"].fillna("unverified").astype(str)
-
+        df = enforce_fact_auctions_schema(df)
         closed_ts = pd.to_datetime(df["closed_at"], utc=True, errors="coerce")
         needs_mask = closed_ts.notna() & (closed_ts <= cutoff_utc)
         if only_unsettled:
-            needs_mask = needs_mask & (~df["is_closed"])
+            # Settle rows either never closed OR closed before fact_bids capture existed
+            needs_mask = needs_mask & ((~df["is_closed"]) | (~df["bids_captured"]))
 
         candidate_aids = df.loc[needs_mask, "auction_id"].dropna().astype("int64").unique().tolist()
         to_fetch = [aid for aid in candidate_aids if aid not in settled_cache]
@@ -301,6 +489,8 @@ def settle_r2_partitions(
             total_fetched += len(to_fetch)
 
         changed_in_file = 0
+        file_bid_rows: List[Dict] = []
+
         for row_idx in df.index[needs_mask]:
             aid = int(df.at[row_idx, "auction_id"])
             res = settled_cache.get(aid)
@@ -308,9 +498,10 @@ def settle_r2_partitions(
                 continue
 
             if res.get("not_found"):
-                if not bool(df.at[row_idx, "is_closed"]):
+                if (not bool(df.at[row_idx, "is_closed"])) or (not bool(df.at[row_idx, "bids_captured"])):
                     df.at[row_idx, "is_closed"] = True
                     df.at[row_idx, "market_status"] = "archived_unverified"
+                    df.at[row_idx, "bids_captured"] = True
                     changed_in_file += 1
                 continue
 
@@ -326,18 +517,38 @@ def settle_r2_partitions(
 
             new_ratio = round(new_price / msrp, 4) if msrp > 0 and new_price >= 0 else df.at[row_idx, "discount_ratio"]
             new_mkt = res.get("market_status") or "sold"
+            pid = str(df.at[row_idx, "product_id"])
+            s_date = df.at[row_idx, "scraped_date"]
+
+            bid_rows, summary = build_bid_analytics(res, product_id=pid, scraped_date=s_date)
+            if bid_rows and aid not in bids_emitted_aids:
+                file_bid_rows.extend(bid_rows)
+                bids_emitted_aids.add(aid)
 
             old_price = float(df.at[row_idx, "final_price"] or 0.0)
             old_bids = int(df.at[row_idx, "bid_count"] or 0)
             old_closed = bool(df.at[row_idx, "is_closed"])
+            old_captured = bool(df.at[row_idx, "bids_captured"])
             old_mkt = str(df.at[row_idx, "market_status"] or "")
 
             df.at[row_idx, "final_price"] = new_price
             df.at[row_idx, "discount_ratio"] = new_ratio
             df.at[row_idx, "bid_count"] = new_bids
-            df.at[row_idx, "unique_bidders"] = min(new_bids, max(1, int(new_bids * 0.65))) if new_bids > 0 else 0
+            df.at[row_idx, "unique_bidders"] = summary["unique_bidders"]
             df.at[row_idx, "is_closed"] = True
             df.at[row_idx, "market_status"] = new_mkt
+            df.at[row_idx, "open_at"] = summary["open_at"]
+            df.at[row_idx, "initial_closed_at"] = summary["initial_closed_at"]
+            df.at[row_idx, "was_extended"] = summary["was_extended"]
+            df.at[row_idx, "extension_seconds"] = summary["extension_seconds"]
+            df.at[row_idx, "first_bid_price"] = summary["first_bid_price"]
+            df.at[row_idx, "price_at_1h_left"] = summary["price_at_1h_left"]
+            df.at[row_idx, "price_at_5m_left"] = summary["price_at_5m_left"]
+            df.at[row_idx, "price_at_1m_left"] = summary["price_at_1m_left"]
+            df.at[row_idx, "bids_last_5m"] = summary["bids_last_5m"]
+            df.at[row_idx, "bids_last_60s"] = summary["bids_last_60s"]
+            df.at[row_idx, "winning_bid_sec_before_close"] = summary["winning_bid_sec_before_close"]
+            df.at[row_idx, "bids_captured"] = True
 
             if res.get("close_ms"):
                 dt_mst = datetime.datetime.fromtimestamp(int(res["close_ms"]) / 1000.0, tz=MST_TZ)
@@ -345,8 +556,8 @@ def settle_r2_partitions(
                 df.at[row_idx, "close_day_of_week"] = (dt_mst.weekday() + 1) % 7
                 df.at[row_idx, "close_hour"] = dt_mst.hour
 
-            # Also tighten condition classification while we already have the item .data payload
-            title = titles_map.get(str(df.at[row_idx, "product_id"]), "")
+            # Tighten condition classification with live grade metadata
+            title = titles_map.get(pid, "")
             cur_notes = str(df.at[row_idx, "damage_notes"] or "")
             api_notes = str(res.get("notes") or "")
             merged_notes = api_notes if len(api_notes) > len(cur_notes) else cur_notes
@@ -371,31 +582,43 @@ def settle_r2_partitions(
             if res.get("func_raw"):
                 df.at[row_idx, "functional_status"] = standardize_functionality(res["func_raw"])
 
-            if (not old_closed) or abs(new_price - old_price) > 0.001 or new_bids != old_bids or new_mkt != old_mkt:
+            if (
+                (not old_closed)
+                or (not old_captured)
+                or abs(new_price - old_price) > 0.001
+                or new_bids != old_bids
+                or new_mkt != old_mkt
+            ):
                 changed_in_file += 1
 
-        if changed_in_file > 0:
-            # Strict Parquet types matching r2_loader.py
-            df["auction_id"] = df["auction_id"].astype("int64")
-            df["product_id"] = df["product_id"].astype("string")
-            df["location"] = df["location"].astype("string")
-            df["condition"] = df["condition"].astype("string")
-            df["completeness"] = df["completeness"].astype("string")
-            df["functional_status"] = df["functional_status"].astype("string")
-            df["damage_notes"] = df["damage_notes"].fillna("").astype("string")
-            df["retail_price"] = df["retail_price"].astype("float64")
-            df["final_price"] = df["final_price"].astype("float64")
-            df["discount_ratio"] = df["discount_ratio"].astype("float64")
-            df["bid_count"] = df["bid_count"].astype("int32")
-            df["unique_bidders"] = df["unique_bidders"].astype("int32")
-            df["closed_at"] = pd.to_datetime(df["closed_at"], format="ISO8601", errors="coerce")
-            df["close_day_of_week"] = df["close_day_of_week"].astype("Int8")
-            df["close_hour"] = df["close_hour"].astype("Int8")
-            df["scraped_date"] = pd.to_datetime(df["scraped_date"]).dt.date
-            df["photo_url"] = df.get("photo_url", pd.Series([""] * len(df))).fillna("").astype("string")
-            df["is_closed"] = df["is_closed"].astype("bool")
-            df["market_status"] = df["market_status"].astype("string")
+        # Upload parallel fact_bids Parquet for this partition
+        bids_key = re.sub(
+            r"^fact_auctions/(.*)auctions_(\d{4}-\d{2}-\d{2})\.parquet$",
+            r"fact_bids/\1bids_\2.parquet",
+            key,
+        )
+        if file_bid_rows and bids_key != key:
+            bids_df_new = enforce_fact_bids_schema(pd.DataFrame(file_bid_rows))
+            try:
+                existing_obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=bids_key)
+                bids_df_old = enforce_fact_bids_schema(pd.read_parquet(io.BytesIO(existing_obj["Body"].read())))
+                bids_df_merged = pd.concat([bids_df_new, bids_df_old], ignore_index=True)
+            except Exception:
+                bids_df_merged = bids_df_new
 
+            bids_df_merged = (
+                bids_df_merged
+                .sort_values(by=["auction_id", "bid_seq", "bid_amount"], ascending=[True, True, False])
+                .drop_duplicates(subset=["auction_id", "bid_seq"], keep="first")
+            )
+            bids_buf = io.BytesIO()
+            bids_df_merged.to_parquet(bids_buf, index=False, compression="zstd")
+            bids_buf.seek(0)
+            s3.put_object(Bucket=R2_BUCKET_NAME, Key=bids_key, Body=bids_buf.getvalue())
+            total_bids_saved += len(file_bid_rows)
+
+        if changed_in_file > 0:
+            df = enforce_fact_auctions_schema(df)
             buf = io.BytesIO()
             df.to_parquet(buf, index=False, compression="zstd")
             buf.seek(0)
@@ -404,17 +627,21 @@ def settle_r2_partitions(
 
         print(
             f"[settle {idx_file}/{len(keys)}] {key}: candidates={len(candidate_aids)}, "
-            f"fetched_new={len(to_fetch)}, updated={changed_in_file} ({time.time() - t0:.1f}s)"
+            f"fetched_new={len(to_fetch)}, auctions_updated={changed_in_file}, "
+            f"bids_saved={len(file_bid_rows)} ({time.time() - t0:.1f}s)"
         )
         if max_items_per_run > 0 and total_fetched >= max_items_per_run:
             break
 
-    print(f"[✓] Settlement sweep complete: fetched={total_fetched:,}, rows_updated={total_updated:,}")
+    print(
+        f"[✓] Settlement sweep complete: fetched={total_fetched:,}, "
+        f"auctions_updated={total_updated:,}, bids_saved={total_bids_saved:,}"
+    )
     return total_updated
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Verify & settle closed Nellis auction winning prices in R2.")
+    parser = argparse.ArgumentParser(description="Verify & settle closed Nellis winning prices and bid histories in R2.")
     parser.add_argument("--max-files", type=int, default=0, help="Max R2 Parquet files to scan newest-first (0 = all).")
     parser.add_argument("--workers", type=int, default=32, help="Concurrent HTTP workers (default: 32).")
     parser.add_argument("--max-items", type=int, default=0, help="Max unique auction lookups (0 = unlimited).")
