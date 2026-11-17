@@ -329,17 +329,26 @@ def unflatten_val(idx, data):
     return val
 
 
-def parse_nellis_products_from_stream(data: list) -> list:
-    """Extract normalized product dictionaries from a Nellis search.data response array."""
+def parse_nellis_products_with_meta(data: list, include_just_ended_sec: int = -30) -> tuple:
+    """
+    Extract normalized product dicts from a Nellis search.data response array.
+    Returns (items, raw_product_count, max_diff_sec_on_page) so pagination never stops
+    early just because closed/filtered lots were skipped on page 0.
+    """
     now_ms = int(time.time() * 1000)
     items = []
+    raw_count = 0
+    max_diff_sec = None
+
     for i, el in enumerate(data):
         if el == 'products' and i + 1 < len(data):
             if not isinstance(data[i + 1], list):
                 continue
-            for idx in data[i + 1]:
+            raw_ids = data[i + 1]
+            raw_count = len(raw_ids)
+            for idx in raw_ids:
                 p = unflatten_val(idx, data)
-                if not p or not isinstance(p, dict) or p.get('isClosed', False):
+                if not p or not isinstance(p, dict):
                     continue
 
                 raw_close = p.get('closeTime')
@@ -351,8 +360,10 @@ def parse_nellis_products_from_stream(data: list) -> list:
                     continue
 
                 diff_sec = (close_ms - now_ms) / 1000.0
-                if diff_sec <= -30:
-                    # Skip already ended lots
+                if max_diff_sec is None or diff_sec > max_diff_sec:
+                    max_diff_sec = diff_sec
+
+                if p.get('isClosed', False) or diff_sec <= include_just_ended_sec:
                     continue
 
                 loc_dict = p.get('location') if isinstance(p.get('location'), dict) else {}
@@ -390,6 +401,12 @@ def parse_nellis_products_from_stream(data: list) -> list:
                     'closed_at': pd.to_datetime(close_ms, unit='ms', utc=True).tz_convert('America/Phoenix')
                 })
             break
+    return items, raw_count, max_diff_sec
+
+
+def parse_nellis_products_from_stream(data: list) -> list:
+    """Backward-compatible wrapper returning normalized active items from a search.data stream."""
+    items, _, _ = parse_nellis_products_with_meta(data)
     return items
 
 
@@ -483,10 +500,19 @@ def build_fuzzy_sql_where(query: str) -> str:
 
 
 @st.cache_data(ttl=15)
-def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by: str = "⏳ Closing Soonest (Sniper)", page_size: int = 120, max_pages: int = 5):
+def fetch_live_nellis_lots(
+    search_kw: str = "",
+    loc_filter: str = "All",
+    sort_by: str = "⏳ Closing Soonest (Sniper)",
+    page_size: int = 240,
+    max_pages: int = 10,
+    target_window_sec: int = 0,
+):
     """
-    Fetch real-time active lots directly from Nellis Auction's API (up to 600 lots across 5 pages).
-    Supports live keyword search (with typo fallback), warehouse location filter, and sorting.
+    Fetch real-time active lots directly from Nellis Auction's API.
+    When target_window_sec > 0 (e.g., < 15 mins / < 30 mins / < 1 hour), always walks
+    chronologically by time_remaining_asc past page-0 closed clutter until the entire
+    requested time window is covered, then lets the UI re-sort in Pandas.
     """
     try:
         opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor())
@@ -497,18 +523,27 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
         )
         opener.open(req_loc, timeout=10)
 
-        nellis_sort = {
-            "⏳ Closing Soonest (Sniper)": "time_remaining_asc",
-            "Lowest Final Bid ($)": "current_price_asc",
-            "Highest Retail MSRP ($)": "retail_price_desc",
-            "Highest Discount (%)": "time_remaining_asc"
-        }.get(sort_by, "time_remaining_asc")
+        # Short live windows MUST walk chronologically so sorting by Discount/Bid/MSRP still sees the full window
+        if target_window_sec > 0:
+            nellis_sort = "time_remaining_asc"
+            eff_max_pages = max(max_pages, 25 if target_window_sec >= 1800 else 18)
+        else:
+            nellis_sort = {
+                "⏳ Closing Soonest (Sniper)": "time_remaining_asc",
+                "Lowest Final Bid ($)": "current_price_asc",
+                "Highest Retail MSRP ($)": "retail_price_desc",
+                "Highest Discount (%)": "time_remaining_asc"
+            }.get(sort_by, "time_remaining_asc")
+            eff_max_pages = max_pages
+
+        eff_page_size = min(max(int(page_size), 40), 240)
 
         def _fetch_query(kw_str: str, pages: int, direct_match: bool = False):
             collected = []
             seen = set()
+            consecutive_empty_new = 0
             for page_num in range(0, pages):
-                params = [("sortBy", nellis_sort), ("_p1", f"s:{page_size},n:{page_num}")]
+                params = [("sortBy", nellis_sort), ("_p1", f"s:{eff_page_size},n:{page_num}")]
                 if kw_str and kw_str.strip():
                     params.append(("query", kw_str.strip()))
                 if loc_filter in ["Phoenix", "Mesa"]:
@@ -517,12 +552,15 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
                 qs = urllib.parse.urlencode(params)
                 url = f'https://www.nellisauction.com/search.data?{qs}'
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with opener.open(req, timeout=10) as resp:
+                with opener.open(req, timeout=12) as resp:
                     data = json.loads(resp.read().decode())
 
-                page_items = parse_nellis_products_from_stream(data)
-                if not page_items:
+                page_items, raw_count, max_diff_sec = parse_nellis_products_with_meta(
+                    data, include_just_ended_sec=0
+                )
+                if raw_count == 0:
                     break
+
                 new_added = 0
                 for it in page_items:
                     aid = it.get("auction_id")
@@ -531,11 +569,30 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
                         it["_direct_nellis_match"] = direct_match
                         collected.append(it)
                         new_added += 1
-                if new_added == 0 or len(page_items) < page_size:
+
+                # Stop early once chronological walk clearly passes target window (+90s safety buffer)
+                if (
+                    target_window_sec > 0
+                    and nellis_sort == "time_remaining_asc"
+                    and max_diff_sec is not None
+                    and max_diff_sec >= target_window_sec + 90
+                ):
                     break
+
+                if raw_count < eff_page_size:
+                    break
+
+                if new_added == 0 and (not page_items or len(seen) > 0):
+                    # Page 0/1 can contain 100% already-closed items; keep advancing unless repeated stalled pages after items found
+                    if len(collected) > 0:
+                        consecutive_empty_new += 1
+                        if consecutive_empty_new >= 2:
+                            break
+                else:
+                    consecutive_empty_new = 0
             return collected
 
-        items = _fetch_query(search_kw, max_pages, direct_match=bool(search_kw and search_kw.strip()))
+        items = _fetch_query(search_kw, eff_max_pages, direct_match=bool(search_kw and search_kw.strip()))
 
         # If search query had a typo or multi-word constraint that returned very few hits from Nellis,
         # also fetch a broader live pool so our typo-tolerant fuzzy matcher can surface relevant items.
@@ -549,7 +606,7 @@ def fetch_live_nellis_lots(search_kw: str = "", loc_filter: str = "All", sort_by
                         seen_ids.add(extra.get("auction_id"))
                         items.append(extra)
             if len(items) < 25:
-                for extra in _fetch_query("", 3, direct_match=False):
+                for extra in _fetch_query("", 4, direct_match=False):
                     if extra.get("auction_id") not in seen_ids:
                         seen_ids.add(extra.get("auction_id"))
                         items.append(extra)
@@ -1424,14 +1481,24 @@ if view_mode == "🎯 Deal Finder":
             except Exception as e:
                 st.error(f"Error querying Historical Archive: {e}")
     else:
+        max_sec_map = {
+            "🔥 Ending in < 5 mins (Live)": 300,
+            "⚡ Ending in < 15 mins (Live)": 900,
+            "⏳ Ending in < 30 mins (Live)": 1800,
+            "🕒 Ending in < 1 hour (Live)": 3600,
+            "📅 Ending Today (< 24 hrs)": 86400
+        }
+        short_window_sec = max_sec_map.get(time_filter, 0) if time_filter != "📅 Ending Today (< 24 hrs)" else 0
+
         # Fetch active lots (Always guarantees only ACTIVE lots are shown, never lots that ended last night)
         with st.spinner("Fetching active lots..."):
             live_df = fetch_live_nellis_lots(
                 search_kw=search_kw,
                 loc_filter=loc_filter,
                 sort_by=sort_by,
-                page_size=120,
-                max_pages=5
+                page_size=240,
+                max_pages=8,
+                target_window_sec=short_window_sec,
             )
 
             # If "All Active Lots" or "Ending Today", also union any active (closed_at > now()) lots in the Data Lake
@@ -1509,9 +1576,16 @@ if view_mode == "🎯 Deal Finder":
                 else format_clean_condition(c, t, n)
                 for c, t, n, cp, fn in zip(live_df["condition"].fillna(""), live_df["title"].fillna(""), notes_col, comp_col, func_col)
             ]
-            # Strict filter: Only currently active lots (diff_sec > 0)
+            # Recompute diff_sec against live current time (never use stale cached countdowns)
+            now_ms_live = int(time.time() * 1000)
+            if "close_ms" in live_df.columns:
+                live_df = live_df.copy()
+                live_df["diff_sec"] = (pd.to_numeric(live_df["close_ms"], errors="coerce").fillna(0) - now_ms_live) / 1000.0
+
+            # Exclude expired or about-to-expire (<10s / <20s) lots that flip to POTENTIALLY CLOSED before render
+            min_sec_buffer = 10.0 if time_filter == "🔥 Ending in < 5 mins (Live)" else 20.0
             filtered = live_df[
-                (live_df['diff_sec'] > 0) &
+                (live_df['diff_sec'] > min_sec_buffer) &
                 (live_df['retail_price'] >= min_retail) &
                 (live_df['final_price'] <= max_bid)
             ]
@@ -1533,13 +1607,6 @@ if view_mode == "🎯 Deal Finder":
                 filtered = filtered.assign(_search_score=scores)
                 filtered = filtered[filtered['_search_score'] >= 0.65]
 
-            max_sec_map = {
-                "🔥 Ending in < 5 mins (Live)": 300,
-                "⚡ Ending in < 15 mins (Live)": 900,
-                "⏳ Ending in < 30 mins (Live)": 1800,
-                "🕒 Ending in < 1 hour (Live)": 3600,
-                "📅 Ending Today (< 24 hrs)": 86400
-            }
             if time_filter in max_sec_map:
                 filtered = filtered[filtered['diff_sec'] <= max_sec_map[time_filter]]
 
