@@ -196,6 +196,7 @@ def main():
     parser.add_argument("--date", type=str, default=None, help="Scrape partition date YYYY-MM-DD (default: today)")
     parser.add_argument("--upload-r2", action="store_true", default=True, help="Upload Parquet files to Cloudflare R2 (default: True)")
     parser.add_argument("--local-only", action="store_true", help="Force saving to local ./data_lake instead of Cloudflare R2")
+    parser.add_argument("--settle-recent", type=int, default=4, help="Verify & settle closed lots in the N newest R2 files (0 to skip)")
     args = parser.parse_args()
 
     locations = [loc.strip() for loc in args.locations.split(",") if loc.strip()]
@@ -226,6 +227,17 @@ def main():
     print("\n[*] Loading Parquet files into Data Lake...")
     fact_path = write_fact_auctions(fact_auctions, scrape_date=scrape_date, use_r2=use_r2)
     catalog_path = merge_dim_products(dim_products, use_r2=use_r2)
+
+    if use_r2 and args.settle_recent > 0 and args.limit is None:
+        from src.settlement import settle_r2_partitions
+        print(f"\n[*] Settling closed auctions across newest {args.settle_recent} R2 partitions...")
+        settle_r2_partitions(
+            max_files=args.settle_recent,
+            workers=32,
+            max_items_per_run=18000,
+            buffer_minutes=5,
+            only_unsettled=True,
+        )
 
     print("\n" + "=" * 70)
     print("[✓] Pipeline Run Completed Successfully!")

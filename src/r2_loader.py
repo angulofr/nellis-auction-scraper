@@ -11,8 +11,6 @@ import datetime
 import os
 import duckdb
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 # Environment configuration
 R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
@@ -87,6 +85,16 @@ def write_fact_auctions(fact_records: list, scrape_date: str = None, use_r2: boo
         df["photo_url"] = df["photo_url"].fillna("").astype("string")
     else:
         df["photo_url"] = ""
+    df["is_closed"] = (
+        df["is_closed"].fillna(False).astype("bool")
+        if "is_closed" in df.columns
+        else pd.Series([False] * len(df), dtype="bool")
+    )
+    df["market_status"] = (
+        df["market_status"].fillna("active").astype("string")
+        if "market_status" in df.columns
+        else pd.Series(["active"] * len(df), dtype="string")
+    )
 
     con = get_configured_duckdb_conn()
 
@@ -102,7 +110,7 @@ def write_fact_auctions(fact_records: list, scrape_date: str = None, use_r2: boo
     # Check if partition already exists so we can upsert and preserve earlier closed lots
     partition_exists = False
     try:
-        con.execute(f"SELECT COUNT(*) FROM '{target_path}'")
+        con.execute(f"SELECT COUNT(*) FROM '{target_path}'").fetchone()
         partition_exists = True
     except Exception:
         partition_exists = False
@@ -118,18 +126,18 @@ def write_fact_auctions(fact_records: list, scrape_date: str = None, use_r2: boo
             )
             SELECT DISTINCT ON (auction_id) *
             FROM combined
-            ORDER BY auction_id, final_price DESC, bid_count DESC;
-        """)
+            ORDER BY auction_id, COALESCE(is_closed, FALSE) DESC, final_price DESC, bid_count DESC;
+        """).fetchall()
         con.execute(f"""
             COPY merged_facts TO '{target_path}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
-        """)
+        """).fetchall()
         total_rows = con.execute("SELECT COUNT(*) FROM merged_facts").fetchone()[0]
         print(f"[✓] Successfully merged fact_auctions Parquet ({total_rows:,} total rows)")
     else:
         print(f"[*] Writing {len(df)} fact records to: {target_path}...")
         con.execute(f"""
             COPY daily_facts_view TO '{target_path}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
-        """)
+        """).fetchall()
         print(f"[✓] Successfully wrote fact_auctions Parquet ({len(df):,} rows)")
 
     con.close()

@@ -23,6 +23,7 @@ import src.transform as _transform_mod
 if not hasattr(_transform_mod, "is_incomplete_or_damaged"):
     importlib.reload(_transform_mod)
 from src.transform import CATEGORY_RULES, classify_product_category, is_incomplete_or_damaged
+from src.settlement import fetch_closed_lots_batch, is_verified_sold_result
 
 # Page setup
 st.set_page_config(
@@ -52,8 +53,8 @@ STOP_WORDS = {
 
 
 @st.cache_resource
-def get_duckdb_con(_v=2):
-    """Create and cache persistent DuckDB connection with Cloudflare R2 httpfs."""
+def get_duckdb_con(_v=3):
+    """Create and cache persistent DuckDB connection with Cloudflare R2 httpfs & deduped fact view."""
     con = duckdb.connect()
     con.execute("INSTALL httpfs; LOAD httpfs;")
     host = R2_ENDPOINT_URL.replace("https://", "").replace("http://", "").strip("/")
@@ -65,7 +66,24 @@ def get_duckdb_con(_v=2):
         SET GLOBAL s3_region = 'auto';
         SET GLOBAL s3_use_ssl = true;
     """)
-    con.execute(f"CREATE OR REPLACE VIEW fact_auctions AS SELECT * FROM read_parquet('s3://{R2_BUCKET_NAME}/fact_auctions/*/*/*.parquet');")
+    facts_glob = f"s3://{R2_BUCKET_NAME}/fact_auctions/*/*/*.parquet"
+    desc_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{facts_glob}', union_by_name=true);").fetchall()
+    raw_cols = {str(r[0]).lower() for r in desc_rows}
+
+    extra_cols = []
+    if "is_closed" not in raw_cols:
+        extra_cols.append("CAST(NULL AS BOOLEAN) AS is_closed")
+    if "market_status" not in raw_cols:
+        extra_cols.append("CAST('unverified' AS VARCHAR) AS market_status")
+    extra_sql = (", " + ", ".join(extra_cols)) if extra_cols else ""
+    settled_order = "COALESCE(is_closed, FALSE) DESC, " if "is_closed" in raw_cols else ""
+
+    con.execute(f"""
+        CREATE OR REPLACE VIEW fact_auctions AS
+        SELECT DISTINCT ON (auction_id) *{extra_sql}
+        FROM read_parquet('{facts_glob}', union_by_name=true)
+        ORDER BY auction_id, {settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
+    """)
     con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('s3://{R2_BUCKET_NAME}/dim_products/products_catalog.parquet');")
     return con
 
@@ -86,6 +104,31 @@ def run_duckdb_query(sql: str) -> pd.DataFrame:
 def run_cached_duckdb_query(sql: str) -> pd.DataFrame:
     """Cached DuckDB query (5m TTL) so pagination & modal clicks don't re-scan R2."""
     return run_duckdb_query(sql)
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def has_settled_history_rows() -> bool:
+    """True once R2 holds at least 500 settled post-close lots."""
+    try:
+        cnt = int(run_duckdb_query("SELECT COUNT(*) FROM fact_auctions WHERE is_closed = TRUE;").iloc[0, 0])
+        return cnt >= 500
+    except Exception:
+        return False
+
+
+def get_settled_sales_where_sql(alias: str = "f") -> str:
+    """SQL predicate restricting historical winning prices to actual closed sales."""
+    parts = [
+        f"{alias}.closed_at <= now()",
+        f"{alias}.final_price > 0",
+        f"{alias}.bid_count > 0",
+        f"COALESCE({alias}.market_status, 'sold') NOT IN ('relisted', 'canceled', 'cancelled', 'void', 'unsold', 'active', 'archived_unverified')",
+    ]
+    if has_settled_history_rows():
+        parts.append(f"{alias}.is_closed = TRUE")
+    else:
+        parts.append(f"COALESCE({alias}.is_closed, TRUE) = TRUE")
+    return " AND ".join(parts)
 
 
 # --- PRODUCT MATCHING & NORMALIZATION ENGINE ($0 COST) ---
@@ -226,7 +269,8 @@ def load_historical_price_index():
     by Amazon Image ID and Normalized Title Signature.
     """
     try:
-        hist_df = run_duckdb_query("""
+        settled_where = get_settled_sales_where_sql("f")
+        hist_df = run_duckdb_query(f"""
             SELECT 
                 f.auction_id,
                 p.title,
@@ -237,10 +281,12 @@ def load_historical_price_index():
                 f.bid_count,
                 f.damage_notes,
                 f.closed_at,
-                f.photo_url
+                f.photo_url,
+                f.is_closed,
+                f.market_status
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
-            WHERE f.closed_at <= now() AND f.final_price > 0
+            WHERE {settled_where}
         """)
     except Exception as e:
         print(f"Warning loading historical index: {e}")
@@ -662,6 +708,85 @@ def search_live_active_duplicates(title: str, retail_price: float, photo_url: st
 
 # --- POPUP MODAL OVERLAY FOR PRICE HISTORY & CHEAPER ACTIVE COPIES ---
 
+@st.cache_data(ttl=1800, show_spinner=False)
+def verify_closed_lots_cached(aids_tuple: tuple) -> dict:
+    """Cache live post-close Nellis .data verification per batch of past auction IDs."""
+    return fetch_closed_lots_batch(list(aids_tuple), workers=16)
+
+
+def _format_az_date(val) -> str:
+    """Format closed timestamp/epoch cleanly as YYYY-MM-DD in Arizona MST."""
+    if val is None or str(val) in ("NaT", "nan", ""):
+        return ""
+    try:
+        if isinstance(val, (int, float)) and val > 1e11:
+            dt = pd.to_datetime(int(val), unit="ms", utc=True).tz_convert("America/Phoenix")
+        else:
+            dt = pd.to_datetime(val, utc=True, errors="coerce")
+            if pd.notna(dt):
+                dt = dt.tz_convert("America/Phoenix")
+        if pd.notna(dt):
+            return dt.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return str(val)[:10]
+
+
+def verify_past_matches_live(past_matches: list, max_verify: int = 30) -> list:
+    """
+    Verify any unverified (is_closed != True) historical match directly against Nellis's
+    post-close endpoint so modal stats show actual WON FOR prices instead of pre-close snapshots.
+    """
+    if not past_matches:
+        return []
+
+    to_check = tuple(
+        sorted({
+            int(m["auction_id"])
+            for m in past_matches[:max_verify]
+            if not (m.get("is_closed") is True)
+        })
+    )
+    live_map = verify_closed_lots_cached(to_check) if to_check else {}
+
+    cleaned = []
+    for m in past_matches[:max_verify]:
+        aid = int(m.get("auction_id") or 0)
+        row = dict(m)
+        if row.get("is_closed") is True:
+            mkt = str(row.get("market_status") or "sold").lower()
+            if mkt in ("relisted", "canceled", "cancelled", "void", "unsold", "active") or int(row.get("bid_count") or 0) <= 0:
+                continue
+            row["_verified_badge"] = "Verified Won" if mkt != "archived_unverified" else "Archived"
+            cleaned.append(row)
+            continue
+
+        res = live_map.get(aid)
+        if res and not res.get("not_found"):
+            if not is_verified_sold_result(res):
+                # Exclude active, 0-bid, relisted, or canceled lots from Past Sales
+                continue
+            row["final_price"] = float(res["final_price"])
+            row["bid_count"] = int(res["bid_count"])
+            if float(res.get("retail_price") or 0) > 0:
+                row["retail_price"] = float(res["retail_price"])
+            if res.get("close_ms"):
+                row["closed_at"] = res["close_ms"]
+            row["is_closed"] = True
+            row["market_status"] = res.get("market_status") or "sold"
+            row["_verified_badge"] = "Live Verified"
+            cleaned.append(row)
+        elif res and res.get("not_found"):
+            row["_verified_badge"] = "Purged / Unverified"
+            cleaned.append(row)
+        else:
+            row["_verified_badge"] = "Unverified"
+            cleaned.append(row)
+
+    cleaned.sort(key=lambda x: (float(x.get("final_price") or 0), str(x.get("closed_at") or "")))
+    return cleaned
+
+
 @st.dialog("🔍 Price History & Active Copies", width="large")
 def show_item_history_dialog(item_row: dict):
     """Compact, mobile-first modal popup displaying active copies and past winning price history."""
@@ -727,8 +852,10 @@ def show_item_history_dialog(item_row: dict):
         if int(c.get("auction_id") or 0) != item_id
         and (not same_cond_only or get_condition_tier(c.get("condition")) == cond_tier)
     ]
+
     hist_index = load_historical_price_index()
-    past_matches = find_historical_matches(item_row, hist_index, same_condition_only=same_cond_only)
+    raw_past_matches = find_historical_matches(item_row, hist_index, same_condition_only=same_cond_only)
+    past_matches = verify_past_matches_live(raw_past_matches)
 
     # Quick Tab Switcher inside modal for clean mobile reading
     tab_hist, tab_active = st.tabs([
@@ -738,7 +865,7 @@ def show_item_history_dialog(item_row: dict):
 
     with tab_hist:
         if not past_matches:
-            st.info(f"No past closed lots recorded yet in **{cond_tier if same_cond_only else 'any'}** condition.")
+            st.info(f"No verified past closed sales found in **{cond_tier if same_cond_only else 'any'}** condition.")
         else:
             prices = [float(m.get("final_price") or 0) for m in past_matches]
             min_won = min(prices)
@@ -771,16 +898,19 @@ def show_item_history_dialog(item_row: dict):
                 p_price = float(past.get("final_price") or 0)
                 p_msrp = float(past.get("retail_price") or msrp or 0)
                 p_disc = ((p_msrp - p_price) / p_msrp * 100.0) if p_msrp > 0 else 0
-                p_date = str(past.get("closed_at") or "")[:10]
+                p_date = _format_az_date(past.get("closed_at"))
                 p_loc = past.get("location") or "AZ"
                 p_cond = past.get("clean_cond") or format_clean_condition(past.get("condition"))
                 p_bids = past.get("bid_count") or 0
+                p_badge = past.get("_verified_badge") or "Verified"
+                badge_color = "#4ade80" if "Verified" in p_badge and "Unverified" not in p_badge else "#fbbf24"
                 rows_html.append(
                     f"""
                     <div style="border:1px solid #334155; background:#0f172a; border-radius:10px; padding:9px 12px; margin-bottom:8px;">
                         <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
                             <div style="font-size:14px; font-weight:800; color:#f8fafc;">
                                 #{rank} &nbsp; ${p_price:,.2f} <span style="color:#4ade80; font-size:12px;">({p_disc:.0f}% off)</span>
+                                <span style="color:{badge_color}; font-size:11px; font-weight:600; margin-left:6px;">· {p_badge}</span>
                             </div>
                             <a href="{p_url}" target="_blank" style="background:#334155; color:#ffffff; text-decoration:none; font-size:12px; font-weight:700; padding:4px 10px; border-radius:6px; white-space:nowrap;">View ↗</a>
                         </div>
@@ -1407,7 +1537,7 @@ if view_mode == "🎯 Deal Finder":
         # Query Closed / Historical Archive directly from Cloudflare R2 Data Lake
         with st.spinner("Searching historical closed auctions in Data Lake..."):
             where_parts = [
-                "f.closed_at <= now()",
+                get_settled_sales_where_sql("f"),
                 f"f.retail_price >= {min_retail}",
                 f"f.final_price <= {max_bid}",
             ]
@@ -2057,10 +2187,9 @@ elif view_mode == "🏆 Best Past Deals":
 
     inject_nellis_card_css()
 
-    # Build DuckDB query for closed historical deals
+    # Build DuckDB query for closed historical deals (excludes pre-close active scrapes & relisted 0-bid lots)
     where_parts = [
-        "f.closed_at <= now()",
-        "f.final_price > 0",
+        get_settled_sales_where_sql("f"),
         "f.retail_price > 0",
         f"f.retail_price >= {pd_min_retail}",
         f"f.final_price <= {pd_max_bid}",
@@ -2372,8 +2501,9 @@ elif view_mode == "📊 Analytics Hub":
         ]
     )
 
+    settled_where = get_settled_sales_where_sql("f")
     if "1. Condition" in model_choice:
-        sql = """
+        sql = f"""
             SELECT 
                 f.condition,
                 f.completeness,
@@ -2385,7 +2515,7 @@ elif view_mode == "📊 Analytics Hub":
                 ROUND((1.0 - MEDIAN(f.discount_ratio)) * 100.0, 1) AS median_discount_pct,
                 ROUND(AVG(f.bid_count), 1) AS avg_bids
             FROM fact_auctions f
-            WHERE f.discount_ratio IS NOT NULL
+            WHERE {settled_where} AND f.discount_ratio IS NOT NULL
             GROUP BY f.condition, f.completeness, f.functional_status
             ORDER BY lot_count DESC
             LIMIT 25;
@@ -2398,7 +2528,7 @@ elif view_mode == "📊 Analytics Hub":
             st.bar_chart(df.set_index("condition")["median_discount_pct"])
 
     elif "2. Category" in model_choice:
-        sql = """
+        sql = f"""
             SELECT 
                 COALESCE(NULLIF(p.category_primary, ''), 'Uncategorized') AS category,
                 COALESCE(NULLIF(p.brand, ''), 'Generic') AS brand,
@@ -2409,7 +2539,7 @@ elif view_mode == "📊 Analytics Hub":
                 ROUND(AVG(f.final_price), 2) AS avg_winning_bid
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
-            WHERE f.discount_ratio IS NOT NULL AND f.retail_price >= 25.0
+            WHERE {settled_where} AND f.discount_ratio IS NOT NULL AND f.retail_price >= 25.0
             GROUP BY category, brand
             HAVING COUNT(f.auction_id) >= 5
             ORDER BY median_ratio ASC
@@ -2421,7 +2551,7 @@ elif view_mode == "📊 Analytics Hub":
         st.dataframe(df, use_container_width=True)
 
     elif "3. Temporal" in model_choice:
-        sql = """
+        sql = f"""
             SELECT 
                 f.close_day_of_week,
                 CASE f.close_day_of_week
@@ -2439,7 +2569,7 @@ elif view_mode == "📊 Analytics Hub":
                 ROUND(MEDIAN(f.discount_ratio), 4) AS median_discount_ratio,
                 ROUND(AVG(f.bid_count), 1) AS avg_bids_per_item
             FROM fact_auctions f
-            WHERE f.close_day_of_week IS NOT NULL AND f.close_hour IS NOT NULL
+            WHERE {settled_where} AND f.close_day_of_week IS NOT NULL AND f.close_hour IS NOT NULL
             GROUP BY f.close_day_of_week, day_name, f.close_hour
             ORDER BY f.close_day_of_week ASC, f.close_hour ASC;
         """
@@ -2451,7 +2581,7 @@ elif view_mode == "📊 Analytics Hub":
             st.line_chart(df.set_index("close_hour")[["avg_bids_per_item"]])
 
     elif "4. Sleeper" in model_choice:
-        sql = """
+        sql = f"""
             SELECT 
                 f.auction_id,
                 p.title,
@@ -2465,7 +2595,8 @@ elif view_mode == "📊 Analytics Hub":
                 f.closed_at
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
-            WHERE f.retail_price >= 150.0
+            WHERE {settled_where}
+              AND f.retail_price >= 150.0
               AND f.bid_count <= 10
               AND f.discount_ratio <= 0.25
               AND f.condition IN ('Brand New', 'Like New', 'Open Box')
@@ -2502,6 +2633,8 @@ elif view_mode == "💻 SQL Studio":
    - close_hour (TINYINT: 0..23)
    - scraped_date (DATE)
    - photo_url (VARCHAR)
+   - is_closed (BOOLEAN; TRUE if verified post-close, FALSE if captured while still open)
+   - market_status (VARCHAR: 'sold', 'relisted', 'canceled', 'active', 'unverified')
 2. dim_products p:
    - product_id (VARCHAR)
    - title (VARCHAR)
@@ -2524,7 +2657,7 @@ elif view_mode == "💻 SQL Studio":
             "Rules:\n"
             "- Output ONLY a single valid DuckDB SELECT (or WITH ... SELECT) SQL query. No markdown, no explanations.\n"
             "- Always JOIN dim_products p ON f.product_id = p.product_id when using title, brand, or category.\n"
-            "- Closed/past auctions satisfy f.closed_at <= now(). 'Last night' means f.closed_at >= now() - INTERVAL 24 HOUR AND f.closed_at <= now().\n"
+            "- Closed/past sold auctions satisfy f.closed_at <= now() AND COALESCE(f.is_closed, TRUE) = TRUE AND COALESCE(f.market_status, 'sold') NOT IN ('relisted', 'canceled', 'cancelled', 'void', 'unsold', 'active'). For winning-price averages, require f.bid_count > 0 AND f.final_price > 0. 'Last night' means f.closed_at >= now() - INTERVAL 24 HOUR AND f.closed_at <= now().\n"
             "- 'New' condition means f.condition = 'Brand New'.\n"
             "- CRITICAL for product keyword matching: NEVER put a multi-word product phrase in one contiguous ILIKE '%a b c%'. Split into separate AND p.title ILIKE '%word%' clauses for the core product words, and handle hyphen/space variants with OR using standard single quotes (e.g., (p.title ILIKE '%usb-c%' OR p.title ILIKE '%usb c%' OR p.title ILIKE '%type-c%') AND p.title ILIKE '%cable%').\n"
             "- For aggregations (AVG, MIN, MAX), ALWAYS use ROUND(..., 2), give clean aliases (e.g. AS avg_price, AS min_price), and also include COUNT(*) AS matching_lots.\n"

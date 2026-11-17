@@ -243,6 +243,10 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
         first_photo = photos_arr[0].get("url", "") if photos_arr and isinstance(photos_arr[0], dict) else ""
         photo_url = item.get("photo_url") or first_photo or ""
 
+        # Closed / settlement status from source payload
+        raw_is_closed = bool(item.get("isClosed", False))
+        raw_mkt_status = str(item.get("marketStatus") or ("sold" if raw_is_closed else "active")).strip().lower()
+
         # 1. Fact Table Record
         fact_record = {
             "auction_id": auction_id,
@@ -261,7 +265,9 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
             "close_day_of_week": close_day_of_week,
             "close_hour": close_hour,
             "scraped_date": scrape_date,
-            "photo_url": photo_url
+            "photo_url": photo_url,
+            "is_closed": raw_is_closed,
+            "market_status": raw_mkt_status,
         }
         fact_auctions.append(fact_record)
 
