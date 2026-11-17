@@ -1789,7 +1789,8 @@ if view_mode == "🎯 Deal Finder":
                 cand_rows = filtered.to_dict("records")
 
                 # Because closed final prices are always >= pre-close snapshots, pre-filter first,
-                # then live-verify matching candidates so Likely Cheap Tonight never shows false $1 steals.
+                # then live-verify matching candidates so Likely Cheap Tonight never shows false $1 steals
+                # or items whose live bid already exceeds their historical average.
                 pre_keep_rows = []
                 for r in cand_rows:
                     ms = find_historical_matches(r, hist_index_for_pred, same_condition_only=True)
@@ -1797,8 +1798,14 @@ if view_mode == "🎯 Deal Finder":
                         continue
                     avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
                     msrp_v = float(r.get("retail_price") or 0)
+                    cur_p = float(r.get("final_price") or 0)
                     avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
-                    if (not predict_cheap_only) or (len(ms) >= min_hist_sales and avg_p <= max_hist_avg and avg_d >= min_hist_disc):
+                    if (not predict_cheap_only) or (
+                        len(ms) >= min_hist_sales
+                        and avg_p <= max_hist_avg
+                        and cur_p <= max_hist_avg
+                        and avg_d >= min_hist_disc
+                    ):
                         pre_keep_rows.append(r)
 
                 verified_pred_map = batch_verify_rows_history(
@@ -1809,38 +1816,43 @@ if view_mode == "🎯 Deal Finder":
                     max_total_live_checks=280,
                 )
 
-                h_counts, h_avgs, h_discs = [], [], []
+                h_counts, h_avgs, h_discs, h_still_cheap = [], [], [], []
                 for r in cand_rows:
                     aid_r = int(r.get("auction_id") or 0)
                     ms = verified_pred_map.get(aid_r, [])
                     if ms:
                         avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
                         msrp_v = float(r.get("retail_price") or 0)
+                        cur_p = float(r.get("final_price") or 0)
                         avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
                         h_counts.append(len(ms))
                         h_avgs.append(avg_p)
                         h_discs.append(avg_d)
+                        h_still_cheap.append(cur_p <= avg_p)
                     else:
                         h_counts.append(0)
                         h_avgs.append(999999.0)
                         h_discs.append(-1.0)
+                        h_still_cheap.append(False)
                 filtered = filtered.assign(
                     _hist_count=h_counts,
                     _hist_avg_price=h_avgs,
                     _hist_avg_disc=h_discs,
                     _has_hist=[c > 0 for c in h_counts],
+                    _still_below_avg=h_still_cheap,
                 )
                 if predict_cheap_only:
                     filtered = filtered[
                         (filtered["_hist_count"] >= min_hist_sales)
                         & (filtered["_hist_avg_price"] <= max_hist_avg)
                         & (filtered["_hist_avg_disc"] >= min_hist_disc)
+                        & (filtered["final_price"] <= filtered["_hist_avg_price"])
                     ]
 
             if sort_by == "🔮 Predicted Best Steal (Lowest Hist Avg)" and "_hist_avg_price" in filtered.columns:
-                filtered = filtered.sort_values(by=["_has_hist", "_hist_avg_price", "_hist_avg_disc"], ascending=[False, True, False])
+                filtered = filtered.sort_values(by=["_has_hist", "_still_below_avg", "_hist_avg_price", "_hist_avg_disc"], ascending=[False, False, True, False])
             elif sort_by == "🔥 Highest Hist Avg % Off" and "_hist_avg_disc" in filtered.columns:
-                filtered = filtered.sort_values(by=["_has_hist", "_hist_avg_disc", "_hist_avg_price"], ascending=[False, False, True])
+                filtered = filtered.sort_values(by=["_has_hist", "_still_below_avg", "_hist_avg_disc", "_hist_avg_price"], ascending=[False, False, False, True])
             elif sort_by == "Highest Discount (%)":
                 filtered = filtered.sort_values(by="discount_pct", ascending=False)
             elif sort_by == "Lowest Final Bid ($)":
@@ -2086,8 +2098,15 @@ if view_mode == "🎯 Deal Finder":
                                 verdict = "🟢 **Below Avg Win**"
                             else:
                                 verdict = f"🔴 **Above Avg (${avg_won:.2f})**"
-                            if not is_archive_mode and len(past_matches) >= min_hist_sales and avg_won <= max_hist_avg and hist_avg_disc >= min_hist_disc:
-                                st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {len(past_matches)} sales)]**")
+                            if (
+                                not is_archive_mode
+                                and cur_bid <= avg_won
+                                and len(past_matches) >= min_hist_sales
+                                and avg_won <= max_hist_avg
+                                and hist_avg_disc >= min_hist_disc
+                            ):
+                                sale_noun = "sale" if len(past_matches) == 1 else "sales"
+                                st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {len(past_matches)} {sale_noun})]**")
                             st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.2f} ({len(past_matches)}) · {verdict}")
                         else:
                             st.caption(f"📊 No past '{cond_tier}' sales yet")
