@@ -711,7 +711,7 @@ def search_live_active_duplicates(title: str, retail_price: float, photo_url: st
 @st.cache_data(ttl=1800, show_spinner=False)
 def verify_closed_lots_cached(aids_tuple: tuple) -> dict:
     """Cache live post-close Nellis .data verification per batch of past auction IDs."""
-    return fetch_closed_lots_batch(list(aids_tuple), workers=16)
+    return fetch_closed_lots_batch(list(aids_tuple), workers=24)
 
 
 def _format_az_date(val) -> str:
@@ -732,22 +732,25 @@ def _format_az_date(val) -> str:
     return str(val)[:10]
 
 
-def verify_past_matches_live(past_matches: list, max_verify: int = 30) -> list:
+def verify_past_matches_live(past_matches: list, max_verify: int = 30, preloaded_map: dict = None) -> list:
     """
     Verify any unverified (is_closed != True) historical match directly against Nellis's
-    post-close endpoint so modal stats show actual WON FOR prices instead of pre-close snapshots.
+    post-close endpoint so modal and card stats show actual WON FOR prices instead of pre-close snapshots.
     """
     if not past_matches:
         return []
 
-    to_check = tuple(
-        sorted({
-            int(m["auction_id"])
-            for m in past_matches[:max_verify]
-            if not (m.get("is_closed") is True)
-        })
-    )
-    live_map = verify_closed_lots_cached(to_check) if to_check else {}
+    if preloaded_map is not None:
+        live_map = preloaded_map
+    else:
+        to_check = tuple(
+            sorted({
+                int(m["auction_id"])
+                for m in past_matches[:max_verify]
+                if not (m.get("is_closed") is True)
+            })
+        )
+        live_map = verify_closed_lots_cached(to_check) if to_check else {}
 
     cleaned = []
     for m in past_matches[:max_verify]:
@@ -785,6 +788,43 @@ def verify_past_matches_live(past_matches: list, max_verify: int = 30) -> list:
 
     cleaned.sort(key=lambda x: (float(x.get("final_price") or 0), str(x.get("closed_at") or "")))
     return cleaned
+
+
+def batch_verify_rows_history(
+    rows: list,
+    hist_index: dict,
+    same_condition_only: bool = True,
+    max_verify_per_item: int = 12,
+    max_total_live_checks: int = 240,
+) -> dict:
+    """
+    Batch-verify unverified historical matches across a page/candidate list in one concurrent sweep
+    so card Min Won / Avg / Likely Cheap Tonight stats match the Price History modal identically.
+    """
+    raw_by_aid = {}
+    unverified_ids = []
+    seen_unv = set()
+
+    for r in rows:
+        aid = int(r.get("auction_id") or 0)
+        raw_ms = find_historical_matches(r, hist_index, same_condition_only=same_condition_only)
+        raw_by_aid[aid] = raw_ms
+        for m in raw_ms[:max_verify_per_item]:
+            if not (m.get("is_closed") is True):
+                m_id = int(m.get("auction_id") or 0)
+                if m_id > 0 and m_id not in seen_unv:
+                    seen_unv.add(m_id)
+                    unverified_ids.append(m_id)
+
+    live_map = {}
+    if unverified_ids:
+        target_ids = tuple(sorted(unverified_ids[:max_total_live_checks]))
+        live_map = verify_closed_lots_cached(target_ids)
+
+    return {
+        aid: verify_past_matches_live(ms, max_verify=max_verify_per_item, preloaded_map=live_map)
+        for aid, ms in raw_by_aid.items()
+    }
 
 
 @st.dialog("🔍 Price History & Active Copies", width="large")
@@ -1746,9 +1786,33 @@ if view_mode == "🎯 Deal Finder":
             )
             if need_hist_scoring and not filtered.empty:
                 hist_index_for_pred = load_historical_price_index()
-                h_counts, h_avgs, h_discs = [], [], []
-                for r in filtered.to_dict("records"):
+                cand_rows = filtered.to_dict("records")
+
+                # Because closed final prices are always >= pre-close snapshots, pre-filter first,
+                # then live-verify matching candidates so Likely Cheap Tonight never shows false $1 steals.
+                pre_keep_rows = []
+                for r in cand_rows:
                     ms = find_historical_matches(r, hist_index_for_pred, same_condition_only=True)
+                    if not ms:
+                        continue
+                    avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
+                    msrp_v = float(r.get("retail_price") or 0)
+                    avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
+                    if (not predict_cheap_only) or (len(ms) >= min_hist_sales and avg_p <= max_hist_avg and avg_d >= min_hist_disc):
+                        pre_keep_rows.append(r)
+
+                verified_pred_map = batch_verify_rows_history(
+                    pre_keep_rows,
+                    hist_index_for_pred,
+                    same_condition_only=True,
+                    max_verify_per_item=15,
+                    max_total_live_checks=280,
+                )
+
+                h_counts, h_avgs, h_discs = [], [], []
+                for r in cand_rows:
+                    aid_r = int(r.get("auction_id") or 0)
+                    ms = verified_pred_map.get(aid_r, [])
                     if ms:
                         avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
                         msrp_v = float(r.get("retail_price") or 0)
@@ -1846,6 +1910,7 @@ if view_mode == "🎯 Deal Finder":
         st.info("No items match your filter criteria right now. Adjust the filters in the left sidebar to widen your search.")
     else:
         records = results_df.to_dict("records")
+        verified_page_hist = batch_verify_rows_history(records, hist_index, same_condition_only=True)
         for row_start in range(0, len(records), 4):
             grid_cols = st.columns(4)
             for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
@@ -1884,8 +1949,8 @@ if view_mode == "🎯 Deal Finder":
                     except Exception:
                         time_badge = f"Closes: {str(row_dict.get('closed_at'))[:16]}"
 
-                # 1. Lookup Historical Closed Matches (Like-for-Like Condition) & Active Copies (O(1))
-                past_matches = find_historical_matches(row_dict, hist_index, same_condition_only=True)
+                # 1. Lookup Verified Historical Closed Matches (Like-for-Like Condition) & Active Copies
+                past_matches = verified_page_hist.get(auction_id, [])
                 open_matches = [
                     c for c in find_open_radar_matches(row_dict, open_radar_index)
                     if int(c.get("auction_id") or 0) != auction_id
@@ -2020,10 +2085,10 @@ if view_mode == "🎯 Deal Finder":
                             elif cur_bid <= avg_won:
                                 verdict = "🟢 **Below Avg Win**"
                             else:
-                                verdict = f"🔴 **Above Avg (${avg_won:.0f})**"
+                                verdict = f"🔴 **Above Avg (${avg_won:.2f})**"
                             if not is_archive_mode and len(past_matches) >= min_hist_sales and avg_won <= max_hist_avg and hist_avg_disc >= min_hist_disc:
                                 st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {len(past_matches)} sales)]**")
-                            st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.0f} ({len(past_matches)}) · {verdict}")
+                            st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.2f} ({len(past_matches)}) · {verdict}")
                         else:
                             st.caption(f"📊 No past '{cond_tier}' sales yet")
 
@@ -2403,6 +2468,7 @@ elif view_mode == "🏆 Best Past Deals":
         render_pd_pagination("pd_top")
 
         records = pd_page_df.to_dict("records")
+        verified_pd_hist = batch_verify_rows_history(records, hist_index, same_condition_only=True)
         for row_start in range(0, len(records), 4):
             grid_cols = st.columns(4)
             for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
@@ -2419,7 +2485,7 @@ elif view_mode == "🏆 Best Past Deals":
 
                 # Idea 1: Check if an identical item is open right now!
                 open_matches = find_open_radar_matches(row_dict, open_radar_index)
-                past_matches = find_historical_matches(row_dict, hist_index, same_condition_only=True)
+                past_matches = verified_pd_hist.get(auction_id, [])
 
                 with grid_cols[col_idx]:
                     with st.container(border=True):
