@@ -274,6 +274,23 @@ def _to_int_ms(val) -> int:
         return 0
 
 
+def _is_single_fetch_not_found(resp, data=None) -> bool:
+    """True when Nellis returns 404/410 or Remix 202 SingleFetchRedirect for purged items."""
+    if resp.status_code in (404, 410):
+        return True
+    set_cookie = str(resp.headers.get("set-cookie") or "").lower()
+    if "item could not be found" in set_cookie:
+        return True
+    if resp.status_code == 202:
+        if isinstance(data, list) and data:
+            head = str(data[0])
+            if "SingleFetchRedirect" in head or "product" not in data:
+                return True
+        else:
+            return True
+    return False
+
+
 def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session] = None, timeout: int = 10) -> Optional[Dict]:
     """Fetch authoritative post-close state & full bidHistory of a lot from Nellis .data endpoint."""
     aid = int(auction_id)
@@ -286,6 +303,14 @@ def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session]
         for attempt in range(2):
             try:
                 resp = sess.get(url, timeout=timeout)
+                if resp.status_code == 429:
+                    raw_ra = resp.headers.get("Retry-After")
+                    try:
+                        ra_sec = int(float(raw_ra)) if raw_ra else 0
+                    except (ValueError, TypeError):
+                        ra_sec = 0
+                    return {"auction_id": aid, "_rate_limited": True, "retry_after": ra_sec}
+
                 if resp.status_code in (404, 410):
                     return {
                         "auction_id": aid,
@@ -296,6 +321,14 @@ def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session]
                     }
                 resp.raise_for_status()
                 data = resp.json()
+                if _is_single_fetch_not_found(resp, data):
+                    return {
+                        "auction_id": aid,
+                        "is_closed": True,
+                        "market_status": "archived_unverified",
+                        "not_found": True,
+                        "bid_history": [],
+                    }
                 if not isinstance(data, list):
                     return None
 
@@ -310,6 +343,14 @@ def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session]
                             bid_history = bh
 
                 if not isinstance(p, dict):
+                    if resp.status_code == 202:
+                        return {
+                            "auction_id": aid,
+                            "is_closed": True,
+                            "market_status": "archived_unverified",
+                            "not_found": True,
+                            "bid_history": [],
+                        }
                     return None
 
                 close_ms = _to_int_ms(p.get("closeTime"))
@@ -356,8 +397,18 @@ def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session]
             sess.close()
 
 
-def fetch_closed_lots_batch(auction_ids: Iterable[int], workers: int = 24) -> Dict[int, Dict]:
-    """Concurrently fetch authoritative post-close status, winning prices & bidHistory for a batch of IDs."""
+def fetch_closed_lots_batch(
+    auction_ids: Iterable[int],
+    workers: int = 12,
+    chunk_size: int = 150,
+    max_cooldowns: int = 0,
+    cooldown_seconds: int = 65,
+) -> Dict[int, Dict]:
+    """
+    Concurrently fetch authoritative post-close status, winning prices & bidHistory in paced chunks.
+    Respects HTTP 429 rate limits cleanly by cooling down when `max_cooldowns > 0`, or exiting early
+    for interactive UI callers (`max_cooldowns=0`) without hammering blocked requests.
+    """
     unique_ids = []
     seen = set()
     for x in auction_ids:
@@ -372,22 +423,62 @@ def fetch_closed_lots_batch(auction_ids: Iterable[int], workers: int = 24) -> Di
     if not unique_ids:
         return {}
 
-    sess = _build_pooled_session(pool_size=max(workers + 8, 16))
+    eff_workers = min(max(1, int(workers)), 12)
+    eff_chunk = max(1, int(chunk_size))
+    sess = _build_pooled_session(pool_size=max(eff_workers + 8, 16))
     results: Dict[int, Dict] = {}
+    queue = list(unique_ids)
+    cooldowns_used = 0
+    consecutive_empty_waves = 0
+    total_rate_limited = 0
+
     try:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            fut_map = {ex.submit(fetch_closed_lot_result, aid, sess): aid for aid in unique_ids}
-            for fut in as_completed(fut_map):
-                aid = fut_map[fut]
-                try:
-                    res = fut.result()
-                    if res:
+        while queue:
+            batch_ids = queue[:eff_chunk]
+            queue = queue[eff_chunk:]
+            rate_limited_ids = []
+            max_retry_after = 0
+            wave_resolved = 0
+
+            with ThreadPoolExecutor(max_workers=eff_workers) as ex:
+                fut_map = {ex.submit(fetch_closed_lot_result, aid, sess): aid for aid in batch_ids}
+                for fut in as_completed(fut_map):
+                    aid = fut_map[fut]
+                    try:
+                        res = fut.result()
+                    except Exception:
+                        res = None
+                    if not res:
+                        continue
+                    if res.get("_rate_limited"):
+                        rate_limited_ids.append(aid)
+                        max_retry_after = max(max_retry_after, int(res.get("retry_after") or 0))
+                    else:
                         results[aid] = res
-                except Exception:
-                    pass
+                        wave_resolved += 1
+
+            if rate_limited_ids:
+                total_rate_limited += len(rate_limited_ids)
+                if cooldowns_used >= max_cooldowns:
+                    break
+                consecutive_empty_waves = consecutive_empty_waves + 1 if wave_resolved == 0 else 0
+                if consecutive_empty_waves >= 2:
+                    print("[!] Consecutive cooldown waves remained rate-limited; stopping sweep cleanly.")
+                    break
+                cooldowns_used += 1
+                sleep_s = max(int(cooldown_seconds), min(max_retry_after, 300))
+                print(
+                    f"[!] Rate-limited (HTTP 429) on {len(rate_limited_ids)} items "
+                    f"(resolved={len(results):,}; cooldown {cooldowns_used}/{max_cooldowns}, sleeping {sleep_s}s)..."
+                )
+                time.sleep(sleep_s)
+                # Retry rate-limited items once cooled down
+                queue = rate_limited_ids + queue
     finally:
         sess.close()
 
+    if total_rate_limited > 0 and max_cooldowns > 0:
+        print(f"[*] Batch telemetry: resolved={len(results):,}, rate_limited_hits={total_rate_limited:,}, cooldowns={cooldowns_used}")
     return results
 
 
@@ -405,10 +496,12 @@ def is_verified_sold_result(res: Dict) -> bool:
 
 def settle_r2_partitions(
     max_files: int = 0,
-    workers: int = 32,
+    workers: int = 10,
     max_items_per_run: int = 0,
     buffer_minutes: int = 5,
     only_unsettled: bool = True,
+    max_cooldowns: int = 12,
+    cooldown_seconds: int = 65,
 ) -> int:
     """
     Scan R2 fact_auctions Parquet partitions newest-first:
@@ -456,12 +549,13 @@ def settle_r2_partitions(
     if max_files > 0:
         keys = keys[:max_files]
 
-    now_utc = pd.Timestamp.utcnow()
+    now_utc = pd.Timestamp.now("UTC")
     cutoff_utc = now_utc - pd.Timedelta(minutes=buffer_minutes)
     settled_cache: Dict[int, Dict] = {}
     bids_emitted_aids = set()
     total_updated = 0
     total_fetched = 0
+    total_resolved = 0
     total_bids_saved = 0
 
     for idx_file, key in enumerate(keys, 1):
@@ -478,17 +572,31 @@ def settle_r2_partitions(
             # Settle rows either never closed OR closed before fact_bids capture existed
             needs_mask = needs_mask & ((~df["is_closed"]) | (~df["bids_captured"]))
 
-        candidate_aids = df.loc[needs_mask, "auction_id"].dropna().astype("int64").unique().tolist()
+        # Prioritize auctions with bids and highest MSRP first so high-value sales always settle before $0 clutter
+        cand_df = df.loc[needs_mask, ["auction_id", "bid_count", "retail_price"]].dropna(subset=["auction_id"]).copy()
+        cand_df["_has_bids"] = cand_df["bid_count"].fillna(0) > 0
+        cand_df = (
+            cand_df.sort_values(by=["_has_bids", "bid_count", "retail_price"], ascending=[False, False, False])
+            .drop_duplicates(subset=["auction_id"], keep="first")
+        )
+        candidate_aids = cand_df["auction_id"].astype("int64").tolist()
         to_fetch = [aid for aid in candidate_aids if aid not in settled_cache]
 
         if max_items_per_run > 0:
-            remaining_budget = max(0, max_items_per_run - total_fetched)
+            remaining_budget = max(0, max_items_per_run - total_resolved)
             to_fetch = to_fetch[:remaining_budget]
 
         if to_fetch:
-            fetched_map = fetch_closed_lots_batch(to_fetch, workers=workers)
+            fetched_map = fetch_closed_lots_batch(
+                to_fetch,
+                workers=workers,
+                chunk_size=150,
+                max_cooldowns=max_cooldowns,
+                cooldown_seconds=cooldown_seconds,
+            )
             settled_cache.update(fetched_map)
             total_fetched += len(to_fetch)
+            total_resolved += len(fetched_map)
 
         changed_in_file = 0
         file_bid_rows: List[Dict] = []
@@ -629,14 +737,14 @@ def settle_r2_partitions(
 
         print(
             f"[settle {idx_file}/{len(keys)}] {key}: candidates={len(candidate_aids)}, "
-            f"fetched_new={len(to_fetch)}, auctions_updated={changed_in_file}, "
+            f"attempted={len(to_fetch)}, auctions_updated={changed_in_file}, "
             f"bids_saved={len(file_bid_rows)} ({time.time() - t0:.1f}s)"
         )
-        if max_items_per_run > 0 and total_fetched >= max_items_per_run:
+        if max_items_per_run > 0 and total_resolved >= max_items_per_run:
             break
 
     print(
-        f"[✓] Settlement sweep complete: fetched={total_fetched:,}, "
+        f"[✓] Settlement sweep complete: attempted={total_fetched:,}, resolved={total_resolved:,}, "
         f"auctions_updated={total_updated:,}, bids_saved={total_bids_saved:,}"
     )
     return total_updated
@@ -645,8 +753,10 @@ def settle_r2_partitions(
 def main():
     parser = argparse.ArgumentParser(description="Verify & settle closed Nellis winning prices and bid histories in R2.")
     parser.add_argument("--max-files", type=int, default=0, help="Max R2 Parquet files to scan newest-first (0 = all).")
-    parser.add_argument("--workers", type=int, default=32, help="Concurrent HTTP workers (default: 32).")
-    parser.add_argument("--max-items", type=int, default=0, help="Max unique auction lookups (0 = unlimited).")
+    parser.add_argument("--workers", type=int, default=10, help="Concurrent HTTP workers (default: 10).")
+    parser.add_argument("--max-items", type=int, default=0, help="Max unique auction lookups resolved (0 = unlimited).")
+    parser.add_argument("--cooldowns", type=int, default=12, help="Max HTTP 429 cooldown cycles per run (default: 12).")
+    parser.add_argument("--cooldown-sec", type=int, default=65, help="Cooldown sleep seconds after HTTP 429 (default: 65).")
     parser.add_argument("--reverify-all", action="store_true", help="Re-check even already settled rows.")
     args = parser.parse_args()
 
@@ -656,6 +766,8 @@ def main():
         max_items_per_run=args.max_items,
         buffer_minutes=5,
         only_unsettled=not args.reverify_all,
+        max_cooldowns=args.cooldowns,
+        cooldown_seconds=args.cooldown_sec,
     )
 
 

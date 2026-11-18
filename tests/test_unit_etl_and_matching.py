@@ -327,6 +327,9 @@ class TestUnitEtlAndMatching(unittest.TestCase):
         sql_where = self.app.build_fuzzy_sql_where("usb-c hub")
         self.assertIn("ILIKE", sql_where)
         self.assertIn("p.title", sql_where)
+        multi_where = self.app.build_fuzzy_sql_where("google pixel")
+        self.assertIn(" AND ", multi_where)
+        self.assertIn("%pix%", multi_where)
 
     # --- 1.4 Verdict, Likely Cheap Guard, Security & NFR Checks (TC-UNIT-017 .. TC-NFR-006) ---
 

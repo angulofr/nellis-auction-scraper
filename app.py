@@ -263,6 +263,15 @@ def get_settled_sales_where_sql(alias: str = "f") -> str:
     return " AND ".join(parts)
 
 
+def get_archive_candidates_where_sql(alias: str = "f") -> str:
+    """SQL predicate covering ALL closed historical lots (settled + unverified pre-close snapshots with initial market_status='active')."""
+    return " AND ".join([
+        f"{alias}.closed_at <= now()",
+        f"COALESCE({alias}.market_status, 'sold') NOT IN ('relisted', 'canceled', 'cancelled', 'void', 'unsold', 'archived_unverified')",
+        f"(COALESCE({alias}.is_closed, FALSE) = FALSE OR (COALESCE({alias}.market_status, 'sold') <> 'active' AND {alias}.final_price > 0 AND {alias}.bid_count > 0))",
+    ])
+
+
 # --- PRODUCT MATCHING & NORMALIZATION ENGINE ($0 COST) ---
 
 def extract_amazon_image_id(photo_url: str) -> str:
@@ -401,7 +410,7 @@ def load_historical_price_index():
     by Amazon Image ID and Normalized Title Signature.
     """
     try:
-        settled_where = get_settled_sales_where_sql("f")
+        cand_where = get_archive_candidates_where_sql("f")
         hist_df = run_duckdb_query(f"""
             SELECT 
                 f.auction_id,
@@ -418,7 +427,7 @@ def load_historical_price_index():
                 f.market_status
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
-            WHERE {settled_where}
+            WHERE {cand_where}
         """)
     except Exception as e:
         print(f"Warning loading historical index: {e}")
@@ -674,7 +683,7 @@ def build_fuzzy_sql_where(query: str) -> str:
             token_clauses.append(
                 f"(p.title ILIKE '%{p3}%' OR p.title ILIKE '%{s3}%' OR f.damage_notes ILIKE '%{p3}%')"
             )
-    return "(" + " OR ".join(token_clauses) + ")"
+    return "(" + " AND ".join(token_clauses) + ")"
 
 
 @st.cache_data(ttl=15)
@@ -872,27 +881,28 @@ def verify_past_matches_live(past_matches: list, max_verify: int = 30, preloaded
     if not past_matches:
         return []
 
+    verified_known = [m for m in past_matches if m.get("is_closed") is True]
+    unverified_pool = sorted(
+        [m for m in past_matches if m.get("is_closed") is not True],
+        key=lambda x: (-int(x.get("bid_count") or 0), -float(x.get("final_price") or 0)),
+    )[:max_verify]
+    candidate_list = verified_known + unverified_pool
+
     if preloaded_map is not None:
         live_map = preloaded_map
     else:
-        to_check = tuple(
-            sorted({
-                int(m["auction_id"])
-                for m in past_matches[:max_verify]
-                if not (m.get("is_closed") is True)
-            })
-        )
+        to_check = tuple(sorted({int(m["auction_id"]) for m in unverified_pool if int(m.get("auction_id") or 0) > 0}))
         live_map = verify_closed_lots_cached(to_check) if to_check else {}
 
     cleaned = []
-    for m in past_matches[:max_verify]:
+    for m in candidate_list:
         aid = int(m.get("auction_id") or 0)
         row = dict(m)
         if row.get("is_closed") is True:
             mkt = str(row.get("market_status") or "sold").lower()
-            if mkt in ("relisted", "canceled", "cancelled", "void", "unsold", "active") or int(row.get("bid_count") or 0) <= 0:
+            if mkt in ("relisted", "canceled", "cancelled", "void", "unsold", "active", "archived_unverified") or int(row.get("bid_count") or 0) <= 0:
                 continue
-            row["_verified_badge"] = "Verified Won" if mkt != "archived_unverified" else "Archived"
+            row["_verified_badge"] = "Verified Won"
             cleaned.append(row)
             continue
 
@@ -911,12 +921,7 @@ def verify_past_matches_live(past_matches: list, max_verify: int = 30, preloaded
             row["market_status"] = res.get("market_status") or "sold"
             row["_verified_badge"] = "Live Verified"
             cleaned.append(row)
-        elif res and res.get("not_found"):
-            row["_verified_badge"] = "Purged / Unverified"
-            cleaned.append(row)
-        else:
-            row["_verified_badge"] = "Unverified"
-            cleaned.append(row)
+        # Do not let unverified pre-close snapshots or purged/rate-limited unknowns skew Min Won / Avg prices
 
     cleaned.sort(key=lambda x: (float(x.get("final_price") or 0), str(x.get("closed_at") or "")))
     return cleaned
@@ -941,12 +946,15 @@ def batch_verify_rows_history(
         aid = int(r.get("auction_id") or 0)
         raw_ms = find_historical_matches(r, hist_index, same_condition_only=same_condition_only)
         raw_by_aid[aid] = raw_ms
-        for m in raw_ms[:max_verify_per_item]:
-            if not (m.get("is_closed") is True):
-                m_id = int(m.get("auction_id") or 0)
-                if m_id > 0 and m_id not in seen_unv:
-                    seen_unv.add(m_id)
-                    unverified_ids.append(m_id)
+        unverified_cand = sorted(
+            [m for m in raw_ms if not (m.get("is_closed") is True)],
+            key=lambda x: (-int(x.get("bid_count") or 0), -float(x.get("final_price") or 0)),
+        )
+        for m in unverified_cand[:max_verify_per_item]:
+            m_id = int(m.get("auction_id") or 0)
+            if m_id > 0 and m_id not in seen_unv:
+                seen_unv.add(m_id)
+                unverified_ids.append(m_id)
 
     live_map = {}
     if unverified_ids:
@@ -1438,10 +1446,18 @@ if view_mode == "🎯 Deal Finder":
     sort_by = st.sidebar.selectbox("↕️ Sort By", sort_options)
 
     predict_cheap_only = False
+    verified_archive_only = False
     min_hist_sales = 2
     min_hist_disc = 85
     max_hist_avg = 25
-    if not is_archive_mode:
+    if is_archive_mode:
+        verified_archive_only = st.sidebar.checkbox(
+            "✅ Settled WON FOR Sales Only",
+            value=False,
+            key="arch_verified_only",
+            help="Unchecked searches ALL closed lots in the Data Lake (visible cards are live-checked automatically).",
+        )
+    else:
         predict_cheap_only = st.sidebar.checkbox(
             "🔮 Likely Cheap Tonight (Historical Steals)",
             value=False,
@@ -1706,16 +1722,19 @@ if view_mode == "🎯 Deal Finder":
     live_df = pd.DataFrame()
 
     if is_archive_mode:
-        # Query Closed / Historical Archive directly from Cloudflare R2 Data Lake
+        # Query Closed / Historical Archive across ALL partitions with total match count
         with st.spinner("Searching historical closed auctions in Data Lake..."):
+            base_arch_where = get_settled_sales_where_sql("f") if verified_archive_only else get_archive_candidates_where_sql("f")
             where_parts = [
-                get_settled_sales_where_sql("f"),
+                base_arch_where,
                 f"f.retail_price >= {min_retail}",
                 f"f.final_price <= {max_bid}",
             ]
             if loc_filter != "All":
                 where_parts.append(f"f.location = '{loc_filter}'")
-            if cond_filter != "All" and cond_filter != "Incomplete / Damaged / Parts":
+            if cond_filter == "Incomplete / Damaged / Parts":
+                where_parts.append("(f.condition ILIKE '%Damaged%' OR f.condition ILIKE '%Incomplete%' OR f.condition ILIKE '%Parts%')")
+            elif cond_filter != "All":
                 where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
             if search_kw.strip():
                 fuzzy_sql = build_fuzzy_sql_where(search_kw)
@@ -1747,6 +1766,9 @@ if view_mode == "🎯 Deal Finder":
                     f.damage_notes,
                     f.closed_at,
                     f.photo_url,
+                    f.is_closed,
+                    f.market_status,
+                    COUNT(*) OVER () AS _sql_total_count,
                     CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms,
                     -1.0 AS diff_sec
                 FROM fact_auctions f
@@ -2044,7 +2066,18 @@ if view_mode == "🎯 Deal Finder":
 
     mode_noun = "closed historical lots" if is_archive_mode else "active lots"
     if total_results > 0:
-        st.write(f"**Found {total_results:,} {mode_noun}** (showing {start_idx + 1}–{end_idx}):")
+        sql_total_avail = 0
+        if is_archive_mode and "_sql_total_count" in filtered_all.columns:
+            try:
+                sql_total_avail = int(filtered_all["_sql_total_count"].max() or 0)
+            except Exception:
+                sql_total_avail = 0
+        if is_archive_mode and sql_total_avail > total_results and total_results >= 2000:
+            st.write(f"**Found {sql_total_avail:,} {mode_noun}** (showing {start_idx + 1}–{end_idx} of top 2,000):")
+        elif is_archive_mode and sql_total_avail > total_results:
+            st.write(f"**Found {total_results:,} matching {mode_noun}** (from newest 2,000 of {sql_total_avail:,}; showing {start_idx + 1}–{end_idx}):")
+        else:
+            st.write(f"**Found {total_results:,} {mode_noun}** (showing {start_idx + 1}–{end_idx}):")
         if total_pages > 1:
             render_pagination_bar("top")
     else:
@@ -2054,6 +2087,36 @@ if view_mode == "🎯 Deal Finder":
         st.info("No items match your filter criteria right now. Adjust the filters in the left sidebar to widen your search.")
     else:
         records = results_df.to_dict("records")
+        if is_archive_mode:
+            # Live-verify only unverified archive rows currently visible on this page (<= 40 items)
+            unv_page_ids = tuple(sorted({
+                int(r["auction_id"])
+                for r in records
+                if not (r.get("is_closed") is True) and int(r.get("auction_id") or 0) > 0
+            }))
+            page_live_map = verify_closed_lots_cached(unv_page_ids) if unv_page_ids else {}
+            for r in records:
+                if r.get("is_closed") is True:
+                    r["_arch_status_badge"] = "✅ Verified Won"
+                    continue
+                res_l = page_live_map.get(int(r.get("auction_id") or 0))
+                if res_l and not res_l.get("not_found") and res_l.get("is_closed"):
+                    r["final_price"] = float(res_l.get("final_price") or r.get("final_price") or 0)
+                    r["bid_count"] = int(res_l.get("bid_count") or r.get("bid_count") or 0)
+                    msrp_r = float(r.get("retail_price") or res_l.get("retail_price") or 0)
+                    if msrp_r > 0:
+                        r["discount_pct"] = round((1.0 - r["final_price"] / msrp_r) * 100.0, 1)
+                    mkt_l = str(res_l.get("market_status") or "sold").lower()
+                    r["_arch_status_badge"] = (
+                        "✅ Live Verified Won"
+                        if is_verified_sold_result(res_l)
+                        else f"⚠️ {mkt_l.title()} (0 bids)"
+                    )
+                elif res_l and res_l.get("not_found"):
+                    r["_arch_status_badge"] = "🗄️ Purged / Archived"
+                else:
+                    r["_arch_status_badge"] = "📸 Pre-Close Snapshot"
+
         verified_page_hist = batch_verify_rows_history(records, hist_index, same_condition_only=True)
         for row_start in range(0, len(records), 4):
             grid_cols = st.columns(4)
@@ -2136,7 +2199,11 @@ if view_mode == "🎯 Deal Finder":
                         bid_label = "WINNING PRICE" if is_archive_mode else "CURRENT PRICE"
                         disc_pct_val = float(row_dict.get('discount_pct') or 0)
                         if is_archive_mode:
-                            time_cell_html = f'<div style="font-size:12px; font-weight:700; color:#cbd5e1;">🏁 {str(row_dict.get("closed_at"))[:16]}</div>'
+                            arch_badge = row_dict.get("_arch_status_badge") or "✅ Verified Won"
+                            time_cell_html = (
+                                f'<div style="font-size:11.5px; font-weight:700; color:#cbd5e1;">🏁 {str(row_dict.get("closed_at"))[:16]}</div>'
+                                f'<div style="font-size:10px; font-weight:700; color:#93c5fd; margin-top:2px;">{arch_badge}</div>'
+                            )
                         else:
                             close_epoch_ms = int(row_dict.get('close_ms') or 0)
                             time_cell_html = (
@@ -2460,7 +2527,8 @@ elif view_mode == "🏆 Best Past Deals":
             f.bid_count,
             f.damage_notes,
             f.closed_at,
-            f.photo_url
+            f.photo_url,
+            COUNT(*) OVER () AS _sql_total_count
         FROM fact_auctions f
         JOIN dim_products p ON f.product_id = p.product_id
         WHERE {where_sql}
@@ -2526,13 +2594,20 @@ elif view_mode == "🏆 Best Past Deals":
         avg_bids = float(pd_df["bid_count"].mean())
         max_savings = float(pd_df["dollar_savings"].max())
 
+        sql_total_pd = int(pd_df["_sql_total_count"].max() or 0) if "_sql_total_count" in pd_df.columns else len(pd_df)
+        lot_count_sub = (
+            f"of {sql_total_pd:,} in lake · Avg {avg_bids:.1f} bids"
+            if sql_total_pd > len(pd_df)
+            else f"Avg {avg_bids:.1f} bids"
+        )
+
         st.markdown(
             f"""
             <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(145px, 1fr)); gap:8px; margin-bottom:10px;">
                 <div class="nellis-stat-box">
                     <div class="nellis-stat-label">Matching Lots</div>
                     <div class="nellis-stat-val">{len(pd_df):,}</div>
-                    <div style="font-size:11px; color:#475569; font-weight:600;">Avg {avg_bids:.1f} bids</div>
+                    <div style="font-size:11px; color:#475569; font-weight:600;">{lot_count_sub}</div>
                 </div>
                 <div class="nellis-stat-box">
                     <div class="nellis-stat-label">Median Win</div>

@@ -214,6 +214,24 @@ def seed_local_data_lake(lake_dir: str) -> Dict:
             "isClosed": False,
             "marketStatus": "active",
         },
+        # Lot 1006: Closed unverified snapshot (isClosed=False, closed in past) for testing full-lake Archive search ("pixel")
+        {
+            "id": 1006,
+            "title": "Google Pixel 9 Pro Unlocked Case Bundle",
+            "retailPrice": 89.99,
+            "currentPrice": 9.0,
+            "bidCount": 3,
+            "bidderCount": 2,
+            "openTime": yest_close_ms - 86_400_000,
+            "initialCloseTime": yest_close_ms - 300_000,
+            "closeTime": yest_close_ms - 300_000,
+            "condition": "Brand New",
+            "grade": {"conditionType": {"description": "New"}, "damageType": {"description": "None"}, "missingPartsType": {"description": "No"}, "functionalType": {"description": "Yes"}, "rating": 5},
+            "locationName": "Phoenix",
+            "photos": [{"url": "https://m.media-amazon.com/images/I/71PIXELTEST._AC_SL1500_.jpg"}],
+            "isClosed": False,
+            "marketStatus": "active",
+        },
     ]
 
     os.chdir(parent_dir)

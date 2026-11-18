@@ -253,9 +253,10 @@ class TestR2LoaderAndQueries(unittest.TestCase):
         )
 
         class _MockResp:
-            def __init__(self, status_code, body=None):
+            def __init__(self, status_code, body=None, headers=None):
                 self.status_code = status_code
                 self._body = body
+                self.headers = headers or {}
 
             def raise_for_status(self):
                 if self.status_code >= 400:
@@ -277,6 +278,39 @@ class TestR2LoaderAndQueries(unittest.TestCase):
         res_404 = settlement.fetch_closed_lot_result(55503, session=sess)
         self.assertEqual(res_404["market_status"], "archived_unverified")
         self.assertFalse(settlement.is_verified_sold_result(res_404))
+
+        # HTTP 202 Remix SingleFetchRedirect returns archived_unverified
+        redirect_202 = [["SingleFetchRedirect", 1], {"_2": 3}, "redirect", "/search"]
+        sess.get.side_effect = [_MockResp(202, redirect_202)]
+        res_202 = settlement.fetch_closed_lot_result(55504, session=sess)
+        self.assertTrue(res_202["not_found"])
+        self.assertEqual(res_202["market_status"], "archived_unverified")
+
+        # HTTP 429 returns _rate_limited sentinel; fetch_closed_lots_batch cools down & retries cleanly
+        sess.get.side_effect = [_MockResp(429, headers={"Retry-After": "0"})]
+        res_429 = settlement.fetch_closed_lot_result(55505, session=sess)
+        self.assertTrue(res_429.get("_rate_limited"))
+
+        batch_calls = {55505: 0}
+
+        def _batch_side_effect(aid, session=None, timeout=10):
+            batch_calls[aid] += 1
+            if batch_calls[aid] == 1:
+                return {"auction_id": aid, "_rate_limited": True, "retry_after": 0}
+            return {
+                "auction_id": aid,
+                "is_closed": True,
+                "market_status": "sold",
+                "final_price": 19.0,
+                "retail_price": 80.0,
+                "bid_count": 3,
+                "not_found": False,
+            }
+
+        with mock.patch.object(settlement, "fetch_closed_lot_result", side_effect=_batch_side_effect):
+            cooled_res = settlement.fetch_closed_lots_batch([55505], workers=2, chunk_size=10, max_cooldowns=1, cooldown_seconds=0)
+        self.assertIn(55505, cooled_res)
+        self.assertEqual(cooled_res[55505]["final_price"], 19.0)
 
         # Relisted returns False on is_verified_sold_result
         sess.get.side_effect = [_MockResp(200, relisted_payload)]
@@ -507,6 +541,17 @@ class TestR2LoaderAndQueries(unittest.TestCase):
                         "photo_url": img,
                         "cond_tier": "New",
                     },
+                    {
+                        "auction_id": 804,
+                        "title": "Test Blender",
+                        "retail_price": 100.0,
+                        "final_price": 1.0,
+                        "is_closed": False,
+                        "bid_count": 1,
+                        "closed_at": "2026-11-15",
+                        "photo_url": img,
+                        "cond_tier": "New",
+                    },
                 ]
             },
             "by_sig": {},
@@ -514,6 +559,7 @@ class TestR2LoaderAndQueries(unittest.TestCase):
         live_map = {
             801: {"auction_id": 801, "is_closed": True, "market_status": "relisted", "final_price": 0.0, "bid_count": 0},
             802: {"auction_id": 802, "is_closed": True, "market_status": "sold", "final_price": 14.0, "bid_count": 5},
+            804: {"auction_id": 804, "is_closed": True, "market_status": "archived_unverified", "not_found": True},
         }
         rows = [{"auction_id": 999, "title": "Test Blender", "retail_price": 100.0, "photo_url": img, "condition": "Brand New"}]
         with mock.patch.object(self.app, "verify_closed_lots_cached", return_value=live_map):

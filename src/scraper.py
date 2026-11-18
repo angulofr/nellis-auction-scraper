@@ -233,10 +233,12 @@ def main():
         print(f"\n[*] Settling closed auctions across newest {args.settle_recent} R2 partitions...")
         settle_r2_partitions(
             max_files=args.settle_recent,
-            workers=32,
-            max_items_per_run=18000,
+            workers=10,
+            max_items_per_run=4000,
             buffer_minutes=5,
             only_unsettled=True,
+            max_cooldowns=6,
+            cooldown_seconds=65,
         )
 
     print("\n" + "=" * 70)

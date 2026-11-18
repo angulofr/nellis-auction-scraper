@@ -10,7 +10,11 @@ on:
       workers:
         description: 'Concurrent HTTP workers'
         required: false
-        default: '36'
+        default: '10'
+      cooldowns:
+        description: 'Max HTTP 429 cooldown cycles per run'
+        required: false
+        default: '45'
       reverify_all:
         description: 'Re-verify even already settled rows (true/false)'
         required: false
@@ -48,5 +52,6 @@ jobs:
           fi
           python -m src.settlement \
             --max-files "${{ github.event.inputs.max_files || '0' }}" \
-            --workers "${{ github.event.inputs.workers || '36' }}" \
+            --workers "${{ github.event.inputs.workers || '10' }}" \
+            --cooldowns "${{ github.event.inputs.cooldowns || '45' }}" \
             $REVERIFY_ARG

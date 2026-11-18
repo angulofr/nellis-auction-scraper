@@ -95,7 +95,7 @@ class TestStreamlitUI(unittest.TestCase):
             self.assertNotIn("$28.00", filtered_md)
 
     def test_deal_finder_archive_mode(self):
-        """TC-E2E-003 (CR-06): Archive Mode queries settled history and renders WINNING PRICE."""
+        """TC-E2E-003 (CR-06): Archive Mode queries full lake, searches unverified closed lots ('pixel'), and filters settled."""
         seed_local_data_lake(self.lake_dir)
         now_ms = int(time.time() * 1000)
         self.srv, _ = start_mock_nellis_server(now_ms)
@@ -108,6 +108,18 @@ class TestStreamlitUI(unittest.TestCase):
             md_text = "\n".join(m.value for m in at.markdown)
             self.assertIn("WINNING PRICE", md_text)
             self.assertIn("DeWalt 20V MAX Brushless Drill Kit", md_text)
+
+            # Search 'pixel' -> must find unverified historical Lot 1006 across the full lake
+            at.sidebar.text_input[0].set_value("pixel").run()
+            self.assertEqual(len(at.exception), 0)
+            pixel_md = "\n".join(m.value for m in at.markdown)
+            self.assertIn("Google Pixel 9 Pro Unlocked Case Bundle", pixel_md)
+
+            # Restrict to Settled WON FOR Sales Only -> excludes Lot 1006 (is_closed=False in lake)
+            at.sidebar.checkbox(key="arch_verified_only").set_value(True).run()
+            self.assertEqual(len(at.exception), 0)
+            settled_only_md = "\n".join(m.value for m in at.markdown)
+            self.assertNotIn("Google Pixel 9 Pro Unlocked Case Bundle", settled_only_md)
 
     def test_best_past_deals_tab_and_sleeper_filter(self):
         """TC-E2E-004 (CR-05): Best Past Deals sleeper & discount filters work accurately."""
