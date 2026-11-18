@@ -4,6 +4,8 @@ Nellis Auction Data Lake & Deal Finder App
 Cloud-ready Streamlit application queryable from phone, tablet, or desktop.
 """
 
+from __future__ import annotations
+
 import ast
 import datetime as _dt
 import difflib
@@ -1793,7 +1795,7 @@ def _render_auction_card_grid(
                         tags.append("damaged")
                     tags_html = "".join(f'<span class="{tag_cls}">{t}</span>' for t in tags[:3])
                     if is_archive_mode:
-                        tags_html += f' <span class="nellis-tag-pill">📍 {row_dict["location"]}</span>'
+                        tags_html += f' <span class="nellis-tag-pill">📍 {row_dict.get("location") or "Unknown"}</span>'
 
                     st.markdown(
                         f'<div class="nellis-cond-row"><div class="nellis-stars">{stars_html}</div>{tags_html}</div>',
@@ -2097,8 +2099,8 @@ def render_top_nav() -> str:
     return chosen
 
 
-def _render_live_field_group(prefix: str, include_search: bool = False):
-    """Render compact 2-column Live Deals filter controls for either sidebar (`sb`) or popover (`top`)."""
+def _render_live_field_group(prefix: str, include_search: bool = False, two_col: bool = True):
+    """Render compact Live Deals filter controls cleanly without nested columns."""
     if include_search:
         st.text_input(
             "Search",
@@ -2107,65 +2109,30 @@ def _render_live_field_group(prefix: str, include_search: bool = False):
             on_change=_sync_widget,
             args=(f"{prefix}_live_kw", "live_kw"),
         )
-    c1, c2 = st.columns(2)
-    with c1:
-        st.selectbox(
-            "Time Left",
-            LIVE_TIME_OPTIONS,
-            key=f"{prefix}_live_time",
-            on_change=_sync_widget,
-            args=(f"{prefix}_live_time", "live_time"),
-        )
-    with c2:
-        st.selectbox(
-            "Warehouse",
-            WAREHOUSE_OPTIONS,
-            key=f"{prefix}_live_wh",
-            on_change=_sync_widget,
-            args=(f"{prefix}_live_wh", "live_wh"),
-        )
-    st.selectbox(
-        "Sort By",
-        LIVE_SORT_OPTIONS,
-        key=f"{prefix}_live_sort",
-        on_change=_sync_widget,
-        args=(f"{prefix}_live_sort", "live_sort"),
-    )
-    st.selectbox(
-        "Condition",
-        COND_OPTIONS,
-        key=f"{prefix}_live_cond",
-        on_change=_sync_widget,
-        args=(f"{prefix}_live_cond", "live_cond"),
-    )
-    p1, p2 = st.columns(2)
-    with p1:
-        st.number_input(
-            "Min MSRP ($)",
-            min_value=0,
-            max_value=50000,
-            step=10,
-            key=f"{prefix}_live_min_retail",
-            on_change=_sync_widget,
-            args=(f"{prefix}_live_min_retail", "live_min_retail"),
-        )
-    with p2:
-        st.number_input(
-            "Max Bid ($)",
-            min_value=1,
-            max_value=50000,
-            step=25,
-            key=f"{prefix}_live_max_bid",
-            on_change=_sync_widget,
-            args=(f"{prefix}_live_max_bid", "live_max_bid"),
-        )
-    st.selectbox(
-        "Category",
-        PRIMARY_CATEGORIES,
-        key=f"{prefix}_live_cat",
-        on_change=_sync_widget,
-        args=(f"{prefix}_live_cat", "live_cat"),
-    )
+    if two_col:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.selectbox("Time Left", LIVE_TIME_OPTIONS, key=f"{prefix}_live_time", on_change=_sync_widget, args=(f"{prefix}_live_time", "live_time"))
+        with c2:
+            st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_live_wh", on_change=_sync_widget, args=(f"{prefix}_live_wh", "live_wh"))
+    else:
+        st.selectbox("Time Left", LIVE_TIME_OPTIONS, key=f"{prefix}_live_time", on_change=_sync_widget, args=(f"{prefix}_live_time", "live_time"))
+        st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_live_wh", on_change=_sync_widget, args=(f"{prefix}_live_wh", "live_wh"))
+
+    st.selectbox("Sort By", LIVE_SORT_OPTIONS, key=f"{prefix}_live_sort", on_change=_sync_widget, args=(f"{prefix}_live_sort", "live_sort"))
+    st.selectbox("Condition", COND_OPTIONS, key=f"{prefix}_live_cond", on_change=_sync_widget, args=(f"{prefix}_live_cond", "live_cond"))
+
+    if two_col:
+        p1, p2 = st.columns(2)
+        with p1:
+            st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_live_min_retail", on_change=_sync_widget, args=(f"{prefix}_live_min_retail", "live_min_retail"))
+        with p2:
+            st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_live_max_bid", on_change=_sync_widget, args=(f"{prefix}_live_max_bid", "live_max_bid"))
+    else:
+        st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_live_min_retail", on_change=_sync_widget, args=(f"{prefix}_live_min_retail", "live_min_retail"))
+        st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_live_max_bid", on_change=_sync_widget, args=(f"{prefix}_live_max_bid", "live_max_bid"))
+
+    st.selectbox("Category", PRIMARY_CATEGORIES, key=f"{prefix}_live_cat", on_change=_sync_widget, args=(f"{prefix}_live_cat", "live_cat"))
     st.checkbox(
         "🔮 Likely Cheap Tonight",
         key=f"{prefix}_live_predict_cheap",
@@ -2174,46 +2141,10 @@ def _render_live_field_group(prefix: str, include_search: bool = False):
         args=(f"{prefix}_live_predict_cheap", "live_predict_cheap"),
     )
     with st.expander("⚙️ Steal Rules & Page Size", expanded=bool(st.session_state.get("live_predict_cheap"))):
-        r1, r2 = st.columns(2)
-        with r1:
-            st.number_input(
-                "Min Past Sales",
-                min_value=1,
-                max_value=50,
-                step=1,
-                key=f"{prefix}_live_min_sales",
-                on_change=_sync_widget,
-                args=(f"{prefix}_live_min_sales", "live_min_sales"),
-            )
-        with r2:
-            st.number_input(
-                "Min Avg % Off",
-                min_value=50,
-                max_value=99,
-                step=5,
-                key=f"{prefix}_live_min_disc",
-                on_change=_sync_widget,
-                args=(f"{prefix}_live_min_disc", "live_min_disc"),
-            )
-        r3, r4 = st.columns(2)
-        with r3:
-            st.number_input(
-                "Max Hist Avg ($)",
-                min_value=1,
-                max_value=5000,
-                step=5,
-                key=f"{prefix}_live_max_hist_avg",
-                on_change=_sync_widget,
-                args=(f"{prefix}_live_max_hist_avg", "live_max_hist_avg"),
-            )
-        with r4:
-            st.selectbox(
-                "Items / Page",
-                [40, 60, 100],
-                key=f"{prefix}_live_page_size",
-                on_change=_sync_widget,
-                args=(f"{prefix}_live_page_size", "live_page_size"),
-            )
+        st.number_input("Min Past Sales", min_value=1, max_value=50, step=1, key=f"{prefix}_live_min_sales", on_change=_sync_widget, args=(f"{prefix}_live_min_sales", "live_min_sales"))
+        st.number_input("Min Avg % Off", min_value=50, max_value=99, step=5, key=f"{prefix}_live_min_disc", on_change=_sync_widget, args=(f"{prefix}_live_min_disc", "live_min_disc"))
+        st.number_input("Max Hist Avg ($)", min_value=1, max_value=5000, step=5, key=f"{prefix}_live_max_hist_avg", on_change=_sync_widget, args=(f"{prefix}_live_max_hist_avg", "live_max_hist_avg"))
+        st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_live_page_size", on_change=_sync_widget, args=(f"{prefix}_live_page_size", "live_page_size"))
 
 
 def _render_inline_search_and_popover(
@@ -2228,9 +2159,9 @@ def _render_inline_search_and_popover(
     defaults: dict,
     is_dirty: bool,
 ):
-    """Render inline Search + Filters popover + Reset button cleanly across Streamlit 1.34..1.67+."""
-    row_s, row_actions = _st_columns([3.0, 1.8], vertical_alignment="center")
-    with row_s:
+    """Render flat 1-level inline Search + Filters popover + Reset bar (safe across all Streamlit >=1.30 versions)."""
+    col_s, col_pop, col_rst = _st_columns([3.0, 1.25, 0.75], vertical_alignment="center")
+    with col_s:
         st.text_input(
             search_label,
             placeholder=placeholder,
@@ -2241,48 +2172,26 @@ def _render_inline_search_and_popover(
         )
     pop_label = f"🎛️ Filters ({badge_count})" if badge_count else "🎛️ Filters"
     btn_stretch = _stretch_kwargs(st.button)
-    with row_actions:
-        if _supports_kw(st.container, "horizontal"):
-            with st.container(horizontal=True, gap="small"):
-                with _open_popover_or_expander(pop_label):
-                    render_fields_fn("top", include_search=False)
-                    st.button(
-                        "↺ Reset Filters",
-                        key=pop_reset_key,
-                        on_click=_reset_filter_group,
-                        args=(defaults,),
-                        disabled=not is_dirty,
-                        **btn_stretch,
-                    )
-                st.button(
-                    "↺ Reset",
-                    key=top_reset_key,
-                    on_click=_reset_filter_group,
-                    args=(defaults,),
-                    disabled=not is_dirty,
-                )
-        else:
-            p_col, r_col = st.columns([1.6, 1])
-            with p_col:
-                with _open_popover_or_expander(pop_label):
-                    render_fields_fn("top", include_search=False)
-                    st.button(
-                        "↺ Reset Filters",
-                        key=pop_reset_key,
-                        on_click=_reset_filter_group,
-                        args=(defaults,),
-                        disabled=not is_dirty,
-                        **btn_stretch,
-                    )
-            with r_col:
-                st.button(
-                    "↺ Reset",
-                    key=top_reset_key,
-                    on_click=_reset_filter_group,
-                    args=(defaults,),
-                    disabled=not is_dirty,
-                    **btn_stretch,
-                )
+    with col_pop:
+        with _open_popover_or_expander(pop_label):
+            render_fields_fn("top", include_search=False, two_col=False)
+            st.button(
+                "↺ Reset Filters",
+                key=pop_reset_key,
+                on_click=_reset_filter_group,
+                args=(defaults,),
+                disabled=not is_dirty,
+                **btn_stretch,
+            )
+    with col_rst:
+        st.button(
+            "↺ Reset",
+            key=top_reset_key,
+            on_click=_reset_filter_group,
+            args=(defaults,),
+            disabled=not is_dirty,
+            **btn_stretch,
+        )
 
 
 def render_live_filter_controls() -> dict:
@@ -2372,8 +2281,8 @@ def render_live_filter_controls() -> dict:
     }
 
 
-def _render_arch_field_group(prefix: str, include_search: bool = False):
-    """Render compact 2-column Past Archive filter controls for sidebar (`sb`) or popover (`top`)."""
+def _render_arch_field_group(prefix: str, include_search: bool = False, two_col: bool = True):
+    """Render compact Past Archive filter controls cleanly without nested columns."""
     if include_search:
         st.text_input(
             "Search",
@@ -2382,100 +2291,52 @@ def _render_arch_field_group(prefix: str, include_search: bool = False):
             on_change=_sync_widget,
             args=(f"{prefix}_arch_kw", "arch_kw"),
         )
-    c1, c2 = st.columns(2)
-    with c1:
-        st.selectbox(
-            "Date Window",
-            ARCH_DATE_OPTIONS,
-            key=f"{prefix}_arch_date_preset",
-            on_change=_sync_widget,
-            args=(f"{prefix}_arch_date_preset", "arch_date_preset"),
-        )
-    with c2:
-        st.selectbox(
-            "Warehouse",
-            WAREHOUSE_OPTIONS,
-            key=f"{prefix}_arch_wh",
-            on_change=_sync_widget,
-            args=(f"{prefix}_arch_wh", "arch_wh"),
-        )
+    if two_col:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.selectbox("Date Window", ARCH_DATE_OPTIONS, key=f"{prefix}_arch_date_preset", on_change=_sync_widget, args=(f"{prefix}_arch_date_preset", "arch_date_preset"))
+        with c2:
+            st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_arch_wh", on_change=_sync_widget, args=(f"{prefix}_arch_wh", "arch_wh"))
+    else:
+        st.selectbox("Date Window", ARCH_DATE_OPTIONS, key=f"{prefix}_arch_date_preset", on_change=_sync_widget, args=(f"{prefix}_arch_date_preset", "arch_date_preset"))
+        st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_arch_wh", on_change=_sync_widget, args=(f"{prefix}_arch_wh", "arch_wh"))
+
     if st.session_state.get("arch_date_preset") == "Custom Range":
-        d1, d2 = st.columns(2)
-        with d1:
-            st.date_input(
-                "From",
-                key=f"{prefix}_arch_start",
-                on_change=_sync_widget,
-                args=(f"{prefix}_arch_start", "arch_start"),
-            )
-        with d2:
-            st.date_input(
-                "To",
-                key=f"{prefix}_arch_end",
-                on_change=_sync_widget,
-                args=(f"{prefix}_arch_end", "arch_end"),
-            )
-    st.selectbox(
-        "Sort By",
-        ARCH_SORT_OPTIONS,
-        key=f"{prefix}_arch_sort",
-        on_change=_sync_widget,
-        args=(f"{prefix}_arch_sort", "arch_sort"),
-    )
-    st.selectbox(
-        "Condition",
-        COND_OPTIONS,
-        key=f"{prefix}_arch_cond",
-        on_change=_sync_widget,
-        args=(f"{prefix}_arch_cond", "arch_cond"),
-    )
-    p1, p2 = st.columns(2)
-    with p1:
-        st.number_input(
-            "Min MSRP ($)",
-            min_value=0,
-            max_value=50000,
-            step=10,
-            key=f"{prefix}_arch_min_retail",
-            on_change=_sync_widget,
-            args=(f"{prefix}_arch_min_retail", "arch_min_retail"),
-        )
-    with p2:
-        st.number_input(
-            "Max Bid ($)",
-            min_value=1,
-            max_value=50000,
-            step=25,
-            key=f"{prefix}_arch_max_bid",
-            on_change=_sync_widget,
-            args=(f"{prefix}_arch_max_bid", "arch_max_bid"),
-        )
-    st.selectbox(
-        "Category",
-        PRIMARY_CATEGORIES,
-        key=f"{prefix}_arch_cat",
-        on_change=_sync_widget,
-        args=(f"{prefix}_arch_cat", "arch_cat"),
-    )
-    b1, b2 = st.columns(2)
-    with b1:
-        st.number_input(
-            "Min % Off",
-            min_value=0,
-            max_value=99,
-            step=5,
-            key=f"{prefix}_arch_min_disc",
-            on_change=_sync_widget,
-            args=(f"{prefix}_arch_min_disc", "arch_min_disc"),
-        )
-    with b2:
-        st.selectbox(
-            "Items / Page",
-            [40, 60, 100],
-            key=f"{prefix}_arch_page_size",
-            on_change=_sync_widget,
-            args=(f"{prefix}_arch_page_size", "arch_page_size"),
-        )
+        if two_col:
+            d1, d2 = st.columns(2)
+            with d1:
+                st.date_input("From", key=f"{prefix}_arch_start", on_change=_sync_widget, args=(f"{prefix}_arch_start", "arch_start"))
+            with d2:
+                st.date_input("To", key=f"{prefix}_arch_end", on_change=_sync_widget, args=(f"{prefix}_arch_end", "arch_end"))
+        else:
+            st.date_input("From", key=f"{prefix}_arch_start", on_change=_sync_widget, args=(f"{prefix}_arch_start", "arch_start"))
+            st.date_input("To", key=f"{prefix}_arch_end", on_change=_sync_widget, args=(f"{prefix}_arch_end", "arch_end"))
+
+    st.selectbox("Sort By", ARCH_SORT_OPTIONS, key=f"{prefix}_arch_sort", on_change=_sync_widget, args=(f"{prefix}_arch_sort", "arch_sort"))
+    st.selectbox("Condition", COND_OPTIONS, key=f"{prefix}_arch_cond", on_change=_sync_widget, args=(f"{prefix}_arch_cond", "arch_cond"))
+
+    if two_col:
+        p1, p2 = st.columns(2)
+        with p1:
+            st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_arch_min_retail", on_change=_sync_widget, args=(f"{prefix}_arch_min_retail", "arch_min_retail"))
+        with p2:
+            st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_arch_max_bid", on_change=_sync_widget, args=(f"{prefix}_arch_max_bid", "arch_max_bid"))
+    else:
+        st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_arch_min_retail", on_change=_sync_widget, args=(f"{prefix}_arch_min_retail", "arch_min_retail"))
+        st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_arch_max_bid", on_change=_sync_widget, args=(f"{prefix}_arch_max_bid", "arch_max_bid"))
+
+    st.selectbox("Category", PRIMARY_CATEGORIES, key=f"{prefix}_arch_cat", on_change=_sync_widget, args=(f"{prefix}_arch_cat", "arch_cat"))
+
+    if two_col:
+        b1, b2 = st.columns(2)
+        with b1:
+            st.number_input("Min % Off", min_value=0, max_value=99, step=5, key=f"{prefix}_arch_min_disc", on_change=_sync_widget, args=(f"{prefix}_arch_min_disc", "arch_min_disc"))
+        with b2:
+            st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_arch_page_size", on_change=_sync_widget, args=(f"{prefix}_arch_page_size", "arch_page_size"))
+    else:
+        st.number_input("Min % Off", min_value=0, max_value=99, step=5, key=f"{prefix}_arch_min_disc", on_change=_sync_widget, args=(f"{prefix}_arch_min_disc", "arch_min_disc"))
+        st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_arch_page_size", on_change=_sync_widget, args=(f"{prefix}_arch_page_size", "arch_page_size"))
+
     st.checkbox(
         "✅ Settled WON FOR Sales Only",
         key=f"{prefix}_arch_settled_only",
