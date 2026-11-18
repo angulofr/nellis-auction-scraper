@@ -7,6 +7,7 @@ Cloud-ready Streamlit application queryable from phone, tablet, or desktop.
 import ast
 import datetime as _dt
 import difflib
+import inspect as _inspect
 import json
 import math
 import os
@@ -1485,6 +1486,69 @@ def inject_nellis_card_css():
     )
 
 
+def _safe_int(val, default: int = 0) -> int:
+    try:
+        if val is None or (isinstance(val, float) and math.isnan(val)):
+            return default
+        return int(float(val))
+    except Exception:
+        return default
+
+
+def _safe_float(val, default: float = 0.0) -> float:
+    try:
+        if val is None:
+            return default
+        f = float(val)
+        return default if math.isnan(f) else f
+    except Exception:
+        return default
+
+
+def _supports_kw(fn, kw: str) -> bool:
+    try:
+        return kw in _inspect.signature(fn).parameters
+    except Exception:
+        return False
+
+
+def _stretch_kwargs(fn) -> dict:
+    return {"width": "stretch"} if _supports_kw(fn, "width") else {"use_container_width": True}
+
+
+def _st_columns(spec, vertical_alignment: str = "top"):
+    if vertical_alignment != "top" and _supports_kw(st.columns, "vertical_alignment"):
+        return st.columns(spec, vertical_alignment=vertical_alignment)
+    return st.columns(spec)
+
+
+def _open_popover_or_expander(label: str):
+    if hasattr(st, "popover"):
+        return st.popover(label, **_stretch_kwargs(st.popover))
+    return st.expander(label, expanded=False)
+
+
+def _render_quick_pills(label: str, options: list[str], key: str, on_change):
+    if hasattr(st, "pills") and _supports_kw(st.pills, "selection_mode"):
+        st.pills(
+            label,
+            options,
+            selection_mode="multi",
+            label_visibility="collapsed",
+            key=key,
+            on_change=on_change,
+        )
+    else:
+        st.multiselect(
+            label,
+            options,
+            label_visibility="collapsed",
+            placeholder="⚡ Quick filters...",
+            key=key,
+            on_change=on_change,
+        )
+
+
 def render_pagination_bar(
     key_prefix: str,
     page_state_key: str,
@@ -1500,7 +1564,7 @@ def render_pagination_bar(
         return
     p_col1, p_col2, p_col3 = st.columns([1.5, 3, 1.5])
     with p_col1:
-        if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(current_page <= 1), width="stretch"):
+        if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(current_page <= 1), **_stretch_kwargs(st.button)):
             st.session_state[page_state_key] = current_page - 1
             st.session_state["_scroll_to_top"] = True
             st.rerun()
@@ -1512,7 +1576,7 @@ def render_pagination_bar(
             unsafe_allow_html=True,
         )
     with p_col3:
-        if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(current_page >= total_pages), width="stretch"):
+        if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(current_page >= total_pages), **_stretch_kwargs(st.button)):
             st.session_state[page_state_key] = current_page + 1
             st.session_state["_scroll_to_top"] = True
             st.rerun()
@@ -1616,12 +1680,12 @@ def _render_auction_card_grid(
     for row_start in range(0, len(records), 4):
         grid_cols = st.columns(4)
         for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
-            auction_id = int(row_dict["auction_id"])
+            auction_id = _safe_int(row_dict.get("auction_id"))
             item_url = f"https://www.nellisauction.com/p/item/{auction_id}"
-            cur_bid = float(row_dict.get("final_price") or 0)
-            msrp = float(row_dict.get("retail_price") or 0)
-            disc_pct_val = float(row_dict.get("discount_pct") or 0)
-            savings_val = float(row_dict.get("dollar_savings") or max(0.0, msrp - cur_bid))
+            cur_bid = _safe_float(row_dict.get("final_price"))
+            msrp = _safe_float(row_dict.get("retail_price"))
+            disc_pct_val = _safe_float(row_dict.get("discount_pct"))
+            savings_val = _safe_float(row_dict.get("dollar_savings"), max(0.0, msrp - cur_bid))
             cond_display = format_clean_condition(row_dict.get("condition"))
             cond_tier = get_condition_tier(cond_display)
             cat_primary = row_dict.get("category_primary") or "Home & General"
@@ -1630,13 +1694,13 @@ def _render_auction_card_grid(
             past_matches = verified_page_hist.get(auction_id, [])
             open_matches = [
                 c for c in find_open_radar_matches(row_dict, open_radar_index)
-                if int(c.get("auction_id") or 0) != auction_id
+                if _safe_int(c.get("auction_id")) != auction_id
             ]
             cheaper_in_batch = []
             if not is_archive_mode and open_matches:
                 cheaper_in_batch = [
                     c for c in open_matches
-                    if float(c.get("final_price") or 0) < cur_bid
+                    if _safe_float(c.get("final_price")) < cur_bid
                     and get_condition_tier(c.get("condition")) == cond_tier
                 ]
 
@@ -1666,7 +1730,7 @@ def _render_auction_card_grid(
                             f'<div style="font-size:10px; font-weight:700; color:#1d4ed8; margin-top:2px;">{arch_badge}</div>'
                         )
                     else:
-                        close_epoch_ms = int(row_dict.get("close_ms") or 0)
+                        close_epoch_ms = _safe_int(row_dict.get("close_ms"))
                         time_badge = _format_live_countdown_badge(row_dict.get("diff_sec"), row_dict.get("closed_at"))
                         time_cell_html = (
                             f'<span class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" '
@@ -1693,13 +1757,13 @@ def _render_auction_card_grid(
                     third_col_html = (
                         f'<div><div class="nellis-meta-item-label">SAVED</div><div class="nellis-meta-item-val" style="color:#15803d;">${savings_val:,.0f}</div></div>'
                         if is_archive_mode
-                        else f'<div><div class="nellis-meta-item-label">LOCATION</div><div class="nellis-meta-item-val">📍 {row_dict["location"]}</div></div>'
+                        else f'<div><div class="nellis-meta-item-label">LOCATION</div><div class="nellis-meta-item-val">📍 {row_dict.get("location") or "Unknown"}</div></div>'
                     )
                     st.markdown(
                         f"""
                         <div class="nellis-meta-strip">
                             <div><div class="nellis-meta-item-label">EST. RETAIL</div><div class="nellis-meta-item-val">${msrp:,.2f}</div></div>
-                            <div><div class="nellis-meta-item-label">BIDS</div><div class="nellis-meta-item-val">{int(row_dict.get("bid_count") or 0)}</div></div>
+                            <div><div class="nellis-meta-item-label">BIDS</div><div class="nellis-meta-item-val">{_safe_int(row_dict.get("bid_count"))}</div></div>
                             {third_col_html}
                         </div>
                         """,
@@ -1781,7 +1845,7 @@ def _render_auction_card_grid(
                         f'<a class="{btn_cls}" href="{item_url}" target="_blank">{action_label}</a>',
                         unsafe_allow_html=True,
                     )
-                    if st.button(f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})", key=f"{btn_key_prefix}_{auction_id}", width="stretch"):
+                    if st.button(f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})", key=f"{btn_key_prefix}_{auction_id}", **_stretch_kwargs(st.button)):
                         show_item_history_dialog(row_dict)
 
 
@@ -2006,17 +2070,27 @@ def _guard_nav_view():
 
 
 def render_top_nav() -> str:
-    """Render top horizontal navigation segmented control cleanly above page content."""
+    """Render top horizontal navigation segmented control (with radio fallback on Streamlit < 1.40)."""
     st.markdown('<div id="nellis-top-anchor"></div>', unsafe_allow_html=True)
     if st.session_state.get("nav_view") not in NAV_OPTIONS:
         st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "🎯 Live Deals")
-    chosen = st.segmented_control(
-        "Navigation",
-        NAV_OPTIONS,
-        key="nav_view",
-        label_visibility="collapsed",
-        on_change=_guard_nav_view,
-    )
+    if hasattr(st, "segmented_control"):
+        chosen = st.segmented_control(
+            "Navigation",
+            NAV_OPTIONS,
+            key="nav_view",
+            label_visibility="collapsed",
+            on_change=_guard_nav_view,
+        )
+    else:
+        chosen = st.radio(
+            "Navigation",
+            NAV_OPTIONS,
+            key="nav_view",
+            horizontal=True,
+            label_visibility="collapsed",
+            on_change=_guard_nav_view,
+        )
     if chosen not in NAV_OPTIONS:
         chosen = st.session_state.get("_last_nav_view", "🎯 Live Deals")
     st.session_state["_last_nav_view"] = chosen
@@ -2142,6 +2216,75 @@ def _render_live_field_group(prefix: str, include_search: bool = False):
             )
 
 
+def _render_inline_search_and_popover(
+    placeholder: str,
+    search_label: str,
+    search_key: str,
+    canonical_kw_key: str,
+    badge_count: int,
+    render_fields_fn,
+    pop_reset_key: str,
+    top_reset_key: str,
+    defaults: dict,
+    is_dirty: bool,
+):
+    """Render inline Search + Filters popover + Reset button cleanly across Streamlit 1.34..1.67+."""
+    row_s, row_actions = _st_columns([3.0, 1.8], vertical_alignment="center")
+    with row_s:
+        st.text_input(
+            search_label,
+            placeholder=placeholder,
+            label_visibility="collapsed",
+            key=search_key,
+            on_change=_sync_widget,
+            args=(search_key, canonical_kw_key),
+        )
+    pop_label = f"🎛️ Filters ({badge_count})" if badge_count else "🎛️ Filters"
+    btn_stretch = _stretch_kwargs(st.button)
+    with row_actions:
+        if _supports_kw(st.container, "horizontal"):
+            with st.container(horizontal=True, gap="small"):
+                with _open_popover_or_expander(pop_label):
+                    render_fields_fn("top", include_search=False)
+                    st.button(
+                        "↺ Reset Filters",
+                        key=pop_reset_key,
+                        on_click=_reset_filter_group,
+                        args=(defaults,),
+                        disabled=not is_dirty,
+                        **btn_stretch,
+                    )
+                st.button(
+                    "↺ Reset",
+                    key=top_reset_key,
+                    on_click=_reset_filter_group,
+                    args=(defaults,),
+                    disabled=not is_dirty,
+                )
+        else:
+            p_col, r_col = st.columns([1.6, 1])
+            with p_col:
+                with _open_popover_or_expander(pop_label):
+                    render_fields_fn("top", include_search=False)
+                    st.button(
+                        "↺ Reset Filters",
+                        key=pop_reset_key,
+                        on_click=_reset_filter_group,
+                        args=(defaults,),
+                        disabled=not is_dirty,
+                        **btn_stretch,
+                    )
+            with r_col:
+                st.button(
+                    "↺ Reset",
+                    key=top_reset_key,
+                    on_click=_reset_filter_group,
+                    args=(defaults,),
+                    disabled=not is_dirty,
+                    **btn_stretch,
+                )
+
+
 def render_live_filter_controls() -> dict:
     """Render synchronized sidebar and mobile-first main-page filters for Live Deals."""
     _init_filter_state(LIVE_DEFAULTS)
@@ -2159,7 +2302,7 @@ def render_live_filter_controls() -> dict:
     is_dirty = badge_count > 0 or bool(str(st.session_state["live_kw"]).strip()) or int(st.session_state["live_page_size"]) != 40
 
     with st.sidebar:
-        sh_col, sr_col = st.columns([2.2, 1], vertical_alignment="center")
+        sh_col, sr_col = _st_columns([2.2, 1], vertical_alignment="center")
         with sh_col:
             st.subheader("🎛️ Live Filters")
         with sr_col:
@@ -2169,52 +2312,27 @@ def render_live_filter_controls() -> dict:
                 on_click=_reset_filter_group,
                 args=(LIVE_DEFAULTS,),
                 disabled=not is_dirty,
-                width="stretch",
+                **_stretch_kwargs(st.button),
             )
         _render_live_field_group("sb", include_search=True)
 
-    row_s, row_actions = st.columns([3.0, 1.8], vertical_alignment="center")
-    with row_s:
-        st.text_input(
-            "Search Active",
-            placeholder="🔍 Search live deals (e.g. DeWalt, Dyson, Pixel, Lego)...",
-            label_visibility="collapsed",
-            key="top_live_kw",
-            on_change=_sync_widget,
-            args=("top_live_kw", "live_kw"),
-        )
-    with row_actions:
-        with st.container(horizontal=True, gap="small"):
-            pop_label = f"🎛️ Filters ({badge_count})" if badge_count else "🎛️ Filters"
-            with st.popover(pop_label, width="stretch"):
-                _render_live_field_group("top", include_search=False)
-                st.button(
-                    "↺ Reset Filters",
-                    key="pop_live_reset",
-                    on_click=_reset_filter_group,
-                    args=(LIVE_DEFAULTS,),
-                    disabled=not is_dirty,
-                    width="stretch",
-                )
-            st.button(
-                "↺ Reset",
-                key="top_live_reset",
-                on_click=_reset_filter_group,
-                args=(LIVE_DEFAULTS,),
-                disabled=not is_dirty,
-            )
+    _render_inline_search_and_popover(
+        placeholder="🔍 Search live deals (e.g. DeWalt, Dyson, Pixel, Lego)...",
+        search_label="Search Active",
+        search_key="top_live_kw",
+        canonical_kw_key="live_kw",
+        badge_count=badge_count,
+        render_fields_fn=_render_live_field_group,
+        pop_reset_key="pop_live_reset",
+        top_reset_key="top_live_reset",
+        defaults=LIVE_DEFAULTS,
+        is_dirty=is_dirty,
+    )
 
     cur_pills = _compute_live_pills()
     st.session_state["_prev_live_quick_pills"] = cur_pills
     st.session_state["live_quick_pills"] = cur_pills
-    st.pills(
-        "Quick Filters",
-        LIVE_QUICK_PILLS,
-        selection_mode="multi",
-        label_visibility="collapsed",
-        key="live_quick_pills",
-        on_change=_on_live_pills_change,
-    )
+    _render_quick_pills("Quick Filters", LIVE_QUICK_PILLS, key="live_quick_pills", on_change=_on_live_pills_change)
 
     parts = [st.session_state["live_time"]]
     if st.session_state["live_wh"] != "All":
@@ -2393,7 +2511,7 @@ def render_arch_filter_controls() -> dict:
     is_dirty = badge_count > 0 or bool(str(st.session_state["arch_kw"]).strip()) or int(st.session_state["arch_page_size"]) != 40
 
     with st.sidebar:
-        sh_col, sr_col = st.columns([2.2, 1], vertical_alignment="center")
+        sh_col, sr_col = _st_columns([2.2, 1], vertical_alignment="center")
         with sh_col:
             st.subheader("🗄️ Archive Filters")
         with sr_col:
@@ -2403,52 +2521,27 @@ def render_arch_filter_controls() -> dict:
                 on_click=_reset_filter_group,
                 args=(arch_defaults,),
                 disabled=not is_dirty,
-                width="stretch",
+                **_stretch_kwargs(st.button),
             )
         _render_arch_field_group("sb", include_search=True)
 
-    row_s, row_actions = st.columns([3.0, 1.8], vertical_alignment="center")
-    with row_s:
-        st.text_input(
-            "Search Archive",
-            placeholder="🔍 Search past auctions & steals (e.g. Pixel, Dyson, Monitor)...",
-            label_visibility="collapsed",
-            key="top_arch_kw",
-            on_change=_sync_widget,
-            args=("top_arch_kw", "arch_kw"),
-        )
-    with row_actions:
-        with st.container(horizontal=True, gap="small"):
-            pop_label = f"🎛️ Filters ({badge_count})" if badge_count else "🎛️ Filters"
-            with st.popover(pop_label, width="stretch"):
-                _render_arch_field_group("top", include_search=False)
-                st.button(
-                    "↺ Reset Filters",
-                    key="pop_arch_reset",
-                    on_click=_reset_filter_group,
-                    args=(arch_defaults,),
-                    disabled=not is_dirty,
-                    width="stretch",
-                )
-            st.button(
-                "↺ Reset",
-                key="top_arch_reset",
-                on_click=_reset_filter_group,
-                args=(arch_defaults,),
-                disabled=not is_dirty,
-            )
+    _render_inline_search_and_popover(
+        placeholder="🔍 Search past auctions & steals (e.g. Pixel, Dyson, Monitor)...",
+        search_label="Search Archive",
+        search_key="top_arch_kw",
+        canonical_kw_key="arch_kw",
+        badge_count=badge_count,
+        render_fields_fn=_render_arch_field_group,
+        pop_reset_key="pop_arch_reset",
+        top_reset_key="top_arch_reset",
+        defaults=arch_defaults,
+        is_dirty=is_dirty,
+    )
 
     cur_pills = _compute_arch_pills()
     st.session_state["_prev_arch_quick_pills"] = cur_pills
     st.session_state["arch_quick_pills"] = cur_pills
-    st.pills(
-        "Archive Quick Views",
-        ARCH_QUICK_PILLS,
-        selection_mode="multi",
-        label_visibility="collapsed",
-        key="arch_quick_pills",
-        on_change=_on_arch_pills_change,
-    )
+    _render_quick_pills("Archive Quick Views", ARCH_QUICK_PILLS, key="arch_quick_pills", on_change=_on_arch_pills_change)
 
     parts = [st.session_state["arch_date_preset"]]
     if st.session_state["arch_settled_only"]:
