@@ -66,7 +66,7 @@ def load_app_module_helpers() -> types.ModuleType:
         # Stop collecting top-level UI before view routing, collecting `validate_readonly_sql` if inside a branch
         if isinstance(node, ast.If):
             src_seg = ast.get_source_segment(src_text, node) or ""
-            if 'view_mode == "🎯 Live Deals"' in src_seg or 'view_mode == "🎯 Deal Finder"' in src_seg:
+            if 'view_mode == "Live"' in src_seg or 'view_mode == "🎯 Live Deals"' in src_seg:
                 for sub in ast.walk(node):
                     if isinstance(sub, ast.FunctionDef) and sub.name == "validate_readonly_sql":
                         validate_sql_node = sub

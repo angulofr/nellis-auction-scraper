@@ -1286,10 +1286,27 @@ def normalize_df_conditions(df_in: pd.DataFrame) -> pd.DataFrame:
 
 
 def inject_nellis_card_css():
-    """Inject shared card, filter-bar, slim number-stepper, and responsive Refresh FAB CSS."""
+    """Inject shared Nellis-style card, mobile top-bar, slim stepper, and responsive Refresh FAB CSS."""
     st.markdown(
         """
         <style>
+        /* Sleek Nellis-style top spacing and results headline */
+        .nellis-results-hdr {
+            margin: 2px 0 8px 0;
+        }
+        .nellis-loc-title {
+            font-size: 22px;
+            font-weight: 800;
+            letter-spacing: 0.4px;
+            text-transform: uppercase;
+            line-height: 1.15;
+            margin: 0;
+        }
+        .nellis-count-sub {
+            font-size: 13.5px;
+            color: #94a3b8;
+            margin-top: 2px;
+        }
         /* Floating Refresh FAB: top-right on desktop, thumb-safe bottom-right above Manage app on mobile */
         .st-key-refresh_live_btn,
         div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] {
@@ -1309,6 +1326,29 @@ def inject_nellis_card_css():
             box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45) !important;
         }
         @media (max-width: 768px) {
+            .block-container {
+                padding-top: 2.3rem !important;
+                padding-left: 0.75rem !important;
+                padding-right: 0.75rem !important;
+            }
+            /* Keep mobile Filter | Steals | Clear toolbar side-by-side on one clean row */
+            .st-key-nellis_filter_toolbar div[data-testid="stHorizontalBlock"] {
+                flex-direction: row !important;
+                flex-wrap: nowrap !important;
+                gap: 6px !important;
+            }
+            .st-key-nellis_filter_toolbar div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+                flex: 1 1 0 !important;
+                min-width: 0 !important;
+                width: auto !important;
+            }
+            .st-key-nellis_filter_toolbar button,
+            .st-key-nellis_filter_toolbar [data-testid="stPopover"] button {
+                padding-left: 6px !important;
+                padding-right: 6px !important;
+                font-size: 13px !important;
+                white-space: nowrap !important;
+            }
             .st-key-refresh_live_btn,
             div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] {
                 top: auto !important;
@@ -1316,7 +1356,7 @@ def inject_nellis_card_css():
                 right: 14px !important;
             }
         }
-        /* Keep 2-column number inputs inside sidebar and popover readable without clipping digits */
+        /* Keep number inputs inside sidebar and popover readable without clipping digits */
         [data-testid="stSidebar"] [data-testid="stNumberInputContainer"] button,
         [data-testid="stPopoverBody"] [data-testid="stNumberInputContainer"] button {
             padding-left: 4px !important;
@@ -1851,18 +1891,29 @@ def _render_auction_card_grid(
                         show_item_history_dialog(row_dict)
 
 
-# --- TOP NAVIGATION & TWO-WAY FILTER ENGINE ---
-NAV_OPTIONS = ["🎯 Live Deals", "🗄️ Past Archive", "📊 Analytics", "💻 SQL Studio"]
+# --- TOP NAVIGATION & OFFICIAL NELLIS FILTER ENGINE ---
+NAV_OPTIONS = ["Live", "Archive", "Analytics", "SQL"]
 PRIMARY_CATEGORIES = ["All Categories"] + sorted({p for p, _, _ in CATEGORY_RULES} | {"Home & General"})
 WAREHOUSE_OPTIONS = ["All", "Phoenix", "Mesa"]
 COND_OPTIONS = ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"]
-LIVE_TIME_OPTIONS = ["< 5 mins", "< 15 mins", "< 30 mins", "< 1 hour", "< 24 hours", "All Active"]
+
+LIVE_TIME_CHIPS = ["5m", "10m", "15m", "30m", "1h", "24h", "All"]
 LIVE_TIME_SEC_MAP = {
-    "< 5 mins": 300,
-    "< 15 mins": 900,
-    "< 30 mins": 1800,
-    "< 1 hour": 3600,
-    "< 24 hours": 86400,
+    "5m": 300,
+    "10m": 600,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "24h": 86400,
+}
+LIVE_TIME_DESC = {
+    "5m": "Closing < 5 mins",
+    "10m": "Closing < 10 mins",
+    "15m": "Closing < 15 mins",
+    "30m": "Closing < 30 mins",
+    "1h": "Closing < 1 hour",
+    "24h": "Closing Today (< 24h)",
+    "All": "All Active",
 }
 LIVE_SORT_OPTIONS = [
     "Closing Soonest",
@@ -1872,7 +1923,16 @@ LIVE_SORT_OPTIONS = [
     "Lowest Current Bid ($)",
     "Highest Retail MSRP ($)",
 ]
-ARCH_DATE_OPTIONS = ["All Time", "Last 24h", "Last 3 Days", "Last 7 Days", "Last 30 Days", "Custom Range"]
+
+ARCH_DATE_CHIPS = ["All", "24h", "3d", "7d", "30d", "Custom"]
+ARCH_DATE_DESC = {
+    "All": "All Time",
+    "24h": "Last 24h",
+    "3d": "Last 3 Days",
+    "7d": "Last 7 Days",
+    "30d": "Last 30 Days",
+    "Custom": "Custom Range",
+}
 ARCH_SORT_OPTIONS = [
     "Most Recently Closed",
     "Highest % Off",
@@ -1880,16 +1940,26 @@ ARCH_SORT_OPTIONS = [
     "Lowest Winning Bid ($)",
     "Highest Retail MSRP ($)",
 ]
-LIVE_QUICK_PILLS = ["🔥 < 5m", "⚡ < 15m", "🔮 Steals Tonight", "📍 Phoenix", "📍 Mesa", "🆕 Brand New"]
-ARCH_QUICK_PILLS = ["🏆 Top Steals (90%+)", "😴 Sleepers", "✅ Settled Only", "📅 Last 7 Days", "📍 Phoenix", "📍 Mesa", "🆕 Brand New"]
+
+RETAIL_PRESET_OPTIONS = ["Any", "Under $20", "$20 - $50", "$50 - $100", "$100 - $500", "Above $500", "Custom"]
+RETAIL_PRESET_BOUNDS = {
+    "Any": (0, 0),
+    "Under $20": (0, 20),
+    "$20 - $50": (20, 50),
+    "$50 - $100": (50, 100),
+    "$100 - $500": (100, 500),
+    "Above $500": (500, 0),
+}
 
 LIVE_DEFAULTS = {
     "live_kw": "",
-    "live_time": "< 5 mins",
+    "live_time": "5m",
     "live_wh": "All",
     "live_cond": "All",
     "live_sort": "Closing Soonest",
+    "live_retail_preset": "Any",
     "live_min_retail": 0,
+    "live_max_retail": 0,
     "live_max_bid": 1000,
     "live_cat": "All Categories",
     "live_predict_cheap": False,
@@ -1904,13 +1974,15 @@ def _get_arch_defaults() -> dict:
     today_az = _dt.date.today()
     return {
         "arch_kw": "",
-        "arch_date_preset": "All Time",
+        "arch_date_preset": "All",
         "arch_start": today_az - _dt.timedelta(days=7),
         "arch_end": today_az,
         "arch_wh": "All",
         "arch_cond": "All",
         "arch_sort": "Most Recently Closed",
+        "arch_retail_preset": "Any",
         "arch_min_retail": 0,
+        "arch_max_retail": 0,
         "arch_max_bid": 1000,
         "arch_cat": "All Categories",
         "arch_min_disc": 0,
@@ -1921,7 +1993,7 @@ def _get_arch_defaults() -> dict:
 
 
 def _init_filter_state(defaults: dict):
-    """Initialize canonical filter keys and sync both sidebar (`sb_*`) and main popover (`top_*`) widget mirrors."""
+    """Initialize canonical filter keys and sync both sidebar (`sb_*`) and main (`top_*`) widget mirrors."""
     for field, default_val in defaults.items():
         if field not in st.session_state:
             st.session_state[field] = default_val
@@ -1933,6 +2005,12 @@ def _sync_widget(widget_key: str, canonical_key: str):
     st.session_state[canonical_key] = st.session_state[widget_key]
 
 
+def _sync_segmented(widget_key: str, canonical_key: str, valid_options: list[str]):
+    val = st.session_state.get(widget_key)
+    if val in valid_options:
+        st.session_state[canonical_key] = val
+
+
 def _reset_filter_group(defaults: dict):
     for field, default_val in defaults.items():
         st.session_state[field] = default_val
@@ -1940,329 +2018,412 @@ def _reset_filter_group(defaults: dict):
         st.session_state[f"top_{field}"] = default_val
 
 
-def _compute_live_pills() -> list[str]:
-    out = []
-    if st.session_state.get("live_time") == "< 5 mins":
-        out.append("🔥 < 5m")
-    elif st.session_state.get("live_time") == "< 15 mins":
-        out.append("⚡ < 15m")
-    if st.session_state.get("live_predict_cheap"):
-        out.append("🔮 Steals Tonight")
-    wh = st.session_state.get("live_wh", "All")
-    if wh == "Phoenix":
-        out.append("📍 Phoenix")
-    elif wh == "Mesa":
-        out.append("📍 Mesa")
-    if st.session_state.get("live_cond") == "Brand New":
-        out.append("🆕 Brand New")
-    return out
+def _on_retail_preset_change(widget_key: str, mode_prefix: str):
+    preset = st.session_state.get(widget_key, "Any")
+    st.session_state[f"{mode_prefix}_retail_preset"] = preset
+    if preset in RETAIL_PRESET_BOUNDS:
+        lo, hi = RETAIL_PRESET_BOUNDS[preset]
+        st.session_state[f"{mode_prefix}_min_retail"] = lo
+        st.session_state[f"{mode_prefix}_max_retail"] = hi
 
 
-def _on_live_pills_change():
-    new_set = set(st.session_state.get("live_quick_pills") or [])
-    old_set = set(st.session_state.get("_prev_live_quick_pills") or [])
-    added = new_set - old_set
-    removed = old_set - new_set
-
-    if "🔥 < 5m" in added:
-        st.session_state["live_time"] = "< 5 mins"
-    elif "⚡ < 15m" in added:
-        st.session_state["live_time"] = "< 15 mins"
-    elif ("🔥 < 5m" in removed and st.session_state.get("live_time") == "< 5 mins") or (
-        "⚡ < 15m" in removed and st.session_state.get("live_time") == "< 15 mins"
-    ):
-        st.session_state["live_time"] = "All Active"
-
-    if "🔮 Steals Tonight" in added:
-        st.session_state["live_predict_cheap"] = True
-    elif "🔮 Steals Tonight" in removed:
-        st.session_state["live_predict_cheap"] = False
-
-    if "📍 Phoenix" in added:
-        st.session_state["live_wh"] = "Phoenix"
-    elif "📍 Mesa" in added:
-        st.session_state["live_wh"] = "Mesa"
-    elif ("📍 Phoenix" in removed and st.session_state.get("live_wh") == "Phoenix") or (
-        "📍 Mesa" in removed and st.session_state.get("live_wh") == "Mesa"
-    ):
-        st.session_state["live_wh"] = "All"
-
-    if "🆕 Brand New" in added:
-        st.session_state["live_cond"] = "Brand New"
-    elif "🆕 Brand New" in removed and st.session_state.get("live_cond") == "Brand New":
-        st.session_state["live_cond"] = "All"
+def _on_retail_bounds_change(min_wk: str, max_wk: str, mode_prefix: str):
+    lo = int(st.session_state.get(min_wk) or 0)
+    hi = int(st.session_state.get(max_wk) or 0)
+    st.session_state[f"{mode_prefix}_min_retail"] = lo
+    st.session_state[f"{mode_prefix}_max_retail"] = hi
+    matched = next((k for k, bounds in RETAIL_PRESET_BOUNDS.items() if bounds == (lo, hi)), "Custom")
+    st.session_state[f"{mode_prefix}_retail_preset"] = matched
 
 
-def _compute_arch_pills() -> list[str]:
-    out = []
-    if int(st.session_state.get("arch_min_disc") or 0) >= 90 and st.session_state.get("arch_settled_only"):
-        out.append("🏆 Top Steals (90%+)")
-    if st.session_state.get("arch_sleeper_only"):
-        out.append("😴 Sleepers")
-    if st.session_state.get("arch_settled_only"):
-        out.append("✅ Settled Only")
-    if st.session_state.get("arch_date_preset") == "Last 7 Days":
-        out.append("📅 Last 7 Days")
-    wh = st.session_state.get("arch_wh", "All")
-    if wh == "Phoenix":
-        out.append("📍 Phoenix")
-    elif wh == "Mesa":
-        out.append("📍 Mesa")
-    if st.session_state.get("arch_cond") == "Brand New":
-        out.append("🆕 Brand New")
-    return out
+def _toggle_live_steal():
+    st.session_state["live_predict_cheap"] = not bool(st.session_state.get("live_predict_cheap"))
 
 
-def _on_arch_pills_change():
-    new_set = set(st.session_state.get("arch_quick_pills") or [])
-    old_set = set(st.session_state.get("_prev_arch_quick_pills") or [])
-    added = new_set - old_set
-    removed = old_set - new_set
-
-    if "🏆 Top Steals (90%+)" in added:
+def _toggle_arch_steal():
+    active = int(st.session_state.get("arch_min_disc") or 0) >= 90 and bool(st.session_state.get("arch_settled_only"))
+    if not active:
         st.session_state["arch_min_disc"] = 90
         st.session_state["arch_settled_only"] = True
         st.session_state["arch_sort"] = "Highest % Off"
-        if st.session_state.get("arch_date_preset") == "All Time":
-            st.session_state["arch_date_preset"] = "Last 7 Days"
-    elif "🏆 Top Steals (90%+)" in removed:
+        if st.session_state.get("arch_date_preset") == "All":
+            st.session_state["arch_date_preset"] = "7d"
+    else:
         st.session_state["arch_min_disc"] = 0
         if st.session_state.get("arch_sort") == "Highest % Off":
             st.session_state["arch_sort"] = "Most Recently Closed"
-        if st.session_state.get("arch_date_preset") == "Last 7 Days":
-            st.session_state["arch_date_preset"] = "All Time"
+        if st.session_state.get("arch_date_preset") == "7d":
+            st.session_state["arch_date_preset"] = "All"
         st.session_state["arch_settled_only"] = bool(st.session_state.get("arch_sleeper_only"))
-
-    if "😴 Sleepers" in added:
-        st.session_state["arch_sleeper_only"] = True
-        st.session_state["arch_settled_only"] = True
-    elif "😴 Sleepers" in removed:
-        st.session_state["arch_sleeper_only"] = False
-
-    if "✅ Settled Only" in added:
-        st.session_state["arch_settled_only"] = True
-    elif "✅ Settled Only" in removed:
-        st.session_state["arch_settled_only"] = False
-
-    if "📅 Last 7 Days" in added:
-        st.session_state["arch_date_preset"] = "Last 7 Days"
-    elif "📅 Last 7 Days" in removed and st.session_state.get("arch_date_preset") == "Last 7 Days":
-        st.session_state["arch_date_preset"] = "All Time"
-
-    if "📍 Phoenix" in added:
-        st.session_state["arch_wh"] = "Phoenix"
-    elif "📍 Mesa" in added:
-        st.session_state["arch_wh"] = "Mesa"
-    elif ("📍 Phoenix" in removed and st.session_state.get("arch_wh") == "Phoenix") or (
-        "📍 Mesa" in removed and st.session_state.get("arch_wh") == "Mesa"
-    ):
-        st.session_state["arch_wh"] = "All"
-
-    if "🆕 Brand New" in added:
-        st.session_state["arch_cond"] = "Brand New"
-    elif "🆕 Brand New" in removed and st.session_state.get("arch_cond") == "Brand New":
-        st.session_state["arch_cond"] = "All"
 
 
 def _guard_nav_view():
     if st.session_state.get("nav_view") not in NAV_OPTIONS:
-        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "🎯 Live Deals")
+        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "Live")
     else:
         st.session_state["_last_nav_view"] = st.session_state["nav_view"]
 
 
-def render_top_nav() -> str:
-    """Render top horizontal navigation segmented control (with radio fallback on Streamlit < 1.40)."""
-    st.markdown('<div id="nellis-top-anchor"></div>', unsafe_allow_html=True)
-    if st.session_state.get("nav_view") not in NAV_OPTIONS:
-        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "🎯 Live Deals")
+def _render_chip_selector(label: str, options: list[str], key: str, on_change, args=()):
+    """Render sleek horizontal segmented chips (or radio fallback on Streamlit < 1.40)."""
     if hasattr(st, "segmented_control"):
-        chosen = st.segmented_control(
-            "Navigation",
-            NAV_OPTIONS,
-            key="nav_view",
+        st.segmented_control(
+            label,
+            options,
+            key=key,
             label_visibility="collapsed",
-            on_change=_guard_nav_view,
+            on_change=on_change,
+            args=args,
         )
     else:
-        chosen = st.radio(
-            "Navigation",
-            NAV_OPTIONS,
-            key="nav_view",
+        st.radio(
+            label,
+            options,
+            key=key,
             horizontal=True,
             label_visibility="collapsed",
-            on_change=_guard_nav_view,
+            on_change=on_change,
+            args=args,
         )
+
+
+def render_top_nav() -> str:
+    """Render ultra-clean single-row top navigation bar above the Search input."""
+    st.markdown('<div id="nellis-top-anchor"></div>', unsafe_allow_html=True)
+    if st.session_state.get("nav_view") not in NAV_OPTIONS:
+        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "Live")
+    _render_chip_selector("Navigation", NAV_OPTIONS, key="nav_view", on_change=_guard_nav_view)
+    chosen = st.session_state.get("nav_view")
     if chosen not in NAV_OPTIONS:
-        chosen = st.session_state.get("_last_nav_view", "🎯 Live Deals")
+        chosen = st.session_state.get("_last_nav_view", "Live")
     st.session_state["_last_nav_view"] = chosen
     return chosen
 
 
-def _render_live_field_group(prefix: str, include_search: bool = False, two_col: bool = True):
-    """Render compact Live Deals filter controls cleanly without nested columns."""
-    if include_search:
-        st.text_input(
-            "Search",
-            placeholder="e.g. DeWalt, Dyson, Pixel, Lego...",
-            key=f"{prefix}_live_kw",
-            on_change=_sync_widget,
-            args=(f"{prefix}_live_kw", "live_kw"),
-        )
-    if two_col:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.selectbox("Time Left", LIVE_TIME_OPTIONS, key=f"{prefix}_live_time", on_change=_sync_widget, args=(f"{prefix}_live_time", "live_time"))
-        with c2:
-            st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_live_wh", on_change=_sync_widget, args=(f"{prefix}_live_wh", "live_wh"))
-    else:
-        st.selectbox("Time Left", LIVE_TIME_OPTIONS, key=f"{prefix}_live_time", on_change=_sync_widget, args=(f"{prefix}_live_time", "live_time"))
-        st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_live_wh", on_change=_sync_widget, args=(f"{prefix}_live_wh", "live_wh"))
-
-    st.selectbox("Sort By", LIVE_SORT_OPTIONS, key=f"{prefix}_live_sort", on_change=_sync_widget, args=(f"{prefix}_live_sort", "live_sort"))
-    st.selectbox("Condition", COND_OPTIONS, key=f"{prefix}_live_cond", on_change=_sync_widget, args=(f"{prefix}_live_cond", "live_cond"))
-
-    if two_col:
-        p1, p2 = st.columns(2)
-        with p1:
-            st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_live_min_retail", on_change=_sync_widget, args=(f"{prefix}_live_min_retail", "live_min_retail"))
-        with p2:
-            st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_live_max_bid", on_change=_sync_widget, args=(f"{prefix}_live_max_bid", "live_max_bid"))
-    else:
-        st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_live_min_retail", on_change=_sync_widget, args=(f"{prefix}_live_min_retail", "live_min_retail"))
-        st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_live_max_bid", on_change=_sync_widget, args=(f"{prefix}_live_max_bid", "live_max_bid"))
-
-    st.selectbox("Category", PRIMARY_CATEGORIES, key=f"{prefix}_live_cat", on_change=_sync_widget, args=(f"{prefix}_live_cat", "live_cat"))
-    st.checkbox(
-        "🔮 Likely Cheap Tonight",
-        key=f"{prefix}_live_predict_cheap",
-        help="Active items currently trading below their past winning average in the same condition.",
-        on_change=_sync_widget,
-        args=(f"{prefix}_live_predict_cheap", "live_predict_cheap"),
+def _render_retail_facet(prefix: str, mode_prefix: str):
+    """Render official Nellis Est. Retail preset buckets + custom Min/Max bounds."""
+    st.radio(
+        "Est. Retail Tier",
+        RETAIL_PRESET_OPTIONS,
+        key=f"{prefix}_{mode_prefix}_retail_preset",
+        label_visibility="collapsed",
+        on_change=_on_retail_preset_change,
+        args=(f"{prefix}_{mode_prefix}_retail_preset", mode_prefix),
     )
-    with st.expander("⚙️ Steal Rules & Page Size", expanded=bool(st.session_state.get("live_predict_cheap"))):
-        st.number_input("Min Past Sales", min_value=1, max_value=50, step=1, key=f"{prefix}_live_min_sales", on_change=_sync_widget, args=(f"{prefix}_live_min_sales", "live_min_sales"))
-        st.number_input("Min Avg % Off", min_value=50, max_value=99, step=5, key=f"{prefix}_live_min_disc", on_change=_sync_widget, args=(f"{prefix}_live_min_disc", "live_min_disc"))
-        st.number_input("Max Hist Avg ($)", min_value=1, max_value=5000, step=5, key=f"{prefix}_live_max_hist_avg", on_change=_sync_widget, args=(f"{prefix}_live_max_hist_avg", "live_max_hist_avg"))
-        st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_live_page_size", on_change=_sync_widget, args=(f"{prefix}_live_page_size", "live_page_size"))
+    st.number_input(
+        "Min Est. Retail ($)",
+        min_value=0,
+        max_value=50000,
+        step=10,
+        key=f"{prefix}_{mode_prefix}_min_retail",
+        on_change=_on_retail_bounds_change,
+        args=(f"{prefix}_{mode_prefix}_min_retail", f"{prefix}_{mode_prefix}_max_retail", mode_prefix),
+    )
+    st.number_input(
+        "Max Est. Retail ($, 0 = no cap)",
+        min_value=0,
+        max_value=50000,
+        step=10,
+        key=f"{prefix}_{mode_prefix}_max_retail",
+        on_change=_on_retail_bounds_change,
+        args=(f"{prefix}_{mode_prefix}_min_retail", f"{prefix}_{mode_prefix}_max_retail", mode_prefix),
+    )
 
 
-def _render_inline_search_and_popover(
-    placeholder: str,
-    search_label: str,
-    search_key: str,
-    canonical_kw_key: str,
-    badge_count: int,
-    render_fields_fn,
-    pop_reset_key: str,
-    top_reset_key: str,
-    defaults: dict,
-    is_dirty: bool,
-):
-    """Render flat 1-level inline Search + Filters popover + Reset bar (safe across all Streamlit >=1.30 versions)."""
-    col_s, col_pop, col_rst = _st_columns([3.0, 1.25, 0.75], vertical_alignment="center")
-    with col_s:
-        st.text_input(
-            search_label,
-            placeholder=placeholder,
-            label_visibility="collapsed",
-            key=search_key,
-            on_change=_sync_widget,
-            args=(search_key, canonical_kw_key),
-        )
-    pop_label = f"🎛️ Filters ({badge_count})" if badge_count else "🎛️ Filters"
-    btn_stretch = _stretch_kwargs(st.button)
-    with col_pop:
-        with _open_popover_or_expander(pop_label):
-            render_fields_fn("top", include_search=False, two_col=False)
+def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: int, is_dirty: bool):
+    """Render official Nellis Auction Sort By + Filters (N) + Accordion sections (zero nested columns)."""
+    st.selectbox(
+        "Sort By",
+        LIVE_SORT_OPTIONS,
+        key=f"{prefix}_live_sort",
+        on_change=_sync_widget,
+        args=(f"{prefix}_live_sort", "live_sort"),
+    )
+    if prefix == "sb":
+        h1, h2 = st.columns([1.4, 1.2])
+        with h1:
+            st.markdown(f"**Filters ({filter_count})**" if filter_count else "**Filters**")
+        with h2:
             st.button(
-                "↺ Reset Filters",
-                key=pop_reset_key,
-                on_click=_reset_filter_group,
-                args=(defaults,),
-                disabled=not is_dirty,
-                **btn_stretch,
-            )
-    with col_rst:
-        st.button(
-            "↺ Reset",
-            key=top_reset_key,
-            on_click=_reset_filter_group,
-            args=(defaults,),
-            disabled=not is_dirty,
-            **btn_stretch,
-        )
-
-
-def render_live_filter_controls() -> dict:
-    """Render synchronized sidebar and mobile-first main-page filters for Live Deals."""
-    _init_filter_state(LIVE_DEFAULTS)
-
-    badge_count = sum([
-        st.session_state["live_time"] != LIVE_DEFAULTS["live_time"],
-        st.session_state["live_wh"] != "All",
-        st.session_state["live_cond"] != "All",
-        st.session_state["live_sort"] != LIVE_DEFAULTS["live_sort"],
-        st.session_state["live_cat"] != "All Categories",
-        int(st.session_state["live_min_retail"]) > 0,
-        int(st.session_state["live_max_bid"]) < 1000,
-        bool(st.session_state["live_predict_cheap"]),
-    ])
-    is_dirty = badge_count > 0 or bool(str(st.session_state["live_kw"]).strip()) or int(st.session_state["live_page_size"]) != 40
-
-    with st.sidebar:
-        sh_col, sr_col = _st_columns([2.2, 1], vertical_alignment="center")
-        with sh_col:
-            st.subheader("🎛️ Live Filters")
-        with sr_col:
-            st.button(
-                "↺ Reset",
+                "Clear Filters",
                 key="sb_live_reset",
                 on_click=_reset_filter_group,
                 args=(LIVE_DEFAULTS,),
                 disabled=not is_dirty,
                 **_stretch_kwargs(st.button),
             )
-        _render_live_field_group("sb", include_search=True)
 
-    _render_inline_search_and_popover(
-        placeholder="🔍 Search live deals (e.g. DeWalt, Dyson, Pixel, Lego)...",
-        search_label="Search Active",
-        search_key="top_live_kw",
-        canonical_kw_key="live_kw",
-        badge_count=badge_count,
-        render_fields_fn=_render_live_field_group,
-        pop_reset_key="pop_live_reset",
-        top_reset_key="top_live_reset",
-        defaults=LIVE_DEFAULTS,
-        is_dirty=is_dirty,
+    if include_window:
+        with st.expander("⏳ Closing Window", expanded=True):
+            st.selectbox(
+                "Closing Within",
+                LIVE_TIME_CHIPS,
+                format_func=lambda x: LIVE_TIME_DESC.get(x, x),
+                key=f"{prefix}_live_time",
+                on_change=_sync_widget,
+                args=(f"{prefix}_live_time", "live_time"),
+            )
+
+    with st.expander("📍 Locations", expanded=(st.session_state["live_wh"] != "All" or prefix == "sb")):
+        st.radio(
+            "Warehouse",
+            WAREHOUSE_OPTIONS,
+            key=f"{prefix}_live_wh",
+            label_visibility="collapsed",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_wh", "live_wh"),
+        )
+
+    with st.expander("⭐ Quality / Condition", expanded=(st.session_state["live_cond"] != "All")):
+        st.radio(
+            "Condition",
+            COND_OPTIONS,
+            key=f"{prefix}_live_cond",
+            label_visibility="collapsed",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_cond", "live_cond"),
+        )
+
+    with st.expander("🏷️ Est. Retail", expanded=(st.session_state["live_retail_preset"] != "Any")):
+        _render_retail_facet(prefix, "live")
+
+    with st.expander("🗂️ Category", expanded=(st.session_state["live_cat"] != "All Categories")):
+        st.selectbox(
+            "Category",
+            PRIMARY_CATEGORIES,
+            key=f"{prefix}_live_cat",
+            label_visibility="collapsed",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_cat", "live_cat"),
+        )
+
+    with st.expander("💵 Max Bid & Steal Rules", expanded=(bool(st.session_state["live_predict_cheap"]) or int(st.session_state["live_max_bid"]) < 1000)):
+        st.number_input(
+            "Max Current Bid ($)",
+            min_value=1,
+            max_value=50000,
+            step=25,
+            key=f"{prefix}_live_max_bid",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_max_bid", "live_max_bid"),
+        )
+        st.checkbox(
+            "🔮 Likely Cheap Tonight",
+            key=f"{prefix}_live_predict_cheap",
+            help="Show active lots currently trading below their past winning average in the same condition.",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_predict_cheap", "live_predict_cheap"),
+        )
+        if st.session_state.get("live_predict_cheap"):
+            st.number_input("Min Past Sales", min_value=1, max_value=50, step=1, key=f"{prefix}_live_min_sales", on_change=_sync_widget, args=(f"{prefix}_live_min_sales", "live_min_sales"))
+            st.number_input("Min Historical Avg % Off", min_value=50, max_value=99, step=5, key=f"{prefix}_live_min_disc", on_change=_sync_widget, args=(f"{prefix}_live_min_disc", "live_min_disc"))
+            st.number_input("Max Historical Avg Price ($)", min_value=1, max_value=5000, step=5, key=f"{prefix}_live_max_hist_avg", on_change=_sync_widget, args=(f"{prefix}_live_max_hist_avg", "live_max_hist_avg"))
+        st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_live_page_size", on_change=_sync_widget, args=(f"{prefix}_live_page_size", "live_page_size"))
+
+
+def _render_nellis_arch_facets(prefix: str, include_window: bool, filter_count: int, is_dirty: bool):
+    """Render official Nellis Auction Sort By + Filters (N) + Accordion sections for Past Archive."""
+    st.selectbox(
+        "Sort By",
+        ARCH_SORT_OPTIONS,
+        key=f"{prefix}_arch_sort",
+        on_change=_sync_widget,
+        args=(f"{prefix}_arch_sort", "arch_sort"),
+    )
+    if prefix == "sb":
+        h1, h2 = st.columns([1.4, 1.2])
+        with h1:
+            st.markdown(f"**Filters ({filter_count})**" if filter_count else "**Filters**")
+        with h2:
+            st.button(
+                "Clear Filters",
+                key="sb_arch_reset",
+                on_click=_reset_filter_group,
+                args=(_get_arch_defaults(),),
+                disabled=not is_dirty,
+                **_stretch_kwargs(st.button),
+            )
+
+    if include_window:
+        with st.expander("📅 Date Window", expanded=(st.session_state["arch_date_preset"] != "All")):
+            st.selectbox(
+                "Window",
+                ARCH_DATE_CHIPS,
+                format_func=lambda x: ARCH_DATE_DESC.get(x, x),
+                key=f"{prefix}_arch_date_preset",
+                on_change=_sync_widget,
+                args=(f"{prefix}_arch_date_preset", "arch_date_preset"),
+            )
+
+    with st.expander("📍 Locations", expanded=(st.session_state["arch_wh"] != "All" or prefix == "sb")):
+        st.radio(
+            "Warehouse",
+            WAREHOUSE_OPTIONS,
+            key=f"{prefix}_arch_wh",
+            label_visibility="collapsed",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_wh", "arch_wh"),
+        )
+
+    with st.expander("⭐ Quality / Condition", expanded=(st.session_state["arch_cond"] != "All")):
+        st.radio(
+            "Condition",
+            COND_OPTIONS,
+            key=f"{prefix}_arch_cond",
+            label_visibility="collapsed",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_cond", "arch_cond"),
+        )
+
+    with st.expander("🏷️ Est. Retail", expanded=(st.session_state["arch_retail_preset"] != "Any")):
+        _render_retail_facet(prefix, "arch")
+
+    with st.expander("🗂️ Category", expanded=(st.session_state["arch_cat"] != "All Categories")):
+        st.selectbox(
+            "Category",
+            PRIMARY_CATEGORIES,
+            key=f"{prefix}_arch_cat",
+            label_visibility="collapsed",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_cat", "arch_cat"),
+        )
+
+    with st.expander("🏆 Past Deals, Discount & Price Caps", expanded=(bool(st.session_state["arch_settled_only"]) or bool(st.session_state["arch_sleeper_only"]) or int(st.session_state["arch_min_disc"]) > 0 or int(st.session_state["arch_max_bid"]) < 1000)):
+        st.number_input("Max Winning Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_arch_max_bid", on_change=_sync_widget, args=(f"{prefix}_arch_max_bid", "arch_max_bid"))
+        st.number_input("Min Discount (% Off)", min_value=0, max_value=99, step=5, key=f"{prefix}_arch_min_disc", on_change=_sync_widget, args=(f"{prefix}_arch_min_disc", "arch_min_disc"))
+        st.checkbox(
+            "✅ Settled WON FOR Sales Only",
+            key=f"{prefix}_arch_settled_only",
+            help="Unchecked searches ALL closed lots in the Data Lake (visible cards are live-checked automatically).",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_settled_only", "arch_settled_only"),
+        )
+        st.checkbox(
+            "😴 Sleepers (Bids ≤ 3 & MSRP ≥ $100)",
+            key=f"{prefix}_arch_sleeper_only",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_sleeper_only", "arch_sleeper_only"),
+        )
+        st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_arch_page_size", on_change=_sync_widget, args=(f"{prefix}_arch_page_size", "arch_page_size"))
+
+
+def _render_nellis_toolbar(
+    filter_count: int,
+    steal_label: str,
+    steal_active: bool,
+    steal_on_click,
+    steal_key: str,
+    clear_key: str,
+    defaults: dict,
+    is_dirty: bool,
+    render_facets_fn,
+    pop_reset_key: str,
+):
+    """Render Nellis-style horizontal toolbar [Filters (N) | Steals | Clear] cleanly without nested columns."""
+    toolbar_box = st.container(key="nellis_filter_toolbar") if _supports_kw(st.container, "key") else st.container()
+    btn_stretch = _stretch_kwargs(st.button)
+    pop_label = f"🎛️ Filters ({filter_count})" if filter_count else "🎛️ Filters"
+    with toolbar_box:
+        col_pop, col_steal, col_clr = st.columns([1.25, 1.15, 0.8])
+        with col_pop:
+            with _open_popover_or_expander(pop_label):
+                render_facets_fn("top", False, filter_count, is_dirty)
+                st.button(
+                    "Clear Filters",
+                    key=pop_reset_key,
+                    on_click=_reset_filter_group,
+                    args=(defaults,),
+                    disabled=not is_dirty,
+                    **btn_stretch,
+                )
+        with col_steal:
+            st.button(
+                steal_label,
+                key=steal_key,
+                type=("primary" if steal_active else "secondary"),
+                on_click=steal_on_click,
+                **btn_stretch,
+            )
+        with col_clr:
+            st.button(
+                "Clear",
+                key=clear_key,
+                on_click=_reset_filter_group,
+                args=(defaults,),
+                disabled=not is_dirty,
+                **btn_stretch,
+            )
+
+
+def _render_nellis_results_header(loc_filter: str, count_text: str, search_kw: str, active_chips: list[str]):
+    """Render official Nellis-style uppercase Location + concise items-found headline."""
+    loc_heading = "PHOENIX & MESA" if loc_filter == "All" else str(loc_filter).upper()
+    kw_clean = str(search_kw or "").strip().replace("<", "&lt;").replace(">", "&gt;")
+    line = f"{count_text} for '{kw_clean}'" if kw_clean else count_text
+    if active_chips:
+        line += " · " + " · ".join(active_chips)
+    st.markdown(
+        f'<div class="nellis-results-hdr">'
+        f'<div class="nellis-loc-title">{loc_heading}</div>'
+        f'<div class="nellis-count-sub">{line}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
 
-    cur_pills = _compute_live_pills()
-    st.session_state["_prev_live_quick_pills"] = cur_pills
-    st.session_state["live_quick_pills"] = cur_pills
-    _render_quick_pills("Quick Filters", LIVE_QUICK_PILLS, key="live_quick_pills", on_change=_on_live_pills_change)
 
-    parts = [st.session_state["live_time"]]
-    if st.session_state["live_wh"] != "All":
-        parts.append(f"📍 {st.session_state['live_wh']}")
-    if st.session_state["live_cond"] != "All":
-        parts.append(st.session_state["live_cond"])
-    if st.session_state["live_cat"] != "All Categories":
-        parts.append(f"🏷️ {st.session_state['live_cat']}")
-    if int(st.session_state["live_min_retail"]) > 0:
-        parts.append(f"MSRP ≥ ${int(st.session_state['live_min_retail'])}")
-    if int(st.session_state["live_max_bid"]) < 1000:
-        parts.append(f"Bid ≤ ${int(st.session_state['live_max_bid'])}")
-    if st.session_state["live_predict_cheap"]:
-        parts.append(
-            f"🔮 Steals (≥{int(st.session_state['live_min_sales'])} sales, "
-            f"Avg ≤ ${int(st.session_state['live_max_hist_avg'])}, ≥{int(st.session_state['live_min_disc'])}% off)"
-        )
-    if str(st.session_state["live_kw"]).strip():
-        parts.append(f"🔍 '{str(st.session_state['live_kw']).strip()}'")
-    parts.append(f"↕️ {st.session_state['live_sort']}")
-    st.caption(f"**Active:** {' · '.join(parts)}")
+def render_live_filter_controls() -> dict:
+    """Render Nellis-style Search-on-top, 5m/10m/15m Closing strip, horizontal Toolbar, and Accordion Drawer."""
+    _init_filter_state(LIVE_DEFAULTS)
+
+    filter_count = sum([
+        st.session_state["live_wh"] != "All",
+        st.session_state["live_cond"] != "All",
+        st.session_state["live_cat"] != "All Categories",
+        int(st.session_state["live_min_retail"]) > 0 or int(st.session_state["live_max_retail"]) > 0,
+        int(st.session_state["live_max_bid"]) < 1000,
+        bool(st.session_state["live_predict_cheap"]),
+        st.session_state["live_sort"] != LIVE_DEFAULTS["live_sort"],
+    ])
+    is_dirty = (
+        filter_count > 0
+        or st.session_state["live_time"] != LIVE_DEFAULTS["live_time"]
+        or bool(str(st.session_state["live_kw"]).strip())
+        or int(st.session_state["live_page_size"]) != 40
+    )
+
+    with st.sidebar:
+        _render_nellis_live_facets("sb", include_window=True, filter_count=filter_count, is_dirty=is_dirty)
+
+    # 1. Search prominently on top (official Nellis style)
+    st.text_input(
+        "Search Nellis Deals",
+        placeholder="🔍 Search Nellis auctions (e.g. DeWalt, Dyson, Pixel, Lego)...",
+        label_visibility="collapsed",
+        key="top_live_kw",
+        on_change=_sync_widget,
+        args=("top_live_kw", "live_kw"),
+    )
+    # 2. Sniping closing-window chips (5m, 10m, 15m, 30m, 1h, 24h, All)
+    _render_chip_selector(
+        "Closing in",
+        LIVE_TIME_CHIPS,
+        key="top_live_time",
+        on_change=_sync_segmented,
+        args=("top_live_time", "live_time", LIVE_TIME_CHIPS),
+    )
+    # 3. Sleek 1-row toolbar: Filters (N) | Steals | Clear
+    _render_nellis_toolbar(
+        filter_count=filter_count,
+        steal_label=("🔮 Steals ✓" if st.session_state["live_predict_cheap"] else "🔮 Steals"),
+        steal_active=bool(st.session_state["live_predict_cheap"]),
+        steal_on_click=_toggle_live_steal,
+        steal_key="top_live_steal_btn",
+        clear_key="top_live_reset",
+        defaults=LIVE_DEFAULTS,
+        is_dirty=is_dirty,
+        render_facets_fn=_render_nellis_live_facets,
+        pop_reset_key="pop_live_reset",
+    )
 
     return {
         "search_kw": str(st.session_state["live_kw"]),
@@ -2270,7 +2431,9 @@ def render_live_filter_controls() -> dict:
         "loc_filter": st.session_state["live_wh"],
         "cond_filter": st.session_state["live_cond"],
         "sort_by": st.session_state["live_sort"],
+        "retail_preset": st.session_state["live_retail_preset"],
         "min_retail": int(st.session_state["live_min_retail"]),
+        "max_retail": int(st.session_state["live_max_retail"]),
         "max_bid": int(st.session_state["live_max_bid"]),
         "cat_filter": st.session_state["live_cat"],
         "predict_cheap_only": bool(st.session_state["live_predict_cheap"]),
@@ -2281,152 +2444,66 @@ def render_live_filter_controls() -> dict:
     }
 
 
-def _render_arch_field_group(prefix: str, include_search: bool = False, two_col: bool = True):
-    """Render compact Past Archive filter controls cleanly without nested columns."""
-    if include_search:
-        st.text_input(
-            "Search",
-            placeholder="e.g. Pixel, Dyson, Monitor, Drill...",
-            key=f"{prefix}_arch_kw",
-            on_change=_sync_widget,
-            args=(f"{prefix}_arch_kw", "arch_kw"),
-        )
-    if two_col:
-        c1, c2 = st.columns(2)
-        with c1:
-            st.selectbox("Date Window", ARCH_DATE_OPTIONS, key=f"{prefix}_arch_date_preset", on_change=_sync_widget, args=(f"{prefix}_arch_date_preset", "arch_date_preset"))
-        with c2:
-            st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_arch_wh", on_change=_sync_widget, args=(f"{prefix}_arch_wh", "arch_wh"))
-    else:
-        st.selectbox("Date Window", ARCH_DATE_OPTIONS, key=f"{prefix}_arch_date_preset", on_change=_sync_widget, args=(f"{prefix}_arch_date_preset", "arch_date_preset"))
-        st.selectbox("Warehouse", WAREHOUSE_OPTIONS, key=f"{prefix}_arch_wh", on_change=_sync_widget, args=(f"{prefix}_arch_wh", "arch_wh"))
-
-    if st.session_state.get("arch_date_preset") == "Custom Range":
-        if two_col:
-            d1, d2 = st.columns(2)
-            with d1:
-                st.date_input("From", key=f"{prefix}_arch_start", on_change=_sync_widget, args=(f"{prefix}_arch_start", "arch_start"))
-            with d2:
-                st.date_input("To", key=f"{prefix}_arch_end", on_change=_sync_widget, args=(f"{prefix}_arch_end", "arch_end"))
-        else:
-            st.date_input("From", key=f"{prefix}_arch_start", on_change=_sync_widget, args=(f"{prefix}_arch_start", "arch_start"))
-            st.date_input("To", key=f"{prefix}_arch_end", on_change=_sync_widget, args=(f"{prefix}_arch_end", "arch_end"))
-
-    st.selectbox("Sort By", ARCH_SORT_OPTIONS, key=f"{prefix}_arch_sort", on_change=_sync_widget, args=(f"{prefix}_arch_sort", "arch_sort"))
-    st.selectbox("Condition", COND_OPTIONS, key=f"{prefix}_arch_cond", on_change=_sync_widget, args=(f"{prefix}_arch_cond", "arch_cond"))
-
-    if two_col:
-        p1, p2 = st.columns(2)
-        with p1:
-            st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_arch_min_retail", on_change=_sync_widget, args=(f"{prefix}_arch_min_retail", "arch_min_retail"))
-        with p2:
-            st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_arch_max_bid", on_change=_sync_widget, args=(f"{prefix}_arch_max_bid", "arch_max_bid"))
-    else:
-        st.number_input("Min MSRP ($)", min_value=0, max_value=50000, step=10, key=f"{prefix}_arch_min_retail", on_change=_sync_widget, args=(f"{prefix}_arch_min_retail", "arch_min_retail"))
-        st.number_input("Max Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_arch_max_bid", on_change=_sync_widget, args=(f"{prefix}_arch_max_bid", "arch_max_bid"))
-
-    st.selectbox("Category", PRIMARY_CATEGORIES, key=f"{prefix}_arch_cat", on_change=_sync_widget, args=(f"{prefix}_arch_cat", "arch_cat"))
-
-    if two_col:
-        b1, b2 = st.columns(2)
-        with b1:
-            st.number_input("Min % Off", min_value=0, max_value=99, step=5, key=f"{prefix}_arch_min_disc", on_change=_sync_widget, args=(f"{prefix}_arch_min_disc", "arch_min_disc"))
-        with b2:
-            st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_arch_page_size", on_change=_sync_widget, args=(f"{prefix}_arch_page_size", "arch_page_size"))
-    else:
-        st.number_input("Min % Off", min_value=0, max_value=99, step=5, key=f"{prefix}_arch_min_disc", on_change=_sync_widget, args=(f"{prefix}_arch_min_disc", "arch_min_disc"))
-        st.selectbox("Items / Page", [40, 60, 100], key=f"{prefix}_arch_page_size", on_change=_sync_widget, args=(f"{prefix}_arch_page_size", "arch_page_size"))
-
-    st.checkbox(
-        "✅ Settled WON FOR Sales Only",
-        key=f"{prefix}_arch_settled_only",
-        help="Unchecked searches ALL closed lots in the Data Lake (visible cards are live-checked automatically).",
-        on_change=_sync_widget,
-        args=(f"{prefix}_arch_settled_only", "arch_settled_only"),
-    )
-    st.checkbox(
-        "😴 Sleepers (Bids ≤ 3 & MSRP ≥ $100)",
-        key=f"{prefix}_arch_sleeper_only",
-        on_change=_sync_widget,
-        args=(f"{prefix}_arch_sleeper_only", "arch_sleeper_only"),
-    )
-
-
 def render_arch_filter_controls() -> dict:
-    """Render synchronized sidebar and mobile-first main-page filters for unified Past Archive."""
+    """Render Nellis-style Search-on-top, Date strip, horizontal Toolbar, and Accordion Drawer for Past Archive."""
     arch_defaults = _get_arch_defaults()
     _init_filter_state(arch_defaults)
 
-    badge_count = sum([
-        st.session_state["arch_date_preset"] != "All Time",
+    filter_count = sum([
+        st.session_state["arch_date_preset"] != "All",
         st.session_state["arch_wh"] != "All",
         st.session_state["arch_cond"] != "All",
         st.session_state["arch_sort"] != "Most Recently Closed",
         st.session_state["arch_cat"] != "All Categories",
-        int(st.session_state["arch_min_retail"]) > 0,
+        int(st.session_state["arch_min_retail"]) > 0 or int(st.session_state["arch_max_retail"]) > 0,
         int(st.session_state["arch_max_bid"]) < 1000,
         int(st.session_state["arch_min_disc"]) > 0,
         bool(st.session_state["arch_settled_only"]),
         bool(st.session_state["arch_sleeper_only"]),
     ])
-    is_dirty = badge_count > 0 or bool(str(st.session_state["arch_kw"]).strip()) or int(st.session_state["arch_page_size"]) != 40
+    is_dirty = filter_count > 0 or bool(str(st.session_state["arch_kw"]).strip()) or int(st.session_state["arch_page_size"]) != 40
 
     with st.sidebar:
-        sh_col, sr_col = _st_columns([2.2, 1], vertical_alignment="center")
-        with sh_col:
-            st.subheader("🗄️ Archive Filters")
-        with sr_col:
-            st.button(
-                "↺ Reset",
-                key="sb_arch_reset",
-                on_click=_reset_filter_group,
-                args=(arch_defaults,),
-                disabled=not is_dirty,
-                **_stretch_kwargs(st.button),
-            )
-        _render_arch_field_group("sb", include_search=True)
+        _render_nellis_arch_facets("sb", include_window=True, filter_count=filter_count, is_dirty=is_dirty)
 
-    _render_inline_search_and_popover(
-        placeholder="🔍 Search past auctions & steals (e.g. Pixel, Dyson, Monitor)...",
-        search_label="Search Archive",
-        search_key="top_arch_kw",
-        canonical_kw_key="arch_kw",
-        badge_count=badge_count,
-        render_fields_fn=_render_arch_field_group,
-        pop_reset_key="pop_arch_reset",
-        top_reset_key="top_arch_reset",
+    # 1. Search prominently on top
+    st.text_input(
+        "Search Archive",
+        placeholder="🔍 Search past Nellis lots (e.g. Pixel, Dyson, Monitor, Drill)...",
+        label_visibility="collapsed",
+        key="top_arch_kw",
+        on_change=_sync_widget,
+        args=("top_arch_kw", "arch_kw"),
+    )
+    # 2. Compact date window chips
+    _render_chip_selector(
+        "Date window",
+        ARCH_DATE_CHIPS,
+        key="top_arch_date_preset",
+        on_change=_sync_segmented,
+        args=("top_arch_date_preset", "arch_date_preset", ARCH_DATE_CHIPS),
+    )
+    if st.session_state.get("arch_date_preset") == "Custom":
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            st.date_input("From", key="top_arch_start", on_change=_sync_widget, args=("top_arch_start", "arch_start"))
+        with dc2:
+            st.date_input("To", key="top_arch_end", on_change=_sync_widget, args=("top_arch_end", "arch_end"))
+
+    # 3. Sleek 1-row toolbar: Filters (N) | 90%+ Steals | Clear
+    arch_steal_on = int(st.session_state["arch_min_disc"]) >= 90 and bool(st.session_state["arch_settled_only"])
+    _render_nellis_toolbar(
+        filter_count=filter_count,
+        steal_label=("🏆 90%+ Steals ✓" if arch_steal_on else "🏆 90%+ Steals"),
+        steal_active=arch_steal_on,
+        steal_on_click=_toggle_arch_steal,
+        steal_key="top_arch_steal_btn",
+        clear_key="top_arch_reset",
         defaults=arch_defaults,
         is_dirty=is_dirty,
+        render_facets_fn=_render_nellis_arch_facets,
+        pop_reset_key="pop_arch_reset",
     )
-
-    cur_pills = _compute_arch_pills()
-    st.session_state["_prev_arch_quick_pills"] = cur_pills
-    st.session_state["arch_quick_pills"] = cur_pills
-    _render_quick_pills("Archive Quick Views", ARCH_QUICK_PILLS, key="arch_quick_pills", on_change=_on_arch_pills_change)
-
-    parts = [st.session_state["arch_date_preset"]]
-    if st.session_state["arch_settled_only"]:
-        parts.append("✅ Settled Sales Only")
-    else:
-        parts.append("All Closed Lots")
-    if int(st.session_state["arch_min_disc"]) > 0:
-        parts.append(f"🔥 ≥ {int(st.session_state['arch_min_disc'])}% off")
-    if st.session_state["arch_sleeper_only"]:
-        parts.append("😴 Sleepers")
-    if st.session_state["arch_wh"] != "All":
-        parts.append(f"📍 {st.session_state['arch_wh']}")
-    if st.session_state["arch_cond"] != "All":
-        parts.append(st.session_state["arch_cond"])
-    if st.session_state["arch_cat"] != "All Categories":
-        parts.append(f"🏷️ {st.session_state['arch_cat']}")
-    if int(st.session_state["arch_min_retail"]) > 0:
-        parts.append(f"MSRP ≥ ${int(st.session_state['arch_min_retail'])}")
-    if int(st.session_state["arch_max_bid"]) < 1000:
-        parts.append(f"Bid ≤ ${int(st.session_state['arch_max_bid'])}")
-    if str(st.session_state["arch_kw"]).strip():
-        parts.append(f"🔍 '{str(st.session_state['arch_kw']).strip()}'")
-    parts.append(f"↕️ {st.session_state['arch_sort']}")
-    st.caption(f"**Archive:** {' · '.join(parts)}")
 
     return {
         "search_kw": str(st.session_state["arch_kw"]),
@@ -2436,7 +2513,9 @@ def render_arch_filter_controls() -> dict:
         "loc_filter": st.session_state["arch_wh"],
         "cond_filter": st.session_state["arch_cond"],
         "sort_by": st.session_state["arch_sort"],
+        "retail_preset": st.session_state["arch_retail_preset"],
         "min_retail": int(st.session_state["arch_min_retail"]),
+        "max_retail": int(st.session_state["arch_max_retail"]),
         "max_bid": int(st.session_state["arch_max_bid"]),
         "cat_filter": st.session_state["arch_cat"],
         "min_disc": int(st.session_state["arch_min_disc"]),
@@ -2450,7 +2529,7 @@ view_mode = render_top_nav()
 
 
 # --- TAB 1: LIVE DEALS (ACTIVE AUCTIONS & SNIPING) ---
-if view_mode == "🎯 Live Deals":
+if view_mode == "Live":
     inject_nellis_card_css()
     f_cfg = render_live_filter_controls()
     search_kw = f_cfg["search_kw"]
@@ -2458,7 +2537,9 @@ if view_mode == "🎯 Live Deals":
     loc_filter = f_cfg["loc_filter"]
     cond_filter = f_cfg["cond_filter"]
     sort_by = f_cfg["sort_by"]
+    retail_preset = f_cfg["retail_preset"]
     min_retail = f_cfg["min_retail"]
+    max_retail = f_cfg["max_retail"]
     max_bid = f_cfg["max_bid"]
     cat_filter = f_cfg["cat_filter"]
     predict_cheap_only = f_cfg["predict_cheap_only"]
@@ -2475,7 +2556,7 @@ if view_mode == "🎯 Live Deals":
 
     filtered_all = pd.DataFrame()
     live_df = pd.DataFrame()
-    short_window_sec = LIVE_TIME_SEC_MAP.get(time_filter, 0) if time_filter != "< 24 hours" else 0
+    short_window_sec = LIVE_TIME_SEC_MAP.get(time_filter, 0) if time_filter != "24h" else 0
 
     with st.spinner("Fetching active lots..."):
         live_df = fetch_live_nellis_lots(
@@ -2487,14 +2568,16 @@ if view_mode == "🎯 Live Deals":
             target_window_sec=short_window_sec,
         )
 
-        # For "< 24 hours" or "All Active", also union any active (closed_at > now()) lots in the Data Lake
-        if time_filter in ("All Active", "< 24 hours"):
+        # For "24h" or "All", also union any active (closed_at > now()) lots in the Data Lake
+        if time_filter in ("All", "24h"):
             where_parts = [
                 "f.closed_at > now()",
                 f"f.retail_price >= {min_retail}",
                 f"f.final_price <= {max_bid}",
             ]
-            if time_filter == "< 24 hours":
+            if max_retail > 0:
+                where_parts.append(f"f.retail_price <= {max_retail}")
+            if time_filter == "24h":
                 where_parts.append("f.closed_at <= now() + INTERVAL 24 HOUR")
             if loc_filter != "All":
                 where_parts.append(f"f.location = '{loc_filter}'")
@@ -2561,12 +2644,16 @@ if view_mode == "🎯 Live Deals":
             live_df["diff_sec"] = (pd.to_numeric(live_df["close_ms"], errors="coerce").fillna(0) - now_ms_live) / 1000.0
 
         # Exclude expired or about-to-expire (<10s / <20s) lots that flip to POTENTIALLY CLOSED before render
-        min_sec_buffer = 10.0 if time_filter == "< 5 mins" else 20.0
+        min_sec_buffer = 10.0 if time_filter in ("5m", "10m") else 20.0
         filtered = live_df[
             (live_df["diff_sec"] > min_sec_buffer)
             & (live_df["retail_price"] >= min_retail)
             & (live_df["final_price"] <= max_bid)
         ]
+        if max_retail > 0:
+            filtered = filtered[filtered["retail_price"] <= max_retail]
+        if time_filter in LIVE_TIME_SEC_MAP:
+            filtered = filtered[filtered["diff_sec"] <= float(LIVE_TIME_SEC_MAP[time_filter])]
         if cat_filter != "All Categories":
             filtered = filtered[filtered["category_primary"] == cat_filter]
         if loc_filter != "All":
@@ -2674,7 +2761,7 @@ if view_mode == "🎯 Live Deals":
     PAGE_SIZE = page_size_opt
     filter_sig = (
         search_kw.strip(), time_filter, cat_filter, loc_filter, cond_filter,
-        min_retail, max_bid, sort_by, predict_cheap_only, min_hist_sales, min_hist_disc, max_hist_avg, PAGE_SIZE,
+        min_retail, max_retail, max_bid, sort_by, predict_cheap_only, min_hist_sales, min_hist_disc, max_hist_avg, PAGE_SIZE,
     )
     if st.session_state.get("last_filter_sig") != filter_sig:
         st.session_state["last_filter_sig"] = filter_sig
@@ -2692,14 +2779,34 @@ if view_mode == "🎯 Live Deals":
     hist_index = load_historical_price_index()
     open_radar_index = load_open_radar_index()
 
+    live_chips = [LIVE_TIME_DESC.get(time_filter, time_filter)]
+    if cond_filter != "All":
+        live_chips.append(cond_filter)
+    if cat_filter != "All Categories":
+        live_chips.append(cat_filter)
+    if retail_preset != "Any":
+        if retail_preset != "Custom":
+            live_chips.append(f"Retail {retail_preset}")
+        elif max_retail > 0:
+            live_chips.append(f"Retail ${min_retail}–${max_retail}")
+        else:
+            live_chips.append(f"Retail >= ${min_retail}")
+    if max_bid < 1000:
+        live_chips.append(f"Bid <= ${max_bid}")
+    if predict_cheap_only:
+        live_chips.append(f"Steals ({min_hist_disc}%+)")
+
+    _render_nellis_results_header(
+        loc_filter,
+        f"{total_results:,} active lots found",
+        search_kw,
+        live_chips,
+    )
     if total_results > 0:
-        st.write(f"**Found {total_results:,} active lots** (showing {start_idx + 1}–{end_idx}):")
         render_pagination_bar("top", "page_num", current_page, total_pages, start_idx, end_idx, total_results, noun="lots")
-    else:
-        st.write("**Showing 0 active lots:**")
 
     if results_df.empty:
-        st.info("No active items match your filter criteria right now. Tap **Reset** above or widen your filters to see more auctions.")
+        st.info("No active items match your filter criteria right now. Tap **15m**, **1h**, **All**, or **Clear** above to see more auctions.")
     else:
         _render_auction_card_grid(
             results_df.to_dict("records"),
@@ -2718,7 +2825,7 @@ if view_mode == "🎯 Live Deals":
 
 
 # --- TAB 2: PAST ARCHIVE (UNIFIED HISTORICAL SEARCH & TOP DEALS) ---
-elif view_mode == "🗄️ Past Archive":
+elif view_mode == "Archive":
     inject_nellis_card_css()
     a_cfg = render_arch_filter_controls()
     a_kw = a_cfg["search_kw"]
@@ -2728,7 +2835,9 @@ elif view_mode == "🗄️ Past Archive":
     a_loc = a_cfg["loc_filter"]
     a_cond = a_cfg["cond_filter"]
     a_sort = a_cfg["sort_by"]
+    a_retail_preset = a_cfg["retail_preset"]
     a_min_retail = a_cfg["min_retail"]
+    a_max_retail = a_cfg["max_retail"]
     a_max_bid = a_cfg["max_bid"]
     a_cat = a_cfg["cat_filter"]
     a_min_disc = a_cfg["min_disc"]
@@ -2742,19 +2851,21 @@ elif view_mode == "🗄️ Past Archive":
         f"f.retail_price >= {a_min_retail}",
         f"f.final_price <= {a_max_bid}",
     ]
+    if a_max_retail > 0:
+        where_parts.append(f"f.retail_price <= {a_max_retail}")
     if a_min_disc > 0:
         where_parts.append("f.retail_price > 0")
         where_parts.append(f"ROUND((1.0 - f.discount_ratio) * 100.0, 1) >= {a_min_disc}")
 
-    if a_date_preset == "Last 24h":
+    if a_date_preset == "24h":
         where_parts.append("f.closed_at >= now() - INTERVAL 24 HOUR")
-    elif a_date_preset == "Last 3 Days":
+    elif a_date_preset == "3d":
         where_parts.append("f.closed_at >= now() - INTERVAL 3 DAY")
-    elif a_date_preset == "Last 7 Days":
+    elif a_date_preset == "7d":
         where_parts.append("f.closed_at >= now() - INTERVAL 7 DAY")
-    elif a_date_preset == "Last 30 Days":
+    elif a_date_preset == "30d":
         where_parts.append("f.closed_at >= now() - INTERVAL 30 DAY")
-    elif a_date_preset == "Custom Range" and a_start_date and a_end_date:
+    elif a_date_preset == "Custom" and a_start_date and a_end_date:
         where_parts.append(f"CAST(f.closed_at AS DATE) >= DATE '{a_start_date.isoformat()}'")
         where_parts.append(f"CAST(f.closed_at AS DATE) <= DATE '{a_end_date.isoformat()}'")
 
@@ -2832,7 +2943,7 @@ elif view_mode == "🗄️ Past Archive":
             arch_df = arch_df[arch_df["_search_score"] >= 0.65]
 
     if arch_df.empty:
-        st.info("No past closed lots match your filters. Try tapping **Reset** or widening the Date Window / Discount threshold.")
+        st.info("No past closed lots match your filters. Try tapping **Clear** or widening the Date window / Discount threshold.")
     else:
         total_arch = len(arch_df)
         sql_total_arch = int(arch_df["_sql_total_count"].max() or 0) if "_sql_total_count" in arch_df.columns else total_arch
@@ -2907,7 +3018,7 @@ elif view_mode == "🗄️ Past Archive":
         arch_sig = (
             a_kw.strip(), a_date_preset, str(a_start_date), str(a_end_date),
             a_min_disc, a_settled_only, a_sleeper_only, a_cat, a_loc, a_cond,
-            a_min_retail, a_max_bid, a_sort, ARCH_PAGE_SIZE,
+            a_min_retail, a_max_retail, a_max_bid, a_sort, ARCH_PAGE_SIZE,
         )
         if st.session_state.get("arch_last_sig") != arch_sig:
             st.session_state["arch_last_sig"] = arch_sig
@@ -2921,12 +3032,36 @@ elif view_mode == "🗄️ Past Archive":
         arch_page_df = arch_df.iloc[arch_start_i:arch_end_i]
 
         if sql_total_arch > total_arch and total_arch >= 2000:
-            st.write(f"**Found {sql_total_arch:,} closed historical lots** (showing {arch_start_i + 1}–{arch_end_i} of top 2,000):")
+            arch_count_txt = f"{sql_total_arch:,} items found (showing top {total_arch:,})"
         elif sql_total_arch > total_arch:
-            st.write(f"**Found {total_arch:,} matching closed historical lots** (from top 2,000 of {sql_total_arch:,}; showing {arch_start_i + 1}–{arch_end_i}):")
+            arch_count_txt = f"{total_arch:,} items found (from top 2,000 of {sql_total_arch:,})"
         else:
-            st.write(f"**Found {total_arch:,} closed historical lots** (showing {arch_start_i + 1}–{arch_end_i}):")
+            arch_count_txt = f"{total_arch:,} items found"
 
+        arch_chips = []
+        if a_date_preset != "All":
+            arch_chips.append(ARCH_DATE_DESC.get(a_date_preset, a_date_preset))
+        if a_cond != "All":
+            arch_chips.append(a_cond)
+        if a_cat != "All Categories":
+            arch_chips.append(a_cat)
+        if a_retail_preset != "Any":
+            if a_retail_preset != "Custom":
+                arch_chips.append(f"Retail {a_retail_preset}")
+            elif a_max_retail > 0:
+                arch_chips.append(f"Retail ${a_min_retail}–${a_max_retail}")
+            else:
+                arch_chips.append(f"Retail >= ${a_min_retail}")
+        if a_max_bid < 1000:
+            arch_chips.append(f"Bid <= ${a_max_bid}")
+        if a_min_disc > 0:
+            arch_chips.append(f"{a_min_disc}%+ Off")
+        if a_settled_only:
+            arch_chips.append("Settled")
+        if a_sleeper_only:
+            arch_chips.append("Sleepers")
+
+        _render_nellis_results_header(a_loc, arch_count_txt, a_kw, arch_chips)
         render_pagination_bar("arch_top", "arch_page_num", arch_curr_page, arch_total_pages, arch_start_i, arch_end_i, total_arch, noun="lots")
 
         records = arch_page_df.to_dict("records")
@@ -2975,10 +3110,10 @@ elif view_mode == "🗄️ Past Archive":
 
 
 # --- TAB 3: ANALYTICS HUB ---
-elif view_mode == "📊 Analytics":
+elif view_mode == "Analytics":
     with st.sidebar:
         st.subheader("📊 Analytics Hub")
-        st.caption("Filters apply to **🎯 Live Deals** and **🗄️ Past Archive**. Choose one of the 5 Data Lake models on the right.")
+        st.caption("Filters apply to **Live** and **Archive**. Choose one of the 5 Data Lake models on the right.")
     st.title("📊 Nellis Auction Analytical Models")
     st.caption("Sub-second SQL analytics powered by DuckDB columnar processing over Parquet")
 
@@ -3179,10 +3314,10 @@ elif view_mode == "📊 Analytics":
 
 
 # --- TAB 4: SQL STUDIO ---
-elif view_mode == "💻 SQL Studio":
+elif view_mode == "SQL":
     with st.sidebar:
         st.subheader("💻 SQL Studio")
-        st.caption("Run read-only DuckDB queries or ask Gemini in plain English. Switch tabs above to return to deal filters.")
+        st.caption("Run read-only DuckDB queries or ask Gemini in plain English. Switch tabs above to return to **Live** or **Archive**.")
     st.title("💻 Interactive DuckDB SQL Studio")
     st.caption("Ask questions in plain English (powered by Gemini Free Tier) or run custom SQL directly against `fact_auctions`, `fact_bids`, and `dim_products` on Cloudflare R2.")
 
