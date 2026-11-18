@@ -52,7 +52,7 @@ class TestStreamlitUI(unittest.TestCase):
         return mock.patch.dict(os.environ, env)
 
     def test_offline_empty_lake_startup(self):
-        """TC-E2E-001 (NFR-REL-003): Boot cleanly with no R2 creds and empty lake fallback."""
+        """TC-E2E-001 (NFR-REL-003): Boot cleanly with no R2 creds, Option B top nav, and empty lake fallback."""
         now_ms = int(time.time() * 1000)
         self.srv, _ = start_mock_nellis_server(now_ms)
         base_url = f"http://127.0.0.1:{self.srv.server_port}"
@@ -60,14 +60,14 @@ class TestStreamlitUI(unittest.TestCase):
         with self._run_apptest_env({"NELLIS_API_BASE": base_url}):
             at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
             self.assertEqual(len(at.exception), 0, f"Unexpected exceptions: {at.exception}")
-            nav = at.sidebar.radio[0]
+            nav = at.get("segmented_control")[0]
             self.assertEqual(
                 nav.options,
-                ["🎯 Deal Finder", "🏆 Best Past Deals", "📊 Analytics Hub", "💻 SQL Studio"],
+                ["Live Deals", "Past Archive", "Analytics", "SQL Studio"],
             )
 
     def test_deal_finder_short_window_and_likely_cheap_filter(self):
-        """TC-E2E-002 (CR-01 & CR-04): < 15m excludes >15m items; Likely Cheap hides $28 (> $10 avg) lot."""
+        """TC-E2E-002 (CR-01 & CR-04): < 15m pill syncs sidebar; Steals Tonight hides >avg lot; Reset clears."""
         seed_local_data_lake(self.lake_dir)
         now_ms = int(time.time() * 1000)
         self.srv, _ = start_mock_nellis_server(now_ms)
@@ -77,16 +77,18 @@ class TestStreamlitUI(unittest.TestCase):
             at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
             self.assertEqual(len(at.exception), 0)
 
-            # Switch Time Remaining to < 15 mins (Live)
-            at.sidebar.selectbox[0].set_value("⚡ Ending in < 15 mins (Live)").run()
+            # Tap quick pill for < 15m and verify sidebar Time Left synced cleanly
+            at.get("pills")[0].set_value(["⚡ < 15m"]).run()
             self.assertEqual(len(at.exception), 0)
+            self.assertEqual(at.sidebar.selectbox(key="sb_live_time").value, "< 15 mins")
             all_md = "\n".join(m.value for m in at.markdown)
             self.assertIn("Found 2 active lots", all_md)
             self.assertNotIn("Late Closing Lamp", all_md)
 
-            # Enable Likely Cheap Tonight (lower min_hist_disc to 50 and max_hist_avg to 25 so $10 avg 75% off passes)
-            at.sidebar.checkbox(key="predict_cheap_only").set_value(True).run()
-            at.sidebar.number_input(key="min_hist_disc").set_value(50).run()
+            # Tap '🔮 Steals Tonight' pill, verify sidebar checkbox synced, lower min_hist_disc to 50
+            at.get("pills")[0].set_value(["⚡ < 15m", "🔮 Steals Tonight"]).run()
+            self.assertTrue(at.sidebar.checkbox(key="sb_live_predict_cheap").value)
+            at.sidebar.number_input(key="sb_live_min_disc").set_value(50).run()
             self.assertEqual(len(at.exception), 0)
 
             filtered_md = "\n".join(m.value for m in at.markdown)
@@ -94,8 +96,21 @@ class TestStreamlitUI(unittest.TestCase):
             self.assertIn("$5.00", filtered_md)
             self.assertNotIn("$28.00", filtered_md)
 
+            # Verify two-way sync across pills <-> popover <-> sidebar & 1-click Reset
+            at.get("pills")[0].set_value(["⚡ < 15m", "📍 Mesa"]).run()
+            self.assertEqual(at.sidebar.selectbox(key="sb_live_wh").value, "Mesa")
+            self.assertEqual(at.selectbox(key="top_live_wh").value, "Mesa")
+
+            at.text_input(key="top_live_kw").set_value("Scanner").run()
+            self.assertEqual(at.sidebar.text_input(key="sb_live_kw").value, "Scanner")
+            at.button(key="top_live_reset").click().run()
+            self.assertEqual(at.sidebar.text_input(key="sb_live_kw").value, "")
+            self.assertEqual(at.sidebar.selectbox(key="sb_live_time").value, "< 5 mins")
+            self.assertEqual(at.sidebar.selectbox(key="sb_live_wh").value, "All")
+            self.assertFalse(at.sidebar.checkbox(key="sb_live_predict_cheap").value)
+
     def test_deal_finder_archive_mode(self):
-        """TC-E2E-003 (CR-06): Archive Mode queries full lake, searches unverified closed lots ('pixel'), and filters settled."""
+        """TC-E2E-003 (CR-06): Unified Past Archive searches full lake ('pixel') and filters settled sales."""
         seed_local_data_lake(self.lake_dir)
         now_ms = int(time.time() * 1000)
         self.srv, _ = start_mock_nellis_server(now_ms)
@@ -103,26 +118,28 @@ class TestStreamlitUI(unittest.TestCase):
 
         with self._run_apptest_env({"NELLIS_API_BASE": base_url}):
             at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
-            at.sidebar.selectbox[0].set_value("🗄️ Closed / Historical Archive").run()
+            at.get("segmented_control")[0].set_value("🗄️ Past Archive").run()
             self.assertEqual(len(at.exception), 0)
             md_text = "\n".join(m.value for m in at.markdown)
             self.assertIn("WINNING PRICE", md_text)
             self.assertIn("DeWalt 20V MAX Brushless Drill Kit", md_text)
 
-            # Search 'pixel' -> must find unverified historical Lot 1006 across the full lake
-            at.sidebar.text_input[0].set_value("pixel").run()
+            # Search 'pixel' via inline main search bar -> syncs sidebar & finds Lot 1006 across full lake
+            at.text_input(key="top_arch_kw").set_value("pixel").run()
             self.assertEqual(len(at.exception), 0)
+            self.assertEqual(at.sidebar.text_input(key="sb_arch_kw").value, "pixel")
             pixel_md = "\n".join(m.value for m in at.markdown)
             self.assertIn("Google Pixel 9 Pro Unlocked Case Bundle", pixel_md)
 
-            # Restrict to Settled WON FOR Sales Only -> excludes Lot 1006 (is_closed=False in lake)
-            at.sidebar.checkbox(key="arch_verified_only").set_value(True).run()
+            # Tap '✅ Settled Only' pill -> syncs checkbox & excludes Lot 1006 (is_closed=False in lake)
+            at.get("pills")[0].set_value(["✅ Settled Only"]).run()
+            self.assertTrue(at.sidebar.checkbox(key="sb_arch_settled_only").value)
             self.assertEqual(len(at.exception), 0)
             settled_only_md = "\n".join(m.value for m in at.markdown)
             self.assertNotIn("Google Pixel 9 Pro Unlocked Case Bundle", settled_only_md)
 
     def test_best_past_deals_tab_and_sleeper_filter(self):
-        """TC-E2E-004 (CR-05): Best Past Deals sleeper & discount filters work accurately."""
+        """TC-E2E-004 (CR-05): Past Archive Top Steals (90%+) & Sleepers presets match Past Deals behavior."""
         seed_local_data_lake(self.lake_dir)
         now_ms = int(time.time() * 1000)
         self.srv, _ = start_mock_nellis_server(now_ms)
@@ -130,10 +147,14 @@ class TestStreamlitUI(unittest.TestCase):
 
         with self._run_apptest_env({"NELLIS_API_BASE": base_url}):
             at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
-            at.sidebar.radio[0].set_value("🏆 Best Past Deals").run()
+            at.get("segmented_control")[0].set_value("🗄️ Past Archive").run()
             self.assertEqual(len(at.exception), 0)
-            at.sidebar.checkbox(key="pd_sleeper_only").set_value(True).run()
+
+            # Tap '🏆 Top Steals (90%+)' + '😴 Sleepers' quick pills
+            at.get("pills")[0].set_value(["🏆 Top Steals (90%+)", "😴 Sleepers"]).run()
             self.assertEqual(len(at.exception), 0)
+            self.assertEqual(int(at.sidebar.number_input(key="sb_arch_min_disc").value), 90)
+            self.assertTrue(at.sidebar.checkbox(key="sb_arch_sleeper_only").value)
             md_text = "\n".join(m.value for m in at.markdown)
             self.assertIn("DeWalt 20V MAX Brushless Drill Kit", md_text)
             self.assertNotIn("UMEIJA", md_text)
@@ -147,7 +168,7 @@ class TestStreamlitUI(unittest.TestCase):
 
         with self._run_apptest_env({"NELLIS_API_BASE": base_url}):
             at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
-            at.sidebar.radio[0].set_value("📊 Analytics Hub").run()
+            at.get("segmented_control")[0].set_value("📊 Analytics").run()
             self.assertEqual(len(at.exception), 0)
 
             sel = at.selectbox[0]
@@ -170,7 +191,7 @@ class TestStreamlitUI(unittest.TestCase):
 
         with self._run_apptest_env({"NELLIS_API_BASE": base_url}):
             at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
-            at.sidebar.radio[0].set_value("💻 SQL Studio").run()
+            at.get("segmented_control")[0].set_value("💻 SQL Studio").run()
             self.assertEqual(len(at.exception), 0)
 
             # Click "💡 Sniping in Last 60s" example button

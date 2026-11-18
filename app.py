@@ -5,6 +5,7 @@ Cloud-ready Streamlit application queryable from phone, tablet, or desktop.
 """
 
 import ast
+import datetime as _dt
 import difflib
 import json
 import math
@@ -690,7 +691,7 @@ def build_fuzzy_sql_where(query: str) -> str:
 def fetch_live_nellis_lots(
     search_kw: str = "",
     loc_filter: str = "All",
-    sort_by: str = "⏳ Closing Soonest (Sniper)",
+    sort_by: str = "Closing Soonest",
     page_size: int = 240,
     max_pages: int = 10,
     target_window_sec: int = 0,
@@ -716,10 +717,12 @@ def fetch_live_nellis_lots(
             eff_max_pages = max(max_pages, 25 if target_window_sec >= 1800 else 18)
         else:
             nellis_sort = {
+                "Closing Soonest": "time_remaining_asc",
                 "⏳ Closing Soonest (Sniper)": "time_remaining_asc",
+                "Lowest Current Bid ($)": "current_price_asc",
                 "Lowest Final Bid ($)": "current_price_asc",
                 "Highest Retail MSRP ($)": "retail_price_desc",
-                "Highest Discount (%)": "time_remaining_asc"
+                "Highest Discount (%)": "time_remaining_asc",
             }.get(sort_by, "time_remaining_asc")
             eff_max_pages = max_pages
 
@@ -1222,11 +1225,100 @@ def load_open_radar_index():
     return {"by_img": by_img, "by_sig": by_sig}
 
 
+def validate_readonly_sql(sql_text: str) -> str:
+    """Ensure SQL Studio queries are strictly single-statement read-only SELECT / WITH queries."""
+    s = re.sub(r"^```(?:sql)?\s*|\s*```$", "", (sql_text or "").strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
+    s = re.sub(r";+\s*$", "", s).strip()
+    if ";" in s:
+        raise ValueError("Only a single read-only SELECT statement is permitted.")
+    if not re.match(r"^(SELECT|WITH)\b", s, re.IGNORECASE):
+        raise ValueError("Generated query must start with SELECT or WITH.")
+    if re.search(
+        r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|ATTACH|DETACH|COPY|TRUNCATE|PRAGMA|EXPORT|IMPORT|CALL|INSTALL|LOAD)\b",
+        s,
+        re.IGNORECASE,
+    ):
+        raise ValueError("Only read-only SELECT queries are permitted.")
+    return s
+
+
+def enrich_categories(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Populate normalized `category_primary` and `category_secondary` columns on a DataFrame."""
+    if df_in.empty:
+        return df_in
+    df_out = df_in.copy()
+    if "category_primary" not in df_out.columns:
+        df_out["category_primary"] = ""
+    if "category_secondary" not in df_out.columns:
+        df_out["category_secondary"] = ""
+
+    cats = [
+        classify_product_category(t, cp, cs)
+        for t, cp, cs in zip(
+            df_out["title"].fillna(""),
+            df_out["category_primary"].fillna(""),
+            df_out["category_secondary"].fillna(""),
+        )
+    ]
+    df_out["category_primary"] = [c[0] for c in cats]
+    df_out["category_secondary"] = [c[1] for c in cats]
+    return df_out
+
+
+def normalize_df_conditions(df_in: pd.DataFrame) -> pd.DataFrame:
+    """Normalize condition strings consistently across Live Deals and Past Archive DataFrames."""
+    if df_in.empty:
+        return df_in
+    df_out = df_in.copy()
+    notes_col = df_out["damage_notes"].fillna("") if "damage_notes" in df_out.columns else [""] * len(df_out)
+    comp_col = df_out["completeness"].fillna("") if "completeness" in df_out.columns else [""] * len(df_out)
+    func_col = df_out["functional_status"].fillna("") if "functional_status" in df_out.columns else [""] * len(df_out)
+    df_out["condition"] = [
+        "Incomplete / Damaged / Parts"
+        if (str(cp).lower() in ("incomplete", "partial") or str(fn).lower() in ("non-functional", "broken"))
+        else format_clean_condition(c, t, n)
+        for c, t, n, cp, fn in zip(df_out["condition"].fillna(""), df_out["title"].fillna(""), notes_col, comp_col, func_col)
+    ]
+    return df_out
+
+
 def inject_nellis_card_css():
-    """Inject shared high-contrast Nellis-style card CSS for 4-column desktop & mobile grid."""
+    """Inject shared card, filter-bar, slim number-stepper, and responsive Refresh FAB CSS."""
     st.markdown(
         """
         <style>
+        /* Floating Refresh FAB: top-right on desktop, thumb-safe bottom-right above Manage app on mobile */
+        .st-key-refresh_live_btn,
+        div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] {
+            position: fixed !important;
+            top: 64px !important;
+            right: 18px !important;
+            bottom: auto !important;
+            left: auto !important;
+            z-index: 9999 !important;
+            width: auto !important;
+        }
+        .st-key-refresh_live_btn button,
+        div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] button {
+            border-radius: 999px !important;
+            padding: 0.55rem 1.25rem !important;
+            font-weight: 700 !important;
+            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45) !important;
+        }
+        @media (max-width: 768px) {
+            .st-key-refresh_live_btn,
+            div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] {
+                top: auto !important;
+                bottom: 58px !important;
+                right: 14px !important;
+            }
+        }
+        /* Keep 2-column number inputs inside sidebar and popover readable without clipping digits */
+        [data-testid="stSidebar"] [data-testid="stNumberInputContainer"] button,
+        [data-testid="stPopoverBody"] [data-testid="stNumberInputContainer"] button {
+            padding-left: 4px !important;
+            padding-right: 4px !important;
+        }
         .nellis-card-img-wrap {
             width: 100%;
             height: 170px;
@@ -1393,106 +1485,1033 @@ def inject_nellis_card_css():
     )
 
 
-st.markdown('<div id="nellis-top-anchor"></div>', unsafe_allow_html=True)
-
-
-# --- SIDEBAR CONTROLS ---
-view_mode = st.sidebar.radio("Navigation", ["🎯 Deal Finder", "🏆 Best Past Deals", "📊 Analytics Hub", "💻 SQL Studio"])
-
-
-# --- TAB 1: DEAL FINDER ---
-if view_mode == "🎯 Deal Finder":
-    # Build sorted list of primary categories for Left Sidebar Filter
-    PRIMARY_CATEGORIES = ["All Categories"] + sorted({p for p, _, _ in CATEGORY_RULES} | {"Home & General"})
-
-    # Left Sidebar Filter Navigation (Directly below Navigation)
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🎛️ Filter Listings")
-    search_kw = st.sidebar.text_input("🔍 Search Keyword", placeholder="e.g. DeWalt, Dyson, Lego, Speaker...")
-    time_filter = st.sidebar.selectbox(
-        "⏳ Time Remaining / Status",
-        [
-            "🔥 Ending in < 5 mins (Live)",
-            "⚡ Ending in < 15 mins (Live)",
-            "⏳ Ending in < 30 mins (Live)",
-            "🕒 Ending in < 1 hour (Live)",
-            "📅 Ending Today (< 24 hrs)",
-            "All Active Lots",
-            "🗄️ Closed / Historical Archive",
-        ]
-    )
-    is_archive_mode = (time_filter == "🗄️ Closed / Historical Archive")
-
-    cat_filter = "All Categories"
-    loc_filter = "All"
-    cond_filter = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"])
-    sort_options = (
-        [
-            "🕒 Most Recently Closed",
-            "Highest Discount (%)",
-            "Lowest Winning Bid ($)",
-            "Highest Retail MSRP ($)",
-        ]
-        if is_archive_mode
-        else [
-            "⏳ Closing Soonest (Sniper)",
-            "🔮 Predicted Best Steal (Lowest Hist Avg)",
-            "🔥 Highest Hist Avg % Off",
-            "Highest Discount (%)",
-            "Lowest Final Bid ($)",
-            "Highest Retail MSRP ($)",
-        ]
-    )
-    sort_by = st.sidebar.selectbox("↕️ Sort By", sort_options)
-
-    predict_cheap_only = False
-    verified_archive_only = False
-    min_hist_sales = 2
-    min_hist_disc = 85
-    max_hist_avg = 25
-    if is_archive_mode:
-        verified_archive_only = st.sidebar.checkbox(
-            "✅ Settled WON FOR Sales Only",
-            value=False,
-            key="arch_verified_only",
-            help="Unchecked searches ALL closed lots in the Data Lake (visible cards are live-checked automatically).",
+def render_pagination_bar(
+    key_prefix: str,
+    page_state_key: str,
+    current_page: int,
+    total_pages: int,
+    start_idx: int,
+    end_idx: int,
+    total_results: int,
+    noun: str = "lots",
+):
+    """Render standardized Previous / Next pagination strip with top-scroll behavior."""
+    if total_results == 0 or total_pages <= 1:
+        return
+    p_col1, p_col2, p_col3 = st.columns([1.5, 3, 1.5])
+    with p_col1:
+        if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(current_page <= 1), width="stretch"):
+            st.session_state[page_state_key] = current_page - 1
+            st.session_state["_scroll_to_top"] = True
+            st.rerun()
+    with p_col2:
+        st.markdown(
+            f"<div style='text-align:center; padding-top:6px; font-weight:600;'>"
+            f"Page {current_page} of {total_pages} &nbsp;·&nbsp; Showing {start_idx + 1}–{end_idx} of {total_results:,} {noun}"
+            f"</div>",
+            unsafe_allow_html=True,
         )
+    with p_col3:
+        if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(current_page >= total_pages), width="stretch"):
+            st.session_state[page_state_key] = current_page + 1
+            st.session_state["_scroll_to_top"] = True
+            st.rerun()
+
+
+def _format_live_countdown_badge(diff_sec_raw, closed_at_val) -> str:
+    try:
+        diff_sec = float(diff_sec_raw or 0)
+        if diff_sec <= 0:
+            return "🔴 <b>POTENTIALLY CLOSED</b>"
+        if diff_sec < 180:
+            return f"🔥 <b>{int(diff_sec // 60)}m {int(diff_sec % 60):02d}s left (SNIPE!)</b>"
+        if diff_sec < 600:
+            return f"⚡ <b>{int(diff_sec // 60)}m {int(diff_sec % 60):02d}s left</b>"
+        if diff_sec < 3600:
+            return f"⏳ <b>{int(diff_sec // 60)}m left</b>"
+        hours = int(diff_sec // 3600)
+        mins = int((diff_sec % 3600) // 60)
+        return f"🕒 <b>{hours}h {mins}m left</b>"
+    except Exception:
+        return f"Closes: {str(closed_at_val)[:16]}"
+
+
+def _render_countdown_script():
+    components.html(
+        """
+        <script>
+        (function() {
+            function tickCountdowns() {
+                try {
+                    const parentDoc = window.parent.document;
+                    if (!parentDoc) return;
+                    const badges = parentDoc.querySelectorAll('.nellis-countdown-badge[data-close-ms]');
+                    const now = Date.now();
+                    badges.forEach(badge => {
+                        const closeMs = parseInt(badge.getAttribute('data-close-ms'));
+                        if (!closeMs || isNaN(closeMs)) return;
+                        const totalSec = Math.floor((closeMs - now) / 1000);
+                        if (totalSec <= 0) {
+                            badge.innerHTML = "🔴 <b>POTENTIALLY CLOSED</b> <span style='font-size:10px; opacity:0.8;'>(anti-snipe)</span>";
+                            badge.style.backgroundColor = "#334155";
+                            badge.style.color = "#cbd5e1";
+                            badge.style.borderColor = "#64748b";
+                        } else {
+                            const mins = Math.floor(totalSec / 60);
+                            const secs = totalSec % 60;
+                            const secStr = secs < 10 ? '0' + secs : secs;
+                            if (totalSec < 180) {
+                                badge.innerHTML = "🔥 <b>" + mins + "m " + secStr + "s left (SNIPE!)</b>";
+                                badge.style.backgroundColor = "#450a0a";
+                                badge.style.color = "#fca5a5";
+                                badge.style.borderColor = "#ef4444";
+                            } else if (totalSec < 600) {
+                                badge.innerHTML = "⚡ <b>" + mins + "m " + secStr + "s left</b>";
+                                badge.style.backgroundColor = "#451a03";
+                                badge.style.color = "#fcd34d";
+                                badge.style.borderColor = "#f59e0b";
+                            } else if (totalSec < 3600) {
+                                badge.innerHTML = "⏳ <b>" + mins + "m left</b>";
+                                badge.style.backgroundColor = "#172554";
+                                badge.style.color = "#93c5fd";
+                                badge.style.borderColor = "#3b82f6";
+                            } else {
+                                const hours = Math.floor(totalSec / 3600);
+                                const remMins = Math.floor((totalSec % 3600) / 60);
+                                badge.innerHTML = "🕒 <b>" + hours + "h " + remMins + "m left</b>";
+                                badge.style.backgroundColor = "#0f172a";
+                                badge.style.color = "#cbd5e1";
+                                badge.style.borderColor = "#334155";
+                            }
+                        }
+                    });
+                } catch (e) {}
+            }
+            tickCountdowns();
+            if (window.parent && !window.parent.__nellisTimer) {
+                window.parent.__nellisTimer = setInterval(tickCountdowns, 1000);
+            } else if (!window.__nellisTimer) {
+                window.__nellisTimer = setInterval(tickCountdowns, 1000);
+            }
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _render_auction_card_grid(
+    records: list[dict],
+    is_archive_mode: bool,
+    hist_index: dict,
+    open_radar_index: dict,
+    btn_key_prefix: str = "btn_hist",
+    min_hist_sales: int = 2,
+    min_hist_disc: int = 85,
+    max_hist_avg: int = 25,
+):
+    """Render responsive 4-column card grid for Live Deals or unified Past Archive."""
+    verified_page_hist = batch_verify_rows_history(records, hist_index, same_condition_only=True)
+    for row_start in range(0, len(records), 4):
+        grid_cols = st.columns(4)
+        for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
+            auction_id = int(row_dict["auction_id"])
+            item_url = f"https://www.nellisauction.com/p/item/{auction_id}"
+            cur_bid = float(row_dict.get("final_price") or 0)
+            msrp = float(row_dict.get("retail_price") or 0)
+            disc_pct_val = float(row_dict.get("discount_pct") or 0)
+            savings_val = float(row_dict.get("dollar_savings") or max(0.0, msrp - cur_bid))
+            cond_display = format_clean_condition(row_dict.get("condition"))
+            cond_tier = get_condition_tier(cond_display)
+            cat_primary = row_dict.get("category_primary") or "Home & General"
+            cat_secondary = row_dict.get("category_secondary") or "Miscellaneous"
+
+            past_matches = verified_page_hist.get(auction_id, [])
+            open_matches = [
+                c for c in find_open_radar_matches(row_dict, open_radar_index)
+                if int(c.get("auction_id") or 0) != auction_id
+            ]
+            cheaper_in_batch = []
+            if not is_archive_mode and open_matches:
+                cheaper_in_batch = [
+                    c for c in open_matches
+                    if float(c.get("final_price") or 0) < cur_bid
+                    and get_condition_tier(c.get("condition")) == cond_tier
+                ]
+
+            with grid_cols[col_idx]:
+                with st.container(border=True):
+                    photo = row_dict.get("photo_url")
+                    img_src = str(photo).strip() if photo and str(photo) != "nan" and str(photo).strip() else "https://placehold.co/300x200?text=No+Photo"
+                    st.markdown(
+                        f'<a href="{item_url}" target="_blank"><div class="nellis-card-img-wrap"><img src="{img_src}" alt="Item"/></div></a>',
+                        unsafe_allow_html=True,
+                    )
+                    st.markdown(
+                        f'<div class="nellis-cat-pill" title="{cat_primary} → {cat_secondary}">🏷️ {cat_primary} → {cat_secondary}</div>',
+                        unsafe_allow_html=True,
+                    )
+                    safe_title = str(row_dict.get("title") or "Untitled").replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+                    st.markdown(
+                        f'<div class="nellis-card-title" title="{safe_title}"><a href="{item_url}" target="_blank">{safe_title}</a></div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    bid_label = "WINNING PRICE" if is_archive_mode else "CURRENT PRICE"
+                    if is_archive_mode:
+                        arch_badge = row_dict.get("_arch_status_badge") or "✅ Verified Won"
+                        time_cell_html = (
+                            f'<div style="font-size:11.5px; font-weight:700; color:#475569;">🏁 {str(row_dict.get("closed_at"))[:16]}</div>'
+                            f'<div style="font-size:10px; font-weight:700; color:#1d4ed8; margin-top:2px;">{arch_badge}</div>'
+                        )
+                    else:
+                        close_epoch_ms = int(row_dict.get("close_ms") or 0)
+                        time_badge = _format_live_countdown_badge(row_dict.get("diff_sec"), row_dict.get("closed_at"))
+                        time_cell_html = (
+                            f'<span class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" '
+                            f'style="display:inline-block; font-weight:700; padding:2px 6px; border-radius:6px; font-size:12px; '
+                            f'background-color:#450a0a; color:#fca5a5; border:1px solid #ef4444;">{time_badge}</span>'
+                        )
+
+                    st.markdown(
+                        f"""
+                        <div class="nellis-stat-grid">
+                            <div class="nellis-stat-box">
+                                <div class="nellis-stat-label">{"CLOSED" if is_archive_mode else "TIME LEFT"}</div>
+                                <div class="nellis-stat-val">{time_cell_html}</div>
+                            </div>
+                            <div class="nellis-stat-box">
+                                <div class="nellis-stat-label">{bid_label}</div>
+                                <div class="nellis-stat-val">${cur_bid:,.2f} <span class="nellis-disc-badge">({disc_pct_val:.0f}% off)</span></div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    third_col_html = (
+                        f'<div><div class="nellis-meta-item-label">SAVED</div><div class="nellis-meta-item-val" style="color:#15803d;">${savings_val:,.0f}</div></div>'
+                        if is_archive_mode
+                        else f'<div><div class="nellis-meta-item-label">LOCATION</div><div class="nellis-meta-item-val">📍 {row_dict["location"]}</div></div>'
+                    )
+                    st.markdown(
+                        f"""
+                        <div class="nellis-meta-strip">
+                            <div><div class="nellis-meta-item-label">EST. RETAIL</div><div class="nellis-meta-item-val">${msrp:,.2f}</div></div>
+                            <div><div class="nellis-meta-item-label">BIDS</div><div class="nellis-meta-item-val">{int(row_dict.get("bid_count") or 0)}</div></div>
+                            {third_col_html}
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    m_rating = re.search(r"(\d)/5", cond_display)
+                    if m_rating:
+                        stars_n = int(m_rating.group(1))
+                    elif cond_tier == "New":
+                        stars_n = 5
+                    elif cond_tier == "Open Box / Like New":
+                        stars_n = 4
+                    elif cond_tier == "Used":
+                        stars_n = 3
+                    else:
+                        stars_n = 2
+                    stars_html = f'<span style="color:#facc15;">{"★" * stars_n}</span><span style="color:#475569;">{"☆" * (5 - stars_n)}</span>'
+
+                    tag_cls = "nellis-tag-pill new" if cond_tier == "New" else "nellis-tag-pill"
+                    tags = [cond_display.split("(")[0].strip().lower()]
+                    notes = row_dict.get("damage_notes")
+                    notes_str = str(notes).strip() if notes and str(notes) != "nan" else ""
+                    if "missing" in notes_str.lower():
+                        tags.append("missing parts")
+                    if "damage" in notes_str.lower() or "broken" in notes_str.lower():
+                        tags.append("damaged")
+                    tags_html = "".join(f'<span class="{tag_cls}">{t}</span>' for t in tags[:3])
+                    if is_archive_mode:
+                        tags_html += f' <span class="nellis-tag-pill">📍 {row_dict["location"]}</span>'
+
+                    st.markdown(
+                        f'<div class="nellis-cond-row"><div class="nellis-stars">{stars_html}</div>{tags_html}</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    if notes_str:
+                        safe_notes = notes_str.replace('"', "&quot;").replace("<", "&lt;").replace(">", "&gt;")
+                        st.markdown(
+                            f'<div style="font-size:11.5px; color:#fbbf24; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:4px;" title="{safe_notes}">⚠️ {safe_notes}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    if past_matches:
+                        p_prices = [float(m.get("final_price") or 0) for m in past_matches]
+                        min_won = min(p_prices)
+                        avg_won = sum(p_prices) / len(p_prices)
+                        hist_avg_disc = ((msrp - avg_won) / msrp * 100.0) if msrp > 0 else 0.0
+                        if cur_bid <= min_won:
+                            verdict = "🟢 **Below All-Time Low!**"
+                        elif cur_bid <= avg_won:
+                            verdict = "🟢 **Below Avg Win**"
+                        else:
+                            verdict = f"🔴 **Above Avg (${avg_won:.2f})**"
+                        if (
+                            not is_archive_mode
+                            and cur_bid <= avg_won
+                            and len(past_matches) >= min_hist_sales
+                            and avg_won <= max_hist_avg
+                            and hist_avg_disc >= min_hist_disc
+                        ):
+                            sale_noun = "sale" if len(past_matches) == 1 else "sales"
+                            st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {len(past_matches)} {sale_noun})]**")
+                        st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.2f} ({len(past_matches)}) · {verdict}")
+                    else:
+                        st.caption(f"📊 No past '{cond_tier}' sales yet")
+
+                    if is_archive_mode and open_matches:
+                        cheapest_now = float(open_matches[0].get("final_price") or 0)
+                        open_url = f"https://www.nellisauction.com/p/item/{int(open_matches[0]['auction_id'])}"
+                        st.markdown(f"🟢 **:green[Back Open Tonight!]** ([From ${cheapest_now:.2f} ↗]({open_url}))")
+                    elif cheaper_in_batch:
+                        cheapest_open = min(float(c.get("final_price") or 0) for c in cheaper_in_batch)
+                        st.markdown(f"💡 **:green[{len(cheaper_in_batch)} Cheaper Open (${cheapest_open:.2f})!]**")
+
+                    btn_cls = "nellis-place-bid-btn archive" if is_archive_mode else "nellis-place-bid-btn"
+                    action_label = "VIEW CLOSED LOT ↗" if is_archive_mode else "PLACE BID ↗"
+                    st.markdown(
+                        f'<a class="{btn_cls}" href="{item_url}" target="_blank">{action_label}</a>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button(f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})", key=f"{btn_key_prefix}_{auction_id}", width="stretch"):
+                        show_item_history_dialog(row_dict)
+
+
+# --- TOP NAVIGATION & TWO-WAY FILTER ENGINE ---
+NAV_OPTIONS = ["🎯 Live Deals", "🗄️ Past Archive", "📊 Analytics", "💻 SQL Studio"]
+PRIMARY_CATEGORIES = ["All Categories"] + sorted({p for p, _, _ in CATEGORY_RULES} | {"Home & General"})
+WAREHOUSE_OPTIONS = ["All", "Phoenix", "Mesa"]
+COND_OPTIONS = ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"]
+LIVE_TIME_OPTIONS = ["< 5 mins", "< 15 mins", "< 30 mins", "< 1 hour", "< 24 hours", "All Active"]
+LIVE_TIME_SEC_MAP = {
+    "< 5 mins": 300,
+    "< 15 mins": 900,
+    "< 30 mins": 1800,
+    "< 1 hour": 3600,
+    "< 24 hours": 86400,
+}
+LIVE_SORT_OPTIONS = [
+    "Closing Soonest",
+    "Best Steal (Hist Avg $)",
+    "Highest Hist Avg % Off",
+    "Highest Discount (%)",
+    "Lowest Current Bid ($)",
+    "Highest Retail MSRP ($)",
+]
+ARCH_DATE_OPTIONS = ["All Time", "Last 24h", "Last 3 Days", "Last 7 Days", "Last 30 Days", "Custom Range"]
+ARCH_SORT_OPTIONS = [
+    "Most Recently Closed",
+    "Highest % Off",
+    "Biggest $ Savings",
+    "Lowest Winning Bid ($)",
+    "Highest Retail MSRP ($)",
+]
+LIVE_QUICK_PILLS = ["🔥 < 5m", "⚡ < 15m", "🔮 Steals Tonight", "📍 Phoenix", "📍 Mesa", "🆕 Brand New"]
+ARCH_QUICK_PILLS = ["🏆 Top Steals (90%+)", "😴 Sleepers", "✅ Settled Only", "📅 Last 7 Days", "📍 Phoenix", "📍 Mesa", "🆕 Brand New"]
+
+LIVE_DEFAULTS = {
+    "live_kw": "",
+    "live_time": "< 5 mins",
+    "live_wh": "All",
+    "live_cond": "All",
+    "live_sort": "Closing Soonest",
+    "live_min_retail": 0,
+    "live_max_bid": 1000,
+    "live_cat": "All Categories",
+    "live_predict_cheap": False,
+    "live_min_sales": 2,
+    "live_min_disc": 85,
+    "live_max_hist_avg": 25,
+    "live_page_size": 40,
+}
+
+
+def _get_arch_defaults() -> dict:
+    today_az = _dt.date.today()
+    return {
+        "arch_kw": "",
+        "arch_date_preset": "All Time",
+        "arch_start": today_az - _dt.timedelta(days=7),
+        "arch_end": today_az,
+        "arch_wh": "All",
+        "arch_cond": "All",
+        "arch_sort": "Most Recently Closed",
+        "arch_min_retail": 0,
+        "arch_max_bid": 1000,
+        "arch_cat": "All Categories",
+        "arch_min_disc": 0,
+        "arch_settled_only": False,
+        "arch_sleeper_only": False,
+        "arch_page_size": 40,
+    }
+
+
+def _init_filter_state(defaults: dict):
+    """Initialize canonical filter keys and sync both sidebar (`sb_*`) and main popover (`top_*`) widget mirrors."""
+    for field, default_val in defaults.items():
+        if field not in st.session_state:
+            st.session_state[field] = default_val
+        st.session_state[f"sb_{field}"] = st.session_state[field]
+        st.session_state[f"top_{field}"] = st.session_state[field]
+
+
+def _sync_widget(widget_key: str, canonical_key: str):
+    st.session_state[canonical_key] = st.session_state[widget_key]
+
+
+def _reset_filter_group(defaults: dict):
+    for field, default_val in defaults.items():
+        st.session_state[field] = default_val
+        st.session_state[f"sb_{field}"] = default_val
+        st.session_state[f"top_{field}"] = default_val
+
+
+def _compute_live_pills() -> list[str]:
+    out = []
+    if st.session_state.get("live_time") == "< 5 mins":
+        out.append("🔥 < 5m")
+    elif st.session_state.get("live_time") == "< 15 mins":
+        out.append("⚡ < 15m")
+    if st.session_state.get("live_predict_cheap"):
+        out.append("🔮 Steals Tonight")
+    wh = st.session_state.get("live_wh", "All")
+    if wh == "Phoenix":
+        out.append("📍 Phoenix")
+    elif wh == "Mesa":
+        out.append("📍 Mesa")
+    if st.session_state.get("live_cond") == "Brand New":
+        out.append("🆕 Brand New")
+    return out
+
+
+def _on_live_pills_change():
+    new_set = set(st.session_state.get("live_quick_pills") or [])
+    old_set = set(st.session_state.get("_prev_live_quick_pills") or [])
+    added = new_set - old_set
+    removed = old_set - new_set
+
+    if "🔥 < 5m" in added:
+        st.session_state["live_time"] = "< 5 mins"
+    elif "⚡ < 15m" in added:
+        st.session_state["live_time"] = "< 15 mins"
+    elif ("🔥 < 5m" in removed and st.session_state.get("live_time") == "< 5 mins") or (
+        "⚡ < 15m" in removed and st.session_state.get("live_time") == "< 15 mins"
+    ):
+        st.session_state["live_time"] = "All Active"
+
+    if "🔮 Steals Tonight" in added:
+        st.session_state["live_predict_cheap"] = True
+    elif "🔮 Steals Tonight" in removed:
+        st.session_state["live_predict_cheap"] = False
+
+    if "📍 Phoenix" in added:
+        st.session_state["live_wh"] = "Phoenix"
+    elif "📍 Mesa" in added:
+        st.session_state["live_wh"] = "Mesa"
+    elif ("📍 Phoenix" in removed and st.session_state.get("live_wh") == "Phoenix") or (
+        "📍 Mesa" in removed and st.session_state.get("live_wh") == "Mesa"
+    ):
+        st.session_state["live_wh"] = "All"
+
+    if "🆕 Brand New" in added:
+        st.session_state["live_cond"] = "Brand New"
+    elif "🆕 Brand New" in removed and st.session_state.get("live_cond") == "Brand New":
+        st.session_state["live_cond"] = "All"
+
+
+def _compute_arch_pills() -> list[str]:
+    out = []
+    if int(st.session_state.get("arch_min_disc") or 0) >= 90 and st.session_state.get("arch_settled_only"):
+        out.append("🏆 Top Steals (90%+)")
+    if st.session_state.get("arch_sleeper_only"):
+        out.append("😴 Sleepers")
+    if st.session_state.get("arch_settled_only"):
+        out.append("✅ Settled Only")
+    if st.session_state.get("arch_date_preset") == "Last 7 Days":
+        out.append("📅 Last 7 Days")
+    wh = st.session_state.get("arch_wh", "All")
+    if wh == "Phoenix":
+        out.append("📍 Phoenix")
+    elif wh == "Mesa":
+        out.append("📍 Mesa")
+    if st.session_state.get("arch_cond") == "Brand New":
+        out.append("🆕 Brand New")
+    return out
+
+
+def _on_arch_pills_change():
+    new_set = set(st.session_state.get("arch_quick_pills") or [])
+    old_set = set(st.session_state.get("_prev_arch_quick_pills") or [])
+    added = new_set - old_set
+    removed = old_set - new_set
+
+    if "🏆 Top Steals (90%+)" in added:
+        st.session_state["arch_min_disc"] = 90
+        st.session_state["arch_settled_only"] = True
+        st.session_state["arch_sort"] = "Highest % Off"
+        if st.session_state.get("arch_date_preset") == "All Time":
+            st.session_state["arch_date_preset"] = "Last 7 Days"
+    elif "🏆 Top Steals (90%+)" in removed:
+        st.session_state["arch_min_disc"] = 0
+        if st.session_state.get("arch_sort") == "Highest % Off":
+            st.session_state["arch_sort"] = "Most Recently Closed"
+        if st.session_state.get("arch_date_preset") == "Last 7 Days":
+            st.session_state["arch_date_preset"] = "All Time"
+        st.session_state["arch_settled_only"] = bool(st.session_state.get("arch_sleeper_only"))
+
+    if "😴 Sleepers" in added:
+        st.session_state["arch_sleeper_only"] = True
+        st.session_state["arch_settled_only"] = True
+    elif "😴 Sleepers" in removed:
+        st.session_state["arch_sleeper_only"] = False
+
+    if "✅ Settled Only" in added:
+        st.session_state["arch_settled_only"] = True
+    elif "✅ Settled Only" in removed:
+        st.session_state["arch_settled_only"] = False
+
+    if "📅 Last 7 Days" in added:
+        st.session_state["arch_date_preset"] = "Last 7 Days"
+    elif "📅 Last 7 Days" in removed and st.session_state.get("arch_date_preset") == "Last 7 Days":
+        st.session_state["arch_date_preset"] = "All Time"
+
+    if "📍 Phoenix" in added:
+        st.session_state["arch_wh"] = "Phoenix"
+    elif "📍 Mesa" in added:
+        st.session_state["arch_wh"] = "Mesa"
+    elif ("📍 Phoenix" in removed and st.session_state.get("arch_wh") == "Phoenix") or (
+        "📍 Mesa" in removed and st.session_state.get("arch_wh") == "Mesa"
+    ):
+        st.session_state["arch_wh"] = "All"
+
+    if "🆕 Brand New" in added:
+        st.session_state["arch_cond"] = "Brand New"
+    elif "🆕 Brand New" in removed and st.session_state.get("arch_cond") == "Brand New":
+        st.session_state["arch_cond"] = "All"
+
+
+def _guard_nav_view():
+    if st.session_state.get("nav_view") not in NAV_OPTIONS:
+        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "🎯 Live Deals")
     else:
-        predict_cheap_only = st.sidebar.checkbox(
-            "🔮 Likely Cheap Tonight (Historical Steals)",
-            value=False,
-            key="predict_cheap_only",
-            help="Show active items that previously sold for cheap in the same condition tier.",
-        )
-        if predict_cheap_only:
-            min_hist_sales = st.sidebar.number_input("Min Past Sales", min_value=1, max_value=50, value=2, step=1, key="min_hist_sales")
-            min_hist_disc = st.sidebar.number_input("Min Historical Avg % Off", min_value=50, max_value=99, value=85, step=5, key="min_hist_disc")
-            max_hist_avg = st.sidebar.number_input("Max Historical Avg Price ($)", min_value=1, max_value=5000, value=25, step=5, key="max_hist_avg")
+        st.session_state["_last_nav_view"] = st.session_state["nav_view"]
 
-    with st.sidebar.expander("⚙️ More Filters", expanded=False):
-        cat_filter = st.selectbox("🏷️ Category", PRIMARY_CATEGORIES)
-        loc_filter = st.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"])
-        min_retail = st.number_input(
-            "Minimum Retail MSRP ($)",
+
+def render_top_nav() -> str:
+    """Render top horizontal navigation segmented control cleanly above page content."""
+    st.markdown('<div id="nellis-top-anchor"></div>', unsafe_allow_html=True)
+    if st.session_state.get("nav_view") not in NAV_OPTIONS:
+        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "🎯 Live Deals")
+    chosen = st.segmented_control(
+        "Navigation",
+        NAV_OPTIONS,
+        key="nav_view",
+        label_visibility="collapsed",
+        on_change=_guard_nav_view,
+    )
+    if chosen not in NAV_OPTIONS:
+        chosen = st.session_state.get("_last_nav_view", "🎯 Live Deals")
+    st.session_state["_last_nav_view"] = chosen
+    return chosen
+
+
+def _render_live_field_group(prefix: str, include_search: bool = False):
+    """Render compact 2-column Live Deals filter controls for either sidebar (`sb`) or popover (`top`)."""
+    if include_search:
+        st.text_input(
+            "Search",
+            placeholder="e.g. DeWalt, Dyson, Pixel, Lego...",
+            key=f"{prefix}_live_kw",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_kw", "live_kw"),
+        )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.selectbox(
+            "Time Left",
+            LIVE_TIME_OPTIONS,
+            key=f"{prefix}_live_time",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_time", "live_time"),
+        )
+    with c2:
+        st.selectbox(
+            "Warehouse",
+            WAREHOUSE_OPTIONS,
+            key=f"{prefix}_live_wh",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_wh", "live_wh"),
+        )
+    st.selectbox(
+        "Sort By",
+        LIVE_SORT_OPTIONS,
+        key=f"{prefix}_live_sort",
+        on_change=_sync_widget,
+        args=(f"{prefix}_live_sort", "live_sort"),
+    )
+    st.selectbox(
+        "Condition",
+        COND_OPTIONS,
+        key=f"{prefix}_live_cond",
+        on_change=_sync_widget,
+        args=(f"{prefix}_live_cond", "live_cond"),
+    )
+    p1, p2 = st.columns(2)
+    with p1:
+        st.number_input(
+            "Min MSRP ($)",
             min_value=0,
             max_value=50000,
-            value=0,
-            step=10
+            step=10,
+            key=f"{prefix}_live_min_retail",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_min_retail", "live_min_retail"),
         )
-        max_bid = st.number_input(
-            "Maximum Current / Winning Bid ($)",
+    with p2:
+        st.number_input(
+            "Max Bid ($)",
             min_value=1,
             max_value=50000,
-            value=1000,
-            step=25
+            step=25,
+            key=f"{prefix}_live_max_bid",
+            on_change=_sync_widget,
+            args=(f"{prefix}_live_max_bid", "live_max_bid"),
         )
-        page_size_opt = st.selectbox("📄 Items Per Page", [40, 60, 100], index=0, key="df_page_size")
+    st.selectbox(
+        "Category",
+        PRIMARY_CATEGORIES,
+        key=f"{prefix}_live_cat",
+        on_change=_sync_widget,
+        args=(f"{prefix}_live_cat", "live_cat"),
+    )
+    st.checkbox(
+        "🔮 Likely Cheap Tonight",
+        key=f"{prefix}_live_predict_cheap",
+        help="Active items currently trading below their past winning average in the same condition.",
+        on_change=_sync_widget,
+        args=(f"{prefix}_live_predict_cheap", "live_predict_cheap"),
+    )
+    with st.expander("⚙️ Steal Rules & Page Size", expanded=bool(st.session_state.get("live_predict_cheap"))):
+        r1, r2 = st.columns(2)
+        with r1:
+            st.number_input(
+                "Min Past Sales",
+                min_value=1,
+                max_value=50,
+                step=1,
+                key=f"{prefix}_live_min_sales",
+                on_change=_sync_widget,
+                args=(f"{prefix}_live_min_sales", "live_min_sales"),
+            )
+        with r2:
+            st.number_input(
+                "Min Avg % Off",
+                min_value=50,
+                max_value=99,
+                step=5,
+                key=f"{prefix}_live_min_disc",
+                on_change=_sync_widget,
+                args=(f"{prefix}_live_min_disc", "live_min_disc"),
+            )
+        r3, r4 = st.columns(2)
+        with r3:
+            st.number_input(
+                "Max Hist Avg ($)",
+                min_value=1,
+                max_value=5000,
+                step=5,
+                key=f"{prefix}_live_max_hist_avg",
+                on_change=_sync_widget,
+                args=(f"{prefix}_live_max_hist_avg", "live_max_hist_avg"),
+            )
+        with r4:
+            st.selectbox(
+                "Items / Page",
+                [40, 60, 100],
+                key=f"{prefix}_live_page_size",
+                on_change=_sync_widget,
+                args=(f"{prefix}_live_page_size", "live_page_size"),
+            )
 
-    # Active filter summary bar + floating always-accessible Refresh button
-    kw_label = f" · 🔍 '{search_kw.strip()}'" if search_kw.strip() else ""
-    cat_label = f" · 🏷️ {cat_filter}" if cat_filter != "All Categories" else ""
-    pred_label = f" · 🔮 Likely Cheap (≥{min_hist_sales} sales, Avg ≤${max_hist_avg}, ≥{min_hist_disc}% off)" if predict_cheap_only else ""
-    st.caption(f"**Active Filter:** {time_filter}{cat_label} · 📍 {loc_filter} · {cond_filter} · MSRP ≥ ${min_retail} · Bid ≤ ${max_bid}{kw_label}{pred_label}")
+
+def render_live_filter_controls() -> dict:
+    """Render synchronized sidebar and mobile-first main-page filters for Live Deals."""
+    _init_filter_state(LIVE_DEFAULTS)
+
+    badge_count = sum([
+        st.session_state["live_time"] != LIVE_DEFAULTS["live_time"],
+        st.session_state["live_wh"] != "All",
+        st.session_state["live_cond"] != "All",
+        st.session_state["live_sort"] != LIVE_DEFAULTS["live_sort"],
+        st.session_state["live_cat"] != "All Categories",
+        int(st.session_state["live_min_retail"]) > 0,
+        int(st.session_state["live_max_bid"]) < 1000,
+        bool(st.session_state["live_predict_cheap"]),
+    ])
+    is_dirty = badge_count > 0 or bool(str(st.session_state["live_kw"]).strip()) or int(st.session_state["live_page_size"]) != 40
+
+    with st.sidebar:
+        sh_col, sr_col = st.columns([2.2, 1], vertical_alignment="center")
+        with sh_col:
+            st.subheader("🎛️ Live Filters")
+        with sr_col:
+            st.button(
+                "↺ Reset",
+                key="sb_live_reset",
+                on_click=_reset_filter_group,
+                args=(LIVE_DEFAULTS,),
+                disabled=not is_dirty,
+                width="stretch",
+            )
+        _render_live_field_group("sb", include_search=True)
+
+    row_s, row_actions = st.columns([3.0, 1.8], vertical_alignment="center")
+    with row_s:
+        st.text_input(
+            "Search Active",
+            placeholder="🔍 Search live deals (e.g. DeWalt, Dyson, Pixel, Lego)...",
+            label_visibility="collapsed",
+            key="top_live_kw",
+            on_change=_sync_widget,
+            args=("top_live_kw", "live_kw"),
+        )
+    with row_actions:
+        with st.container(horizontal=True, gap="small"):
+            pop_label = f"🎛️ Filters ({badge_count})" if badge_count else "🎛️ Filters"
+            with st.popover(pop_label, width="stretch"):
+                _render_live_field_group("top", include_search=False)
+                st.button(
+                    "↺ Reset Filters",
+                    key="pop_live_reset",
+                    on_click=_reset_filter_group,
+                    args=(LIVE_DEFAULTS,),
+                    disabled=not is_dirty,
+                    width="stretch",
+                )
+            st.button(
+                "↺ Reset",
+                key="top_live_reset",
+                on_click=_reset_filter_group,
+                args=(LIVE_DEFAULTS,),
+                disabled=not is_dirty,
+            )
+
+    cur_pills = _compute_live_pills()
+    st.session_state["_prev_live_quick_pills"] = cur_pills
+    st.session_state["live_quick_pills"] = cur_pills
+    st.pills(
+        "Quick Filters",
+        LIVE_QUICK_PILLS,
+        selection_mode="multi",
+        label_visibility="collapsed",
+        key="live_quick_pills",
+        on_change=_on_live_pills_change,
+    )
+
+    parts = [st.session_state["live_time"]]
+    if st.session_state["live_wh"] != "All":
+        parts.append(f"📍 {st.session_state['live_wh']}")
+    if st.session_state["live_cond"] != "All":
+        parts.append(st.session_state["live_cond"])
+    if st.session_state["live_cat"] != "All Categories":
+        parts.append(f"🏷️ {st.session_state['live_cat']}")
+    if int(st.session_state["live_min_retail"]) > 0:
+        parts.append(f"MSRP ≥ ${int(st.session_state['live_min_retail'])}")
+    if int(st.session_state["live_max_bid"]) < 1000:
+        parts.append(f"Bid ≤ ${int(st.session_state['live_max_bid'])}")
+    if st.session_state["live_predict_cheap"]:
+        parts.append(
+            f"🔮 Steals (≥{int(st.session_state['live_min_sales'])} sales, "
+            f"Avg ≤ ${int(st.session_state['live_max_hist_avg'])}, ≥{int(st.session_state['live_min_disc'])}% off)"
+        )
+    if str(st.session_state["live_kw"]).strip():
+        parts.append(f"🔍 '{str(st.session_state['live_kw']).strip()}'")
+    parts.append(f"↕️ {st.session_state['live_sort']}")
+    st.caption(f"**Active:** {' · '.join(parts)}")
+
+    return {
+        "search_kw": str(st.session_state["live_kw"]),
+        "time_filter": st.session_state["live_time"],
+        "loc_filter": st.session_state["live_wh"],
+        "cond_filter": st.session_state["live_cond"],
+        "sort_by": st.session_state["live_sort"],
+        "min_retail": int(st.session_state["live_min_retail"]),
+        "max_bid": int(st.session_state["live_max_bid"]),
+        "cat_filter": st.session_state["live_cat"],
+        "predict_cheap_only": bool(st.session_state["live_predict_cheap"]),
+        "min_hist_sales": int(st.session_state["live_min_sales"]),
+        "min_hist_disc": int(st.session_state["live_min_disc"]),
+        "max_hist_avg": int(st.session_state["live_max_hist_avg"]),
+        "page_size": int(st.session_state["live_page_size"]),
+    }
+
+
+def _render_arch_field_group(prefix: str, include_search: bool = False):
+    """Render compact 2-column Past Archive filter controls for sidebar (`sb`) or popover (`top`)."""
+    if include_search:
+        st.text_input(
+            "Search",
+            placeholder="e.g. Pixel, Dyson, Monitor, Drill...",
+            key=f"{prefix}_arch_kw",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_kw", "arch_kw"),
+        )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.selectbox(
+            "Date Window",
+            ARCH_DATE_OPTIONS,
+            key=f"{prefix}_arch_date_preset",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_date_preset", "arch_date_preset"),
+        )
+    with c2:
+        st.selectbox(
+            "Warehouse",
+            WAREHOUSE_OPTIONS,
+            key=f"{prefix}_arch_wh",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_wh", "arch_wh"),
+        )
+    if st.session_state.get("arch_date_preset") == "Custom Range":
+        d1, d2 = st.columns(2)
+        with d1:
+            st.date_input(
+                "From",
+                key=f"{prefix}_arch_start",
+                on_change=_sync_widget,
+                args=(f"{prefix}_arch_start", "arch_start"),
+            )
+        with d2:
+            st.date_input(
+                "To",
+                key=f"{prefix}_arch_end",
+                on_change=_sync_widget,
+                args=(f"{prefix}_arch_end", "arch_end"),
+            )
+    st.selectbox(
+        "Sort By",
+        ARCH_SORT_OPTIONS,
+        key=f"{prefix}_arch_sort",
+        on_change=_sync_widget,
+        args=(f"{prefix}_arch_sort", "arch_sort"),
+    )
+    st.selectbox(
+        "Condition",
+        COND_OPTIONS,
+        key=f"{prefix}_arch_cond",
+        on_change=_sync_widget,
+        args=(f"{prefix}_arch_cond", "arch_cond"),
+    )
+    p1, p2 = st.columns(2)
+    with p1:
+        st.number_input(
+            "Min MSRP ($)",
+            min_value=0,
+            max_value=50000,
+            step=10,
+            key=f"{prefix}_arch_min_retail",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_min_retail", "arch_min_retail"),
+        )
+    with p2:
+        st.number_input(
+            "Max Bid ($)",
+            min_value=1,
+            max_value=50000,
+            step=25,
+            key=f"{prefix}_arch_max_bid",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_max_bid", "arch_max_bid"),
+        )
+    st.selectbox(
+        "Category",
+        PRIMARY_CATEGORIES,
+        key=f"{prefix}_arch_cat",
+        on_change=_sync_widget,
+        args=(f"{prefix}_arch_cat", "arch_cat"),
+    )
+    b1, b2 = st.columns(2)
+    with b1:
+        st.number_input(
+            "Min % Off",
+            min_value=0,
+            max_value=99,
+            step=5,
+            key=f"{prefix}_arch_min_disc",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_min_disc", "arch_min_disc"),
+        )
+    with b2:
+        st.selectbox(
+            "Items / Page",
+            [40, 60, 100],
+            key=f"{prefix}_arch_page_size",
+            on_change=_sync_widget,
+            args=(f"{prefix}_arch_page_size", "arch_page_size"),
+        )
+    st.checkbox(
+        "✅ Settled WON FOR Sales Only",
+        key=f"{prefix}_arch_settled_only",
+        help="Unchecked searches ALL closed lots in the Data Lake (visible cards are live-checked automatically).",
+        on_change=_sync_widget,
+        args=(f"{prefix}_arch_settled_only", "arch_settled_only"),
+    )
+    st.checkbox(
+        "😴 Sleepers (Bids ≤ 3 & MSRP ≥ $100)",
+        key=f"{prefix}_arch_sleeper_only",
+        on_change=_sync_widget,
+        args=(f"{prefix}_arch_sleeper_only", "arch_sleeper_only"),
+    )
+
+
+def render_arch_filter_controls() -> dict:
+    """Render synchronized sidebar and mobile-first main-page filters for unified Past Archive."""
+    arch_defaults = _get_arch_defaults()
+    _init_filter_state(arch_defaults)
+
+    badge_count = sum([
+        st.session_state["arch_date_preset"] != "All Time",
+        st.session_state["arch_wh"] != "All",
+        st.session_state["arch_cond"] != "All",
+        st.session_state["arch_sort"] != "Most Recently Closed",
+        st.session_state["arch_cat"] != "All Categories",
+        int(st.session_state["arch_min_retail"]) > 0,
+        int(st.session_state["arch_max_bid"]) < 1000,
+        int(st.session_state["arch_min_disc"]) > 0,
+        bool(st.session_state["arch_settled_only"]),
+        bool(st.session_state["arch_sleeper_only"]),
+    ])
+    is_dirty = badge_count > 0 or bool(str(st.session_state["arch_kw"]).strip()) or int(st.session_state["arch_page_size"]) != 40
+
+    with st.sidebar:
+        sh_col, sr_col = st.columns([2.2, 1], vertical_alignment="center")
+        with sh_col:
+            st.subheader("🗄️ Archive Filters")
+        with sr_col:
+            st.button(
+                "↺ Reset",
+                key="sb_arch_reset",
+                on_click=_reset_filter_group,
+                args=(arch_defaults,),
+                disabled=not is_dirty,
+                width="stretch",
+            )
+        _render_arch_field_group("sb", include_search=True)
+
+    row_s, row_actions = st.columns([3.0, 1.8], vertical_alignment="center")
+    with row_s:
+        st.text_input(
+            "Search Archive",
+            placeholder="🔍 Search past auctions & steals (e.g. Pixel, Dyson, Monitor)...",
+            label_visibility="collapsed",
+            key="top_arch_kw",
+            on_change=_sync_widget,
+            args=("top_arch_kw", "arch_kw"),
+        )
+    with row_actions:
+        with st.container(horizontal=True, gap="small"):
+            pop_label = f"🎛️ Filters ({badge_count})" if badge_count else "🎛️ Filters"
+            with st.popover(pop_label, width="stretch"):
+                _render_arch_field_group("top", include_search=False)
+                st.button(
+                    "↺ Reset Filters",
+                    key="pop_arch_reset",
+                    on_click=_reset_filter_group,
+                    args=(arch_defaults,),
+                    disabled=not is_dirty,
+                    width="stretch",
+                )
+            st.button(
+                "↺ Reset",
+                key="top_arch_reset",
+                on_click=_reset_filter_group,
+                args=(arch_defaults,),
+                disabled=not is_dirty,
+            )
+
+    cur_pills = _compute_arch_pills()
+    st.session_state["_prev_arch_quick_pills"] = cur_pills
+    st.session_state["arch_quick_pills"] = cur_pills
+    st.pills(
+        "Archive Quick Views",
+        ARCH_QUICK_PILLS,
+        selection_mode="multi",
+        label_visibility="collapsed",
+        key="arch_quick_pills",
+        on_change=_on_arch_pills_change,
+    )
+
+    parts = [st.session_state["arch_date_preset"]]
+    if st.session_state["arch_settled_only"]:
+        parts.append("✅ Settled Sales Only")
+    else:
+        parts.append("All Closed Lots")
+    if int(st.session_state["arch_min_disc"]) > 0:
+        parts.append(f"🔥 ≥ {int(st.session_state['arch_min_disc'])}% off")
+    if st.session_state["arch_sleeper_only"]:
+        parts.append("😴 Sleepers")
+    if st.session_state["arch_wh"] != "All":
+        parts.append(f"📍 {st.session_state['arch_wh']}")
+    if st.session_state["arch_cond"] != "All":
+        parts.append(st.session_state["arch_cond"])
+    if st.session_state["arch_cat"] != "All Categories":
+        parts.append(f"🏷️ {st.session_state['arch_cat']}")
+    if int(st.session_state["arch_min_retail"]) > 0:
+        parts.append(f"MSRP ≥ ${int(st.session_state['arch_min_retail'])}")
+    if int(st.session_state["arch_max_bid"]) < 1000:
+        parts.append(f"Bid ≤ ${int(st.session_state['arch_max_bid'])}")
+    if str(st.session_state["arch_kw"]).strip():
+        parts.append(f"🔍 '{str(st.session_state['arch_kw']).strip()}'")
+    parts.append(f"↕️ {st.session_state['arch_sort']}")
+    st.caption(f"**Archive:** {' · '.join(parts)}")
+
+    return {
+        "search_kw": str(st.session_state["arch_kw"]),
+        "date_preset": st.session_state["arch_date_preset"],
+        "start_date": st.session_state["arch_start"],
+        "end_date": st.session_state["arch_end"],
+        "loc_filter": st.session_state["arch_wh"],
+        "cond_filter": st.session_state["arch_cond"],
+        "sort_by": st.session_state["arch_sort"],
+        "min_retail": int(st.session_state["arch_min_retail"]),
+        "max_bid": int(st.session_state["arch_max_bid"]),
+        "cat_filter": st.session_state["arch_cat"],
+        "min_disc": int(st.session_state["arch_min_disc"]),
+        "settled_only": bool(st.session_state["arch_settled_only"]),
+        "sleeper_only": bool(st.session_state["arch_sleeper_only"]),
+        "page_size": int(st.session_state["arch_page_size"]),
+    }
+
+
+view_mode = render_top_nav()
+
+
+# --- TAB 1: LIVE DEALS (ACTIVE AUCTIONS & SNIPING) ---
+if view_mode == "🎯 Live Deals":
+    inject_nellis_card_css()
+    f_cfg = render_live_filter_controls()
+    search_kw = f_cfg["search_kw"]
+    time_filter = f_cfg["time_filter"]
+    loc_filter = f_cfg["loc_filter"]
+    cond_filter = f_cfg["cond_filter"]
+    sort_by = f_cfg["sort_by"]
+    min_retail = f_cfg["min_retail"]
+    max_bid = f_cfg["max_bid"]
+    cat_filter = f_cfg["cat_filter"]
+    predict_cheap_only = f_cfg["predict_cheap_only"]
+    min_hist_sales = f_cfg["min_hist_sales"]
+    min_hist_disc = f_cfg["min_hist_disc"]
+    max_hist_avg = f_cfg["max_hist_avg"]
+    page_size_opt = f_cfg["page_size"]
 
     st.markdown('<span id="nellis-refresh-anchor"></span>', unsafe_allow_html=True)
     if st.button("🔄 Refresh Live Data", key="refresh_live_btn", type="primary"):
@@ -1500,241 +2519,32 @@ if view_mode == "🎯 Deal Finder":
         search_live_active_duplicates.clear()
         st.rerun()
 
-    # Inject clean card styling for uniform 4-column desktop grid + floating Refresh FAB
-    st.markdown(
-        """
-        <style>
-        .st-key-refresh_live_btn,
-        div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] {
-            position: fixed !important;
-            top: 64px !important;
-            right: 18px !important;
-            bottom: auto !important;
-            left: auto !important;
-            z-index: 9999 !important;
-            width: auto !important;
-        }
-        .st-key-refresh_live_btn button,
-        div[data-testid="stElementContainer"]:has(#nellis-refresh-anchor) + div[data-testid="stElementContainer"] button {
-            border-radius: 999px !important;
-            padding: 0.55rem 1.25rem !important;
-            font-weight: 700 !important;
-            box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45) !important;
-        }
-        .nellis-card-img-wrap {
-            width: 100%;
-            height: 170px;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: #ffffff;
-            border-radius: 8px;
-            overflow: hidden;
-            margin-bottom: 8px;
-            padding: 6px;
-        }
-        .nellis-card-img-wrap img {
-            max-height: 158px;
-            max-width: 100%;
-            object-fit: contain;
-        }
-        .nellis-cat-pill {
-            display: inline-block;
-            font-size: 11px;
-            font-weight: 600;
-            color: #93c5fd;
-            background: #1e293b;
-            border: 1px solid #334155;
-            border-radius: 999px;
-            padding: 2px 8px;
-            margin-bottom: 6px;
-            white-space: nowrap;
-            overflow: hidden;
-            text-overflow: ellipsis;
-            max-width: 100%;
-        }
-        .nellis-card-title {
-            font-size: 14px;
-            font-weight: 700;
-            line-height: 1.35;
-            height: 38px;
-            overflow: hidden;
-            display: -webkit-box;
-            -webkit-line-clamp: 2;
-            -webkit-box-orient: vertical;
-            margin-bottom: 8px;
-        }
-        .nellis-card-title a {
-            text-decoration: none;
-        }
-        /* Distinct Card Separation for both Desktop Grid & Stacked Mobile */
-        div[data-testid="stColumn"] div[data-testid="stVerticalBlockBorderWrapper"] {
-            border: 2px solid #94a3b8 !important;
-            border-radius: 14px !important;
-            box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14) !important;
-            padding: 12px !important;
-            margin-bottom: 18px !important;
-        }
-        .nellis-stat-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 8px;
-            margin-bottom: 8px;
-        }
-        .nellis-stat-box {
-            background: #f8fafc;
-            border: 1px solid #cbd5e1;
-            border-radius: 10px;
-            padding: 8px 8px;
-            text-align: center;
-        }
-        .nellis-stat-label {
-            font-size: 10px;
-            font-weight: 800;
-            letter-spacing: 0.5px;
-            text-transform: uppercase;
-            color: #475569;
-            margin-bottom: 3px;
-        }
-        .nellis-stat-val {
-            font-size: 15px;
-            font-weight: 800;
-            color: #0f172a;
-            line-height: 1.2;
-        }
-        .nellis-disc-badge {
-            font-size: 11px;
-            color: #15803d;
-            font-weight: 800;
-        }
-        .nellis-meta-strip {
-            display: grid;
-            grid-template-columns: 1fr 0.65fr 1fr;
-            gap: 4px;
-            background: #f1f5f9;
-            border: 1px solid #cbd5e1;
-            border-radius: 8px;
-            padding: 7px 4px;
-            margin-bottom: 8px;
-            text-align: center;
-        }
-        .nellis-meta-item-label {
-            font-size: 9.5px;
-            font-weight: 800;
-            text-transform: uppercase;
-            color: #475569;
-            margin-bottom: 2px;
-        }
-        .nellis-meta-item-val {
-            font-size: 13px;
-            font-weight: 800;
-            color: #0f172a;
-        }
-        .nellis-cond-row {
-            text-align: center;
-            margin-bottom: 8px;
-        }
-        .nellis-stars {
-            font-size: 14px;
-            letter-spacing: 1px;
-            margin-bottom: 4px;
-        }
-        .nellis-tag-pill {
-            display: inline-block;
-            font-size: 10.5px;
-            font-weight: 600;
-            padding: 2px 8px;
-            border-radius: 999px;
-            margin: 2px 2px;
-            background: #451a03;
-            color: #fde68a;
-            border: 1px solid #92400e;
-        }
-        .nellis-tag-pill.new {
-            background: #052e16;
-            color: #86efac;
-            border-color: #166534;
-        }
-        .nellis-place-bid-btn {
-            display: block;
-            width: 100%;
-            text-align: center;
-            background: #b91c1c;
-            color: #ffffff !important;
-            font-weight: 800;
-            font-size: 13px;
-            letter-spacing: 0.4px;
-            text-transform: uppercase;
-            padding: 8px 10px;
-            border-radius: 8px;
-            text-decoration: none !important;
-            margin-bottom: 6px;
-        }
-        .nellis-place-bid-btn:hover {
-            background: #dc2626;
-        }
-        .nellis-place-bid-btn.archive {
-            background: #334155;
-        }
-        @media (max-width: 768px) {
-            .nellis-card-img-wrap {
-                height: 210px;
-            }
-            .nellis-card-img-wrap img {
-                max-height: 196px;
-            }
-            .nellis-card-title {
-                height: auto;
-                -webkit-line-clamp: 3;
-                font-size: 15px;
-            }
-            .nellis-stat-val {
-                font-size: 17px;
-            }
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    def enrich_categories(df_in: pd.DataFrame) -> pd.DataFrame:
-        if df_in.empty:
-            return df_in
-        if "category_primary" not in df_in.columns:
-            df_in["category_primary"] = ""
-        if "category_secondary" not in df_in.columns:
-            df_in["category_secondary"] = ""
-
-        cats = [
-            classify_product_category(t, cp, cs)
-            for t, cp, cs in zip(
-                df_in["title"].fillna(""),
-                df_in["category_primary"].fillna(""),
-                df_in["category_secondary"].fillna(""),
-            )
-        ]
-        df_in["category_primary"] = [c[0] for c in cats]
-        df_in["category_secondary"] = [c[1] for c in cats]
-        return df_in
-
-    results_df = pd.DataFrame()
     filtered_all = pd.DataFrame()
     live_df = pd.DataFrame()
+    short_window_sec = LIVE_TIME_SEC_MAP.get(time_filter, 0) if time_filter != "< 24 hours" else 0
 
-    if is_archive_mode:
-        # Query Closed / Historical Archive across ALL partitions with total match count
-        with st.spinner("Searching historical closed auctions in Data Lake..."):
-            base_arch_where = get_settled_sales_where_sql("f") if verified_archive_only else get_archive_candidates_where_sql("f")
+    with st.spinner("Fetching active lots..."):
+        live_df = fetch_live_nellis_lots(
+            search_kw=search_kw,
+            loc_filter=loc_filter,
+            sort_by=sort_by,
+            page_size=240,
+            max_pages=8,
+            target_window_sec=short_window_sec,
+        )
+
+        # For "< 24 hours" or "All Active", also union any active (closed_at > now()) lots in the Data Lake
+        if time_filter in ("All Active", "< 24 hours"):
             where_parts = [
-                base_arch_where,
+                "f.closed_at > now()",
                 f"f.retail_price >= {min_retail}",
                 f"f.final_price <= {max_bid}",
             ]
+            if time_filter == "< 24 hours":
+                where_parts.append("f.closed_at <= now() + INTERVAL 24 HOUR")
             if loc_filter != "All":
                 where_parts.append(f"f.location = '{loc_filter}'")
-            if cond_filter == "Incomplete / Damaged / Parts":
-                where_parts.append("(f.condition ILIKE '%Damaged%' OR f.condition ILIKE '%Incomplete%' OR f.condition ILIKE '%Parts%')")
-            elif cond_filter != "All":
+            if cond_filter != "All" and cond_filter != "Incomplete / Damaged / Parts":
                 where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
             if search_kw.strip():
                 fuzzy_sql = build_fuzzy_sql_where(search_kw)
@@ -1743,14 +2553,14 @@ if view_mode == "🎯 Deal Finder":
 
             where_sql = " AND ".join(where_parts)
             sort_sql = {
-                "🕒 Most Recently Closed": "f.closed_at DESC",
+                "Closing Soonest": "f.closed_at ASC",
                 "Highest Discount (%)": "f.discount_ratio ASC",
-                "Lowest Winning Bid ($)": "f.final_price ASC",
+                "Lowest Current Bid ($)": "f.final_price ASC",
                 "Highest Retail MSRP ($)": "f.retail_price DESC",
-            }.get(sort_by, "f.closed_at DESC")
+            }.get(sort_by, "f.closed_at ASC")
 
-            archive_query = f"""
-                SELECT 
+            lake_active_query = f"""
+                SELECT
                     f.auction_id,
                     p.title,
                     p.category_primary,
@@ -1766,11 +2576,7 @@ if view_mode == "🎯 Deal Finder":
                     f.damage_notes,
                     f.closed_at,
                     f.photo_url,
-                    f.is_closed,
-                    f.market_status,
-                    COUNT(*) OVER () AS _sql_total_count,
-                    CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms,
-                    -1.0 AS diff_sec
+                    CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms
                 FROM fact_auctions f
                 JOIN dim_products p ON f.product_id = p.product_id
                 WHERE {where_sql}
@@ -1778,247 +2584,139 @@ if view_mode == "🎯 Deal Finder":
                 LIMIT 2000;
             """
             try:
-                archive_df = run_cached_duckdb_query(archive_query)
-                archive_df = enrich_categories(archive_df)
-                if not archive_df.empty:
-                    notes_col = archive_df["damage_notes"].fillna("") if "damage_notes" in archive_df.columns else [""] * len(archive_df)
-                    comp_col = archive_df["completeness"].fillna("") if "completeness" in archive_df.columns else [""] * len(archive_df)
-                    func_col = archive_df["functional_status"].fillna("") if "functional_status" in archive_df.columns else [""] * len(archive_df)
-                    archive_df["condition"] = [
-                        "Incomplete / Damaged / Parts"
-                        if (str(cp).lower() in ("incomplete", "partial") or str(fn).lower() in ("non-functional", "broken"))
-                        else format_clean_condition(c, t, n)
-                        for c, t, n, cp, fn in zip(archive_df["condition"].fillna(""), archive_df["title"].fillna(""), notes_col, comp_col, func_col)
-                    ]
-                    if cond_filter != "All":
-                        archive_df = archive_df[archive_df["condition"].str.contains(cond_filter, case=False, na=False)]
-                if not archive_df.empty and cat_filter != "All Categories":
-                    archive_df = archive_df[archive_df["category_primary"] == cat_filter]
-                if not archive_df.empty and search_kw.strip():
-                    scores = [
-                        smart_fuzzy_search_score(search_kw, t, n)
-                        for t, n in zip(archive_df["title"].fillna(""), archive_df["damage_notes"].fillna(""))
-                    ]
-                    archive_df = archive_df.assign(_search_score=scores)
-                    archive_df = archive_df[archive_df["_search_score"] >= 0.65]
-                filtered_all = archive_df
-            except Exception as e:
-                st.error(f"Error querying Historical Archive: {e}")
-    else:
-        max_sec_map = {
-            "🔥 Ending in < 5 mins (Live)": 300,
-            "⚡ Ending in < 15 mins (Live)": 900,
-            "⏳ Ending in < 30 mins (Live)": 1800,
-            "🕒 Ending in < 1 hour (Live)": 3600,
-            "📅 Ending Today (< 24 hrs)": 86400
-        }
-        short_window_sec = max_sec_map.get(time_filter, 0) if time_filter != "📅 Ending Today (< 24 hrs)" else 0
+                lake_active_df = run_cached_duckdb_query(lake_active_query)
+                if not lake_active_df.empty:
+                    now_ms_val = int(time.time() * 1000)
+                    lake_active_df = lake_active_df.copy()
+                    lake_active_df["diff_sec"] = (lake_active_df["close_ms"].astype("float64") - now_ms_val) / 1000.0
+                    if live_df.empty:
+                        live_df = lake_active_df
+                    else:
+                        live_df = pd.concat([live_df, lake_active_df], ignore_index=True)
+                        live_df = live_df.drop_duplicates(subset=["auction_id"], keep="first")
+            except Exception:
+                pass
 
-        # Fetch active lots (Always guarantees only ACTIVE lots are shown, never lots that ended last night)
-        with st.spinner("Fetching active lots..."):
-            live_df = fetch_live_nellis_lots(
-                search_kw=search_kw,
-                loc_filter=loc_filter,
-                sort_by=sort_by,
-                page_size=240,
-                max_pages=8,
-                target_window_sec=short_window_sec,
+    if not live_df.empty:
+        live_df = enrich_categories(live_df)
+        live_df = normalize_df_conditions(live_df)
+        # Recompute diff_sec against live current time (never use stale cached countdowns)
+        now_ms_live = int(time.time() * 1000)
+        if "close_ms" in live_df.columns:
+            live_df = live_df.copy()
+            live_df["diff_sec"] = (pd.to_numeric(live_df["close_ms"], errors="coerce").fillna(0) - now_ms_live) / 1000.0
+
+        # Exclude expired or about-to-expire (<10s / <20s) lots that flip to POTENTIALLY CLOSED before render
+        min_sec_buffer = 10.0 if time_filter == "< 5 mins" else 20.0
+        filtered = live_df[
+            (live_df["diff_sec"] > min_sec_buffer)
+            & (live_df["retail_price"] >= min_retail)
+            & (live_df["final_price"] <= max_bid)
+        ]
+        if cat_filter != "All Categories":
+            filtered = filtered[filtered["category_primary"] == cat_filter]
+        if loc_filter != "All":
+            filtered = filtered[filtered["location"].str.contains(loc_filter, case=False, na=False, regex=False)]
+        if cond_filter != "All":
+            filtered = filtered[filtered["condition"].str.contains(cond_filter, case=False, na=False, regex=False)]
+        if search_kw.strip() and not filtered.empty:
+            scores = [
+                1.0 if direct else smart_fuzzy_search_score(search_kw, t, n)
+                for direct, t, n in zip(
+                    filtered.get("_direct_nellis_match", pd.Series([False] * len(filtered))).fillna(False),
+                    filtered["title"].fillna(""),
+                    filtered["damage_notes"].fillna(""),
+                )
+            ]
+            filtered = filtered.assign(_search_score=scores)
+            filtered = filtered[filtered["_search_score"] >= 0.65]
+
+        if time_filter in LIVE_TIME_SEC_MAP:
+            filtered = filtered[filtered["diff_sec"] <= LIVE_TIME_SEC_MAP[time_filter]]
+
+        need_hist_scoring = (
+            predict_cheap_only
+            or sort_by in ("Best Steal (Hist Avg $)", "Highest Hist Avg % Off")
+        )
+        if need_hist_scoring and not filtered.empty:
+            hist_index_for_pred = load_historical_price_index()
+            cand_rows = filtered.to_dict("records")
+
+            # Pre-filter candidates, then live-verify matching sales so Likely Cheap Tonight
+            # never surfaces stale $1 pre-close prices or already-expensive live items.
+            pre_keep_rows = []
+            for r in cand_rows:
+                ms = find_historical_matches(r, hist_index_for_pred, same_condition_only=True)
+                if not ms:
+                    continue
+                avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
+                msrp_v = float(r.get("retail_price") or 0)
+                cur_p = float(r.get("final_price") or 0)
+                avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
+                if (not predict_cheap_only) or (
+                    len(ms) >= min_hist_sales
+                    and avg_p <= max_hist_avg
+                    and cur_p <= max_hist_avg
+                    and avg_d >= min_hist_disc
+                ):
+                    pre_keep_rows.append(r)
+
+            verified_pred_map = batch_verify_rows_history(
+                pre_keep_rows,
+                hist_index_for_pred,
+                same_condition_only=True,
+                max_verify_per_item=15,
+                max_total_live_checks=280,
             )
 
-            # If "All Active Lots" or "Ending Today", also union any active (closed_at > now()) lots in the Data Lake
-            if time_filter in ["All Active Lots", "📅 Ending Today (< 24 hrs)"]:
-                where_parts = [
-                    "f.closed_at > now()",
-                    f"f.retail_price >= {min_retail}",
-                    f"f.final_price <= {max_bid}"
-                ]
-                if time_filter == "📅 Ending Today (< 24 hrs)":
-                    where_parts.append("f.closed_at <= now() + INTERVAL 24 HOUR")
-                if loc_filter != "All":
-                    where_parts.append(f"f.location = '{loc_filter}'")
-                if cond_filter != "All" and cond_filter != "Incomplete / Damaged / Parts":
-                    where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
-                if search_kw.strip():
-                    fuzzy_sql = build_fuzzy_sql_where(search_kw)
-                    if fuzzy_sql:
-                        where_parts.append(fuzzy_sql)
-
-                where_sql = " AND ".join(where_parts)
-                sort_sql = {
-                    "⏳ Closing Soonest (Sniper)": "f.closed_at ASC",
-                    "Highest Discount (%)": "f.discount_ratio ASC",
-                    "Lowest Final Bid ($)": "f.final_price ASC",
-                    "Highest Retail MSRP ($)": "f.retail_price DESC"
-                }.get(sort_by, "f.closed_at ASC")
-
-                lake_active_query = f"""
-                    SELECT 
-                        f.auction_id,
-                        p.title,
-                        p.category_primary,
-                        p.category_secondary,
-                        f.location,
-                        f.condition,
-                        f.completeness,
-                        f.functional_status,
-                        f.retail_price,
-                        f.final_price,
-                        ROUND((1.0 - f.discount_ratio) * 100.0, 1) AS discount_pct,
-                        f.bid_count,
-                        f.damage_notes,
-                        f.closed_at,
-                        f.photo_url,
-                        CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms
-                    FROM fact_auctions f
-                    JOIN dim_products p ON f.product_id = p.product_id
-                    WHERE {where_sql}
-                    ORDER BY {sort_sql}
-                    LIMIT 2000;
-                """
-                try:
-                    lake_active_df = run_cached_duckdb_query(lake_active_query)
-                    if not lake_active_df.empty:
-                        now_ms_val = int(time.time() * 1000)
-                        lake_active_df = lake_active_df.copy()
-                        lake_active_df["diff_sec"] = (lake_active_df["close_ms"].astype("float64") - now_ms_val) / 1000.0
-                        if live_df.empty:
-                            live_df = lake_active_df
-                        else:
-                            live_df = pd.concat([live_df, lake_active_df], ignore_index=True)
-                            live_df = live_df.drop_duplicates(subset=["auction_id"], keep="first")
-                except Exception:
-                    pass
-
-        if not live_df.empty:
-            live_df = enrich_categories(live_df)
-            notes_col = live_df["damage_notes"].fillna("") if "damage_notes" in live_df.columns else [""] * len(live_df)
-            comp_col = live_df["completeness"].fillna("") if "completeness" in live_df.columns else [""] * len(live_df)
-            func_col = live_df["functional_status"].fillna("") if "functional_status" in live_df.columns else [""] * len(live_df)
-            live_df["condition"] = [
-                "Incomplete / Damaged / Parts"
-                if (str(cp).lower() in ("incomplete", "partial") or str(fn).lower() in ("non-functional", "broken"))
-                else format_clean_condition(c, t, n)
-                for c, t, n, cp, fn in zip(live_df["condition"].fillna(""), live_df["title"].fillna(""), notes_col, comp_col, func_col)
-            ]
-            # Recompute diff_sec against live current time (never use stale cached countdowns)
-            now_ms_live = int(time.time() * 1000)
-            if "close_ms" in live_df.columns:
-                live_df = live_df.copy()
-                live_df["diff_sec"] = (pd.to_numeric(live_df["close_ms"], errors="coerce").fillna(0) - now_ms_live) / 1000.0
-
-            # Exclude expired or about-to-expire (<10s / <20s) lots that flip to POTENTIALLY CLOSED before render
-            min_sec_buffer = 10.0 if time_filter == "🔥 Ending in < 5 mins (Live)" else 20.0
-            filtered = live_df[
-                (live_df['diff_sec'] > min_sec_buffer) &
-                (live_df['retail_price'] >= min_retail) &
-                (live_df['final_price'] <= max_bid)
-            ]
-            if cat_filter != "All Categories":
-                filtered = filtered[filtered['category_primary'] == cat_filter]
-            if loc_filter != "All":
-                filtered = filtered[filtered['location'].str.contains(loc_filter, case=False, na=False)]
-            if cond_filter != "All":
-                filtered = filtered[filtered['condition'].str.contains(cond_filter, case=False, na=False)]
-            if search_kw.strip() and not filtered.empty:
-                scores = [
-                    1.0 if direct else smart_fuzzy_search_score(search_kw, t, n)
-                    for direct, t, n in zip(
-                        filtered.get('_direct_nellis_match', pd.Series([False] * len(filtered))).fillna(False),
-                        filtered['title'].fillna(""),
-                        filtered['damage_notes'].fillna("")
-                    )
-                ]
-                filtered = filtered.assign(_search_score=scores)
-                filtered = filtered[filtered['_search_score'] >= 0.65]
-
-            if time_filter in max_sec_map:
-                filtered = filtered[filtered['diff_sec'] <= max_sec_map[time_filter]]
-
-            need_hist_scoring = (
-                predict_cheap_only
-                or sort_by in ("🔮 Predicted Best Steal (Lowest Hist Avg)", "🔥 Highest Hist Avg % Off")
-            )
-            if need_hist_scoring and not filtered.empty:
-                hist_index_for_pred = load_historical_price_index()
-                cand_rows = filtered.to_dict("records")
-
-                # Because closed final prices are always >= pre-close snapshots, pre-filter first,
-                # then live-verify matching candidates so Likely Cheap Tonight never shows false $1 steals
-                # or items whose live bid already exceeds their historical average.
-                pre_keep_rows = []
-                for r in cand_rows:
-                    ms = find_historical_matches(r, hist_index_for_pred, same_condition_only=True)
-                    if not ms:
-                        continue
+            h_counts, h_avgs, h_discs, h_still_cheap = [], [], [], []
+            for r in cand_rows:
+                aid_r = int(r.get("auction_id") or 0)
+                ms = verified_pred_map.get(aid_r, [])
+                if ms:
                     avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
                     msrp_v = float(r.get("retail_price") or 0)
                     cur_p = float(r.get("final_price") or 0)
                     avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
-                    if (not predict_cheap_only) or (
-                        len(ms) >= min_hist_sales
-                        and avg_p <= max_hist_avg
-                        and cur_p <= max_hist_avg
-                        and avg_d >= min_hist_disc
-                    ):
-                        pre_keep_rows.append(r)
+                    h_counts.append(len(ms))
+                    h_avgs.append(avg_p)
+                    h_discs.append(avg_d)
+                    h_still_cheap.append(cur_p <= avg_p)
+                else:
+                    h_counts.append(0)
+                    h_avgs.append(999999.0)
+                    h_discs.append(-1.0)
+                    h_still_cheap.append(False)
+            filtered = filtered.assign(
+                _hist_count=h_counts,
+                _hist_avg_price=h_avgs,
+                _hist_avg_disc=h_discs,
+                _has_hist=[c > 0 for c in h_counts],
+                _still_below_avg=h_still_cheap,
+            )
+            if predict_cheap_only:
+                filtered = filtered[
+                    (filtered["_hist_count"] >= min_hist_sales)
+                    & (filtered["_hist_avg_price"] <= max_hist_avg)
+                    & (filtered["_hist_avg_disc"] >= min_hist_disc)
+                    & (filtered["final_price"] <= filtered["_hist_avg_price"])
+                ]
 
-                verified_pred_map = batch_verify_rows_history(
-                    pre_keep_rows,
-                    hist_index_for_pred,
-                    same_condition_only=True,
-                    max_verify_per_item=15,
-                    max_total_live_checks=280,
-                )
+        if sort_by == "Best Steal (Hist Avg $)" and "_hist_avg_price" in filtered.columns:
+            filtered = filtered.sort_values(by=["_has_hist", "_still_below_avg", "_hist_avg_price", "_hist_avg_disc"], ascending=[False, False, True, False])
+        elif sort_by == "Highest Hist Avg % Off" and "_hist_avg_disc" in filtered.columns:
+            filtered = filtered.sort_values(by=["_has_hist", "_still_below_avg", "_hist_avg_disc", "_hist_avg_price"], ascending=[False, False, False, True])
+        elif sort_by == "Highest Discount (%)":
+            filtered = filtered.sort_values(by="discount_pct", ascending=False)
+        elif sort_by == "Lowest Current Bid ($)":
+            filtered = filtered.sort_values(by="final_price", ascending=True)
+        elif sort_by == "Highest Retail MSRP ($)":
+            filtered = filtered.sort_values(by="retail_price", ascending=False)
+        else:
+            filtered = filtered.sort_values(by="diff_sec", ascending=True)
 
-                h_counts, h_avgs, h_discs, h_still_cheap = [], [], [], []
-                for r in cand_rows:
-                    aid_r = int(r.get("auction_id") or 0)
-                    ms = verified_pred_map.get(aid_r, [])
-                    if ms:
-                        avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
-                        msrp_v = float(r.get("retail_price") or 0)
-                        cur_p = float(r.get("final_price") or 0)
-                        avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
-                        h_counts.append(len(ms))
-                        h_avgs.append(avg_p)
-                        h_discs.append(avg_d)
-                        h_still_cheap.append(cur_p <= avg_p)
-                    else:
-                        h_counts.append(0)
-                        h_avgs.append(999999.0)
-                        h_discs.append(-1.0)
-                        h_still_cheap.append(False)
-                filtered = filtered.assign(
-                    _hist_count=h_counts,
-                    _hist_avg_price=h_avgs,
-                    _hist_avg_disc=h_discs,
-                    _has_hist=[c > 0 for c in h_counts],
-                    _still_below_avg=h_still_cheap,
-                )
-                if predict_cheap_only:
-                    filtered = filtered[
-                        (filtered["_hist_count"] >= min_hist_sales)
-                        & (filtered["_hist_avg_price"] <= max_hist_avg)
-                        & (filtered["_hist_avg_disc"] >= min_hist_disc)
-                        & (filtered["final_price"] <= filtered["_hist_avg_price"])
-                    ]
+        filtered_all = filtered
 
-            if sort_by == "🔮 Predicted Best Steal (Lowest Hist Avg)" and "_hist_avg_price" in filtered.columns:
-                filtered = filtered.sort_values(by=["_has_hist", "_still_below_avg", "_hist_avg_price", "_hist_avg_disc"], ascending=[False, False, True, False])
-            elif sort_by == "🔥 Highest Hist Avg % Off" and "_hist_avg_disc" in filtered.columns:
-                filtered = filtered.sort_values(by=["_has_hist", "_still_below_avg", "_hist_avg_disc", "_hist_avg_price"], ascending=[False, False, False, True])
-            elif sort_by == "Highest Discount (%)":
-                filtered = filtered.sort_values(by="discount_pct", ascending=False)
-            elif sort_by == "Lowest Final Bid ($)":
-                filtered = filtered.sort_values(by="final_price", ascending=True)
-            elif sort_by == "Highest Retail MSRP ($)":
-                filtered = filtered.sort_values(by="retail_price", ascending=False)
-            else:
-                filtered = filtered.sort_values(by="diff_sec", ascending=True)
-
-            filtered_all = filtered
-
-    # Pagination: configurable (default 40 items per page)
     PAGE_SIZE = page_size_opt
     filter_sig = (
         search_kw.strip(), time_filter, cat_filter, loc_filter, cond_filter,
@@ -2037,480 +2735,98 @@ if view_mode == "🎯 Deal Finder":
     end_idx = min(start_idx + PAGE_SIZE, total_results)
     results_df = filtered_all.iloc[start_idx:end_idx] if total_results > 0 else pd.DataFrame()
 
-    # Load cached historical index and open radar index for fast O(1) badges
     hist_index = load_historical_price_index()
     open_radar_index = load_open_radar_index()
-    active_batch_records = live_df.to_dict("records") if not live_df.empty else []
 
-    def render_pagination_bar(key_prefix: str):
-        if total_results == 0:
-            return
-        p_col1, p_col2, p_col3 = st.columns([1.5, 3, 1.5])
-        with p_col1:
-            if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(current_page <= 1), use_container_width=True):
-                st.session_state["page_num"] = current_page - 1
-                st.session_state["_scroll_to_top"] = True
-                st.rerun()
-        with p_col2:
-            st.markdown(
-                f"<div style='text-align:center; padding-top:6px; font-weight:600;'>"
-                f"Page {current_page} of {total_pages} &nbsp;·&nbsp; Showing {start_idx + 1}–{end_idx} of {total_results:,} lots"
-                f"</div>",
-                unsafe_allow_html=True,
-            )
-        with p_col3:
-            if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(current_page >= total_pages), use_container_width=True):
-                st.session_state["page_num"] = current_page + 1
-                st.session_state["_scroll_to_top"] = True
-                st.rerun()
-
-    mode_noun = "closed historical lots" if is_archive_mode else "active lots"
     if total_results > 0:
-        sql_total_avail = 0
-        if is_archive_mode and "_sql_total_count" in filtered_all.columns:
-            try:
-                sql_total_avail = int(filtered_all["_sql_total_count"].max() or 0)
-            except Exception:
-                sql_total_avail = 0
-        if is_archive_mode and sql_total_avail > total_results and total_results >= 2000:
-            st.write(f"**Found {sql_total_avail:,} {mode_noun}** (showing {start_idx + 1}–{end_idx} of top 2,000):")
-        elif is_archive_mode and sql_total_avail > total_results:
-            st.write(f"**Found {total_results:,} matching {mode_noun}** (from newest 2,000 of {sql_total_avail:,}; showing {start_idx + 1}–{end_idx}):")
-        else:
-            st.write(f"**Found {total_results:,} {mode_noun}** (showing {start_idx + 1}–{end_idx}):")
-        if total_pages > 1:
-            render_pagination_bar("top")
+        st.write(f"**Found {total_results:,} active lots** (showing {start_idx + 1}–{end_idx}):")
+        render_pagination_bar("top", "page_num", current_page, total_pages, start_idx, end_idx, total_results, noun="lots")
     else:
-        st.write(f"**Showing 0 {mode_noun}:**")
+        st.write("**Showing 0 active lots:**")
 
     if results_df.empty:
-        st.info("No items match your filter criteria right now. Adjust the filters in the left sidebar to widen your search.")
+        st.info("No active items match your filter criteria right now. Tap **Reset** above or widen your filters to see more auctions.")
     else:
-        records = results_df.to_dict("records")
-        if is_archive_mode:
-            # Live-verify only unverified archive rows currently visible on this page (<= 40 items)
-            unv_page_ids = tuple(sorted({
-                int(r["auction_id"])
-                for r in records
-                if not (r.get("is_closed") is True) and int(r.get("auction_id") or 0) > 0
-            }))
-            page_live_map = verify_closed_lots_cached(unv_page_ids) if unv_page_ids else {}
-            for r in records:
-                if r.get("is_closed") is True:
-                    r["_arch_status_badge"] = "✅ Verified Won"
-                    continue
-                res_l = page_live_map.get(int(r.get("auction_id") or 0))
-                if res_l and not res_l.get("not_found") and res_l.get("is_closed"):
-                    r["final_price"] = float(res_l.get("final_price") or r.get("final_price") or 0)
-                    r["bid_count"] = int(res_l.get("bid_count") or r.get("bid_count") or 0)
-                    msrp_r = float(r.get("retail_price") or res_l.get("retail_price") or 0)
-                    if msrp_r > 0:
-                        r["discount_pct"] = round((1.0 - r["final_price"] / msrp_r) * 100.0, 1)
-                    mkt_l = str(res_l.get("market_status") or "sold").lower()
-                    r["_arch_status_badge"] = (
-                        "✅ Live Verified Won"
-                        if is_verified_sold_result(res_l)
-                        else f"⚠️ {mkt_l.title()} (0 bids)"
-                    )
-                elif res_l and res_l.get("not_found"):
-                    r["_arch_status_badge"] = "🗄️ Purged / Archived"
-                else:
-                    r["_arch_status_badge"] = "📸 Pre-Close Snapshot"
-
-        verified_page_hist = batch_verify_rows_history(records, hist_index, same_condition_only=True)
-        for row_start in range(0, len(records), 4):
-            grid_cols = st.columns(4)
-            for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
-                auction_id = int(row_dict['auction_id'])
-                item_url = f"https://www.nellisauction.com/p/item/{auction_id}"
-                cur_bid = float(row_dict.get('final_price') or 0)
-                msrp = float(row_dict.get('retail_price') or 0)
-                cond_display = format_clean_condition(row_dict.get('condition'))
-                cond_tier = get_condition_tier(cond_display)
-                cat_primary = row_dict.get('category_primary') or 'Home & General'
-                cat_secondary = row_dict.get('category_secondary') or 'Miscellaneous'
-
-                # Calculate initial time badge
-                if is_archive_mode:
-                    time_badge = f"🏁 Closed: {str(row_dict.get('closed_at'))[:16]}"
-                else:
-                    try:
-                        diff_sec = float(row_dict.get('diff_sec') or 0)
-                        if diff_sec <= 0:
-                            time_badge = "🔴 **POTENTIALLY CLOSED**"
-                        elif diff_sec < 180:
-                            mins = int(diff_sec // 60)
-                            secs = int(diff_sec % 60)
-                            time_badge = f"🔥 **{mins}m {secs:02d}s left (SNIPE!)**"
-                        elif diff_sec < 600:
-                            mins = int(diff_sec // 60)
-                            secs = int(diff_sec % 60)
-                            time_badge = f"⚡ **{mins}m {secs:02d}s left**"
-                        elif diff_sec < 3600:
-                            mins = int(diff_sec // 60)
-                            time_badge = f"⏳ **{mins}m left**"
-                        else:
-                            hours = int(diff_sec // 3600)
-                            mins = int((diff_sec % 3600) // 60)
-                            time_badge = f"🕒 **{hours}h {mins}m left**"
-                    except Exception:
-                        time_badge = f"Closes: {str(row_dict.get('closed_at'))[:16]}"
-
-                # 1. Lookup Verified Historical Closed Matches (Like-for-Like Condition) & Active Copies
-                past_matches = verified_page_hist.get(auction_id, [])
-                open_matches = [
-                    c for c in find_open_radar_matches(row_dict, open_radar_index)
-                    if int(c.get("auction_id") or 0) != auction_id
-                ]
-
-                # 2. Check for cheaper active copies in O(1) open_matches (when not in archive mode)
-                cheaper_in_batch = []
-                if not is_archive_mode and open_matches:
-                    cheaper_in_batch = [
-                        c for c in open_matches
-                        if float(c.get("final_price") or 0) < cur_bid
-                        and get_condition_tier(c.get("condition")) == cond_tier
-                    ]
-
-                with grid_cols[col_idx]:
-                    with st.container(border=True):
-                        # 1. Uniform Product Image
-                        photo = row_dict.get("photo_url")
-                        img_src = str(photo).strip() if photo and str(photo) != "nan" and str(photo).strip() else "https://placehold.co/300x200?text=No+Photo"
-                        st.markdown(
-                            f'<a href="{item_url}" target="_blank"><div class="nellis-card-img-wrap"><img src="{img_src}" alt="Item"/></div></a>',
-                            unsafe_allow_html=True,
-                        )
-
-                        # 2. Category Breadcrumb Pill
-                        st.markdown(
-                            f'<div class="nellis-cat-pill" title="{cat_primary} → {cat_secondary}">🏷️ {cat_primary} → {cat_secondary}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        # 3. Title
-                        safe_title = str(row_dict.get('title') or 'Untitled').replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-                        st.markdown(
-                            f'<div class="nellis-card-title" title="{safe_title}"><a href="{item_url}" target="_blank">{safe_title}</a></div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        # 4. 2-Column Nellis-style Stat Boxes: TIME LEFT | CURRENT PRICE
-                        bid_label = "WINNING PRICE" if is_archive_mode else "CURRENT PRICE"
-                        disc_pct_val = float(row_dict.get('discount_pct') or 0)
-                        if is_archive_mode:
-                            arch_badge = row_dict.get("_arch_status_badge") or "✅ Verified Won"
-                            time_cell_html = (
-                                f'<div style="font-size:11.5px; font-weight:700; color:#cbd5e1;">🏁 {str(row_dict.get("closed_at"))[:16]}</div>'
-                                f'<div style="font-size:10px; font-weight:700; color:#93c5fd; margin-top:2px;">{arch_badge}</div>'
-                            )
-                        else:
-                            close_epoch_ms = int(row_dict.get('close_ms') or 0)
-                            time_cell_html = (
-                                f'<span class="nellis-countdown-badge" data-close-ms="{close_epoch_ms}" '
-                                f'style="display:inline-block; font-weight:700; padding:2px 6px; border-radius:6px; font-size:12px; '
-                                f'background-color:#450a0a; color:#fca5a5; border:1px solid #ef4444;">{time_badge}</span>'
-                            )
-
-                        st.markdown(
-                            f"""
-                            <div class="nellis-stat-grid">
-                                <div class="nellis-stat-box">
-                                    <div class="nellis-stat-label">{"CLOSED" if is_archive_mode else "TIME LEFT"}</div>
-                                    <div class="nellis-stat-val">{time_cell_html}</div>
-                                </div>
-                                <div class="nellis-stat-box">
-                                    <div class="nellis-stat-label">{bid_label}</div>
-                                    <div class="nellis-stat-val">${cur_bid:,.2f} <span class="nellis-disc-badge">({disc_pct_val:.0f}% off)</span></div>
-                                </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        # 5. 3-Column Metadata Strip: EST. RETAIL | BIDS | LOCATION
-                        st.markdown(
-                            f"""
-                            <div class="nellis-meta-strip">
-                                <div>
-                                    <div class="nellis-meta-item-label">EST. RETAIL</div>
-                                    <div class="nellis-meta-item-val">${msrp:,.2f}</div>
-                                </div>
-                                <div>
-                                    <div class="nellis-meta-item-label">BIDS</div>
-                                    <div class="nellis-meta-item-val">{int(row_dict.get('bid_count') or 0)}</div>
-                                </div>
-                                <div>
-                                    <div class="nellis-meta-item-label">LOCATION</div>
-                                    <div class="nellis-meta-item-val">📍 {row_dict['location']}</div>
-                                </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        # 6. Star Rating + Condition Pill Tags
-                        m_rating = re.search(r"(\d)/5", cond_display)
-                        if m_rating:
-                            stars_n = int(m_rating.group(1))
-                        elif cond_tier == "New":
-                            stars_n = 5
-                        elif cond_tier == "Open Box / Like New":
-                            stars_n = 4
-                        elif cond_tier == "Used":
-                            stars_n = 3
-                        else:
-                            stars_n = 2
-                        stars_html = f'<span style="color:#facc15;">{"★" * stars_n}</span><span style="color:#475569;">{"☆" * (5 - stars_n)}</span>'
-
-                        tag_cls = "nellis-tag-pill new" if cond_tier == "New" else "nellis-tag-pill"
-                        tags = [cond_display.split("(")[0].strip().lower()]
-                        notes = row_dict.get('damage_notes')
-                        notes_str = str(notes).strip() if notes and str(notes) != "nan" else ""
-                        if "missing" in notes_str.lower():
-                            tags.append("missing parts")
-                        if "damage" in notes_str.lower() or "broken" in notes_str.lower():
-                            tags.append("damaged")
-                        tags_html = "".join(f'<span class="{tag_cls}">{t}</span>' for t in tags[:3])
-
-                        st.markdown(
-                            f'<div class="nellis-cond-row"><div class="nellis-stars">{stars_html}</div>{tags_html}</div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        if notes_str:
-                            safe_notes = notes_str.replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-                            st.markdown(
-                                f'<div style="font-size:11.5px; color:#fbbf24; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; margin-bottom:4px;" title="{safe_notes}">⚠️ {safe_notes}</div>',
-                                unsafe_allow_html=True,
-                            )
-
-                        # 7. Price History & Cheaper Active Copies Summary
-                        if past_matches:
-                            p_prices = [float(m.get("final_price") or 0) for m in past_matches]
-                            min_won = min(p_prices)
-                            avg_won = sum(p_prices) / len(p_prices)
-                            hist_avg_disc = ((msrp - avg_won) / msrp * 100.0) if msrp > 0 else 0.0
-                            if cur_bid <= min_won:
-                                verdict = "🟢 **Below All-Time Low!**"
-                            elif cur_bid <= avg_won:
-                                verdict = "🟢 **Below Avg Win**"
-                            else:
-                                verdict = f"🔴 **Above Avg (${avg_won:.2f})**"
-                            if (
-                                not is_archive_mode
-                                and cur_bid <= avg_won
-                                and len(past_matches) >= min_hist_sales
-                                and avg_won <= max_hist_avg
-                                and hist_avg_disc >= min_hist_disc
-                            ):
-                                sale_noun = "sale" if len(past_matches) == 1 else "sales"
-                                st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {len(past_matches)} {sale_noun})]**")
-                            st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.2f} ({len(past_matches)}) · {verdict}")
-                        else:
-                            st.caption(f"📊 No past '{cond_tier}' sales yet")
-
-                        if cheaper_in_batch:
-                            cheapest_open = min(float(c.get("final_price") or 0) for c in cheaper_in_batch)
-                            st.markdown(f"💡 **:green[{len(cheaper_in_batch)} Cheaper Open (${cheapest_open:.2f})!]**")
-
-                        # 8. Nellis-style Place Bid Button + History & Active Modal Button
-                        btn_cls = "nellis-place-bid-btn archive" if is_archive_mode else "nellis-place-bid-btn"
-                        action_label = "VIEW CLOSED LOT ↗" if is_archive_mode else "PLACE BID ↗"
-                        st.markdown(
-                            f'<a class="{btn_cls}" href="{item_url}" target="_blank">{action_label}</a>',
-                            unsafe_allow_html=True,
-                        )
-                        btn_label = f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})"
-                        if st.button(btn_label, key=f"btn_hist_{auction_id}", use_container_width=True):
-                            show_item_history_dialog(row_dict)
-
+        _render_auction_card_grid(
+            results_df.to_dict("records"),
+            is_archive_mode=False,
+            hist_index=hist_index,
+            open_radar_index=open_radar_index,
+            btn_key_prefix="btn_hist",
+            min_hist_sales=min_hist_sales,
+            min_hist_disc=min_hist_disc,
+            max_hist_avg=max_hist_avg,
+        )
         if total_pages > 1:
             st.markdown("---")
-            render_pagination_bar("bottom")
-
-        # Inject real-time ticking countdown JavaScript (only needed in active mode)
-        if not is_archive_mode:
-            components.html(
-                """
-                <script>
-                (function() {
-                    function tickCountdowns() {
-                        try {
-                            const parentDoc = window.parent.document;
-                            if (!parentDoc) return;
-                            const badges = parentDoc.querySelectorAll('.nellis-countdown-badge[data-close-ms]');
-                            const now = Date.now();
-                            
-                            badges.forEach(badge => {
-                                const closeMs = parseInt(badge.getAttribute('data-close-ms'));
-                                if (!closeMs || isNaN(closeMs)) return;
-                                
-                                const diff = closeMs - now;
-                                const totalSec = Math.floor(diff / 1000);
-                                
-                                if (totalSec <= 0) {
-                                    badge.innerHTML = "🔴 <b>POTENTIALLY CLOSED</b> <span style='font-size:10px; opacity:0.8;'>(anti-snipe)</span>";
-                                    badge.style.backgroundColor = "#334155";
-                                    badge.style.color = "#cbd5e1";
-                                    badge.style.borderColor = "#64748b";
-                                } else {
-                                    const mins = Math.floor(totalSec / 60);
-                                    const secs = totalSec % 60;
-                                    const secStr = secs < 10 ? '0' + secs : secs;
-                                    
-                                    if (totalSec < 180) {
-                                        badge.innerHTML = "🔥 <b>" + mins + "m " + secStr + "s left (SNIPE!)</b>";
-                                        badge.style.backgroundColor = "#450a0a";
-                                        badge.style.color = "#fca5a5";
-                                        badge.style.borderColor = "#ef4444";
-                                    } else if (totalSec < 600) {
-                                        badge.innerHTML = "⚡ <b>" + mins + "m " + secStr + "s left</b>";
-                                        badge.style.backgroundColor = "#451a03";
-                                        badge.style.color = "#fcd34d";
-                                        badge.style.borderColor = "#f59e0b";
-                                    } else if (totalSec < 3600) {
-                                        badge.innerHTML = "⏳ <b>" + mins + "m left</b>";
-                                        badge.style.backgroundColor = "#172554";
-                                        badge.style.color = "#93c5fd";
-                                        badge.style.borderColor = "#3b82f6";
-                                    } else {
-                                        const hours = Math.floor(totalSec / 3600);
-                                        const remMins = Math.floor((totalSec % 3600) / 60);
-                                        badge.innerHTML = "🕒 <b>" + hours + "h " + remMins + "m left</b>";
-                                        badge.style.backgroundColor = "#0f172a";
-                                        badge.style.color = "#cbd5e1";
-                                        badge.style.borderColor = "#334155";
-                                    }
-                                }
-                            });
-                        } catch (e) {
-                            // ignore sandbox warnings
-                        }
-                    }
-                    
-                    tickCountdowns();
-                    if (window.parent && !window.parent.__nellisTimer) {
-                        window.parent.__nellisTimer = setInterval(tickCountdowns, 1000);
-                    } else if (!window.__nellisTimer) {
-                        window.__nellisTimer = setInterval(tickCountdowns, 1000);
-                    }
-                })();
-                </script>
-                """,
-                height=0,
-                width=0
-            )
+            render_pagination_bar("bottom", "page_num", current_page, total_pages, start_idx, end_idx, total_results, noun="lots")
+        _render_countdown_script()
 
 
-# --- TAB 1B: BEST PAST DEALS (DAYTIME SCOUTING) ---
-elif view_mode == "🏆 Best Past Deals":
-    import datetime as _dt
-
-    PRIMARY_CATEGORIES = ["All Categories"] + sorted({p for p, _, _ in CATEGORY_RULES} | {"Home & General"})
-
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("🏆 Past Deals Filters")
-    pd_kw = st.sidebar.text_input("🔍 Search Keyword", placeholder="e.g. Dyson, Monitor, Air Fryer...", key="pd_kw")
-    pd_date_preset = st.sidebar.selectbox(
-        "📅 Auction Date Window",
-        [
-            "Last Night (24h)",
-            "Last 3 Days",
-            "Last 7 Days",
-            "Last 30 Days",
-            "All Time",
-            "Custom Date Range",
-        ],
-        index=2,
-        key="pd_date_preset",
-    )
-
-    today_az = _dt.date.today()
-    pd_start_date, pd_end_date = None, None
-    if pd_date_preset == "Custom Date Range":
-        d_col1, d_col2 = st.sidebar.columns(2)
-        with d_col1:
-            pd_start_date = st.date_input("From", value=today_az - _dt.timedelta(days=7), key="pd_start")
-        with d_col2:
-            pd_end_date = st.date_input("To", value=today_az, key="pd_end")
-
-    pd_min_disc = st.sidebar.number_input(
-        "🔥 Minimum Discount (% Off)",
-        min_value=0,
-        max_value=99,
-        value=90,
-        step=5,
-        key="pd_min_disc",
-    )
-    pd_cond = st.sidebar.selectbox("✨ Condition", ["All", "Brand New", "Like New", "Open Box", "Used", "Incomplete / Damaged / Parts"], index=1, key="pd_cond")
-    pd_sort = st.sidebar.selectbox(
-        "↕️ Sort By",
-        [
-            "Highest % Off",
-            "Biggest $ Savings",
-            "Lowest Winning Bid ($)",
-            "Most Recently Closed",
-            "Highest Retail MSRP ($)",
-        ],
-        key="pd_sort",
-    )
-
-    with st.sidebar.expander("⚙️ More Filters", expanded=False):
-        pd_sleeper_only = st.checkbox(
-            "😴 Low-Competition Sleepers (Bids ≤ 3 & MSRP ≥ $100)",
-            value=False,
-            key="pd_sleeper_only",
-        )
-        pd_cat = st.selectbox("🏷️ Category", PRIMARY_CATEGORIES, key="pd_cat")
-        pd_loc = st.selectbox("📍 Warehouse", ["All", "Phoenix", "Mesa"], key="pd_loc")
-        pd_min_retail = st.number_input("Minimum Retail MSRP ($)", min_value=0, max_value=50000, value=0, step=10, key="pd_min_retail")
-        pd_max_bid = st.number_input("Maximum Winning Bid ($)", min_value=1, max_value=50000, value=1000, step=25, key="pd_max_bid")
-        pd_page_size_opt = st.selectbox("📄 Deals Per Page", [40, 60, 100], index=0, key="pd_page_size")
-
+# --- TAB 2: PAST ARCHIVE (UNIFIED HISTORICAL SEARCH & TOP DEALS) ---
+elif view_mode == "🗄️ Past Archive":
     inject_nellis_card_css()
+    a_cfg = render_arch_filter_controls()
+    a_kw = a_cfg["search_kw"]
+    a_date_preset = a_cfg["date_preset"]
+    a_start_date = a_cfg["start_date"]
+    a_end_date = a_cfg["end_date"]
+    a_loc = a_cfg["loc_filter"]
+    a_cond = a_cfg["cond_filter"]
+    a_sort = a_cfg["sort_by"]
+    a_min_retail = a_cfg["min_retail"]
+    a_max_bid = a_cfg["max_bid"]
+    a_cat = a_cfg["cat_filter"]
+    a_min_disc = a_cfg["min_disc"]
+    a_settled_only = a_cfg["settled_only"]
+    a_sleeper_only = a_cfg["sleeper_only"]
+    a_page_size = a_cfg["page_size"]
 
-    # Build DuckDB query for closed historical deals (excludes pre-close active scrapes & relisted 0-bid lots)
+    base_arch_where = get_settled_sales_where_sql("f") if a_settled_only else get_archive_candidates_where_sql("f")
     where_parts = [
-        get_settled_sales_where_sql("f"),
-        "f.retail_price > 0",
-        f"f.retail_price >= {pd_min_retail}",
-        f"f.final_price <= {pd_max_bid}",
-        f"ROUND((1.0 - f.discount_ratio) * 100.0, 1) >= {pd_min_disc}",
+        base_arch_where,
+        f"f.retail_price >= {a_min_retail}",
+        f"f.final_price <= {a_max_bid}",
     ]
-    if pd_date_preset == "Last Night (24h)":
-        where_parts.append("f.closed_at >= now() - INTERVAL 24 HOUR")
-    elif pd_date_preset == "Last 3 Days":
-        where_parts.append("f.closed_at >= now() - INTERVAL 3 DAY")
-    elif pd_date_preset == "Last 7 Days":
-        where_parts.append("f.closed_at >= now() - INTERVAL 7 DAY")
-    elif pd_date_preset == "Last 30 Days":
-        where_parts.append("f.closed_at >= now() - INTERVAL 30 DAY")
-    elif pd_date_preset == "Custom Date Range" and pd_start_date and pd_end_date:
-        where_parts.append(f"CAST(f.closed_at AS DATE) >= DATE '{pd_start_date.isoformat()}'")
-        where_parts.append(f"CAST(f.closed_at AS DATE) <= DATE '{pd_end_date.isoformat()}'")
+    if a_min_disc > 0:
+        where_parts.append("f.retail_price > 0")
+        where_parts.append(f"ROUND((1.0 - f.discount_ratio) * 100.0, 1) >= {a_min_disc}")
 
-    if pd_sleeper_only:
+    if a_date_preset == "Last 24h":
+        where_parts.append("f.closed_at >= now() - INTERVAL 24 HOUR")
+    elif a_date_preset == "Last 3 Days":
+        where_parts.append("f.closed_at >= now() - INTERVAL 3 DAY")
+    elif a_date_preset == "Last 7 Days":
+        where_parts.append("f.closed_at >= now() - INTERVAL 7 DAY")
+    elif a_date_preset == "Last 30 Days":
+        where_parts.append("f.closed_at >= now() - INTERVAL 30 DAY")
+    elif a_date_preset == "Custom Range" and a_start_date and a_end_date:
+        where_parts.append(f"CAST(f.closed_at AS DATE) >= DATE '{a_start_date.isoformat()}'")
+        where_parts.append(f"CAST(f.closed_at AS DATE) <= DATE '{a_end_date.isoformat()}'")
+
+    if a_sleeper_only:
         where_parts.append("f.bid_count <= 3 AND f.retail_price >= 100")
-    if pd_loc != "All":
-        where_parts.append(f"f.location = '{pd_loc}'")
-    if pd_cond != "All" and pd_cond != "Incomplete / Damaged / Parts":
-        where_parts.append(f"f.condition ILIKE '%{pd_cond}%'")
-    if pd_kw.strip():
-        fuzzy_sql = build_fuzzy_sql_where(pd_kw)
+    if a_loc != "All":
+        where_parts.append(f"f.location = '{a_loc}'")
+    if a_cond == "Incomplete / Damaged / Parts":
+        where_parts.append("(f.condition ILIKE '%Damaged%' OR f.condition ILIKE '%Incomplete%' OR f.condition ILIKE '%Parts%')")
+    elif a_cond != "All":
+        where_parts.append(f"f.condition ILIKE '%{a_cond}%'")
+    if a_kw.strip():
+        fuzzy_sql = build_fuzzy_sql_where(a_kw)
         if fuzzy_sql:
             where_parts.append(fuzzy_sql)
 
     where_sql = " AND ".join(where_parts)
     sort_sql = {
+        "Most Recently Closed": "f.closed_at DESC",
         "Highest % Off": "f.discount_ratio ASC, f.retail_price DESC",
         "Biggest $ Savings": "(f.retail_price - f.final_price) DESC",
         "Lowest Winning Bid ($)": "f.final_price ASC",
-        "Most Recently Closed": "f.closed_at DESC",
         "Highest Retail MSRP ($)": "f.retail_price DESC",
-    }.get(pd_sort, "f.discount_ratio ASC")
+    }.get(a_sort, "f.closed_at DESC")
 
-    past_deals_sql = f"""
+    archive_sql = f"""
         SELECT
             f.auction_id,
             p.title,
@@ -2528,7 +2844,10 @@ elif view_mode == "🏆 Best Past Deals":
             f.damage_notes,
             f.closed_at,
             f.photo_url,
-            COUNT(*) OVER () AS _sql_total_count
+            f.is_closed,
+            f.market_status,
+            COUNT(*) OVER () AS _sql_total_count,
+            CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms
         FROM fact_auctions f
         JOIN dim_products p ON f.product_id = p.product_id
         WHERE {where_sql}
@@ -2536,68 +2855,48 @@ elif view_mode == "🏆 Best Past Deals":
         LIMIT 2000;
     """
 
-    pd_df = pd.DataFrame()
-    with st.spinner("Scanning past winning deals in Data Lake..."):
+    arch_df = pd.DataFrame()
+    with st.spinner("Searching closed historical auctions in Data Lake..."):
         try:
-            pd_df = run_cached_duckdb_query(past_deals_sql)
+            arch_df = run_cached_duckdb_query(archive_sql)
         except Exception as e:
-            st.error(f"Error querying Best Past Deals: {e}")
+            st.error(f"Error querying Past Archive: {e}")
 
-    if not pd_df.empty:
-        if "category_primary" not in pd_df.columns:
-            pd_df["category_primary"] = ""
-        if "category_secondary" not in pd_df.columns:
-            pd_df["category_secondary"] = ""
-        cats = [
-            classify_product_category(t, cp, cs)
-            for t, cp, cs in zip(pd_df["title"].fillna(""), pd_df["category_primary"].fillna(""), pd_df["category_secondary"].fillna(""))
-        ]
-        pd_df["category_primary"] = [c[0] for c in cats]
-        pd_df["category_secondary"] = [c[1] for c in cats]
-
-        notes_col = pd_df["damage_notes"].fillna("") if "damage_notes" in pd_df.columns else [""] * len(pd_df)
-        comp_col = pd_df["completeness"].fillna("") if "completeness" in pd_df.columns else [""] * len(pd_df)
-        func_col = pd_df["functional_status"].fillna("") if "functional_status" in pd_df.columns else [""] * len(pd_df)
-        pd_df["condition"] = [
-            "Incomplete / Damaged / Parts"
-            if (str(cp).lower() in ("incomplete", "partial") or str(fn).lower() in ("non-functional", "broken"))
-            else format_clean_condition(c, t, n)
-            for c, t, n, cp, fn in zip(pd_df["condition"].fillna(""), pd_df["title"].fillna(""), notes_col, comp_col, func_col)
-        ]
-        if pd_cond != "All":
-            pd_df = pd_df[pd_df["condition"].str.contains(pd_cond, case=False, na=False)]
-
-        if pd_cat != "All Categories":
-            pd_df = pd_df[pd_df["category_primary"] == pd_cat]
-        if pd_kw.strip() and not pd_df.empty:
+    if not arch_df.empty:
+        arch_df = enrich_categories(arch_df)
+        arch_df = normalize_df_conditions(arch_df)
+        if a_cond != "All":
+            arch_df = arch_df[arch_df["condition"].str.contains(a_cond, case=False, na=False, regex=False)]
+        if a_cat != "All Categories":
+            arch_df = arch_df[arch_df["category_primary"] == a_cat]
+        if a_kw.strip() and not arch_df.empty:
             scores = [
-                smart_fuzzy_search_score(pd_kw, t, n)
-                for t, n in zip(pd_df["title"].fillna(""), pd_df["damage_notes"].fillna(""))
+                smart_fuzzy_search_score(a_kw, t, n)
+                for t, n in zip(arch_df["title"].fillna(""), arch_df["damage_notes"].fillna(""))
             ]
-            pd_df = pd_df.assign(_search_score=scores)
-            pd_df = pd_df[pd_df["_search_score"] >= 0.65]
+            arch_df = arch_df.assign(_search_score=scores)
+            arch_df = arch_df[arch_df["_search_score"] >= 0.65]
 
-    st.caption(
-        f"**Past Deals Filter:** 📅 {pd_date_preset} · 🔥 ≥ {pd_min_disc}% off"
-        + (f" · 😴 Sleepers Only" if pd_sleeper_only else "")
-        + (f" · 🏷️ {pd_cat}" if pd_cat != "All Categories" else "")
-        + (f" · 🔍 '{pd_kw.strip()}'" if pd_kw.strip() else "")
-    )
-
-    if pd_df.empty:
-        st.info("No past closed deals match your criteria. Try widening the Date Window or lowering Minimum Discount (% Off).")
+    if arch_df.empty:
+        st.info("No past closed lots match your filters. Try tapping **Reset** or widening the Date Window / Discount threshold.")
     else:
-        # IDEA 3: "Target Bid" Cheat Sheet Banner
-        median_win = float(pd_df["final_price"].median())
-        steal_p20 = float(pd_df["final_price"].quantile(0.20))
-        median_disc = float(pd_df["discount_pct"].median())
-        avg_bids = float(pd_df["bid_count"].mean())
-        max_savings = float(pd_df["dollar_savings"].max())
+        total_arch = len(arch_df)
+        sql_total_arch = int(arch_df["_sql_total_count"].max() or 0) if "_sql_total_count" in arch_df.columns else total_arch
 
-        sql_total_pd = int(pd_df["_sql_total_count"].max() or 0) if "_sql_total_count" in pd_df.columns else len(pd_df)
+        # Target Bid Cheat Sheet & Condition Arbitrage: prefer verified sales when mixed archive results exist
+        settled_mask = (arch_df["is_closed"] == True) & (arch_df["bid_count"].fillna(0) > 0) & (arch_df["final_price"].fillna(0) > 0)
+        stats_df = arch_df[settled_mask] if (not a_settled_only and settled_mask.any()) else arch_df
+        stats_scope = "verified sales" if (a_settled_only or settled_mask.any()) else "listed closes"
+
+        median_win = float(stats_df["final_price"].median())
+        steal_p20 = float(stats_df["final_price"].quantile(0.20))
+        median_disc = float(stats_df["discount_pct"].median())
+        avg_bids = float(stats_df["bid_count"].mean())
+        max_savings = float(stats_df["dollar_savings"].max())
+
         lot_count_sub = (
-            f"of {sql_total_pd:,} in lake · Avg {avg_bids:.1f} bids"
-            if sql_total_pd > len(pd_df)
+            f"of {sql_total_arch:,} in lake · Avg {avg_bids:.1f} bids"
+            if sql_total_arch > total_arch
             else f"Avg {avg_bids:.1f} bids"
         )
 
@@ -2606,11 +2905,11 @@ elif view_mode == "🏆 Best Past Deals":
             <div style="display:grid; grid-template-columns:repeat(auto-fit, minmax(145px, 1fr)); gap:8px; margin-bottom:10px;">
                 <div class="nellis-stat-box">
                     <div class="nellis-stat-label">Matching Lots</div>
-                    <div class="nellis-stat-val">{len(pd_df):,}</div>
+                    <div class="nellis-stat-val">{total_arch:,}</div>
                     <div style="font-size:11px; color:#475569; font-weight:600;">{lot_count_sub}</div>
                 </div>
                 <div class="nellis-stat-box">
-                    <div class="nellis-stat-label">Median Win</div>
+                    <div class="nellis-stat-label">Median Win ({stats_scope})</div>
                     <div class="nellis-stat-val">${median_win:,.2f}</div>
                     <div style="font-size:11px; color:#15803d; font-weight:700;">{median_disc:.1f}% off</div>
                 </div>
@@ -2629,10 +2928,10 @@ elif view_mode == "🏆 Best Past Deals":
             unsafe_allow_html=True,
         )
 
-        # IDEA 5: "Condition Arbitrage" Quick Comparison Strip
-        pd_df["_cond_tier"] = [get_condition_tier(c) for c in pd_df["condition"]]
+        cond_base_df = stats_df.copy()
+        cond_base_df["_cond_tier"] = [get_condition_tier(c) for c in cond_base_df["condition"]]
         tier_summary = (
-            pd_df.groupby("_cond_tier", as_index=False)
+            cond_base_df.groupby("_cond_tier", as_index=False)
             .agg(
                 lots=("auction_id", "count"),
                 avg_win=("final_price", "mean"),
@@ -2650,136 +2949,82 @@ elif view_mode == "🏆 Best Past Deals":
                         f"{trow['med_disc']:.0f}% off",
                     )
 
-        # Load Open Radar Index (Idea 1: "Back Tonight" Radar)
+        ARCH_PAGE_SIZE = a_page_size
+        arch_sig = (
+            a_kw.strip(), a_date_preset, str(a_start_date), str(a_end_date),
+            a_min_disc, a_settled_only, a_sleeper_only, a_cat, a_loc, a_cond,
+            a_min_retail, a_max_bid, a_sort, ARCH_PAGE_SIZE,
+        )
+        if st.session_state.get("arch_last_sig") != arch_sig:
+            st.session_state["arch_last_sig"] = arch_sig
+            st.session_state["arch_page_num"] = 1
+
+        arch_total_pages = max(1, math.ceil(total_arch / ARCH_PAGE_SIZE))
+        arch_curr_page = min(max(1, int(st.session_state.get("arch_page_num", 1))), arch_total_pages)
+        st.session_state["arch_page_num"] = arch_curr_page
+        arch_start_i = (arch_curr_page - 1) * ARCH_PAGE_SIZE
+        arch_end_i = min(arch_start_i + ARCH_PAGE_SIZE, total_arch)
+        arch_page_df = arch_df.iloc[arch_start_i:arch_end_i]
+
+        if sql_total_arch > total_arch and total_arch >= 2000:
+            st.write(f"**Found {sql_total_arch:,} closed historical lots** (showing {arch_start_i + 1}–{arch_end_i} of top 2,000):")
+        elif sql_total_arch > total_arch:
+            st.write(f"**Found {total_arch:,} matching closed historical lots** (from top 2,000 of {sql_total_arch:,}; showing {arch_start_i + 1}–{arch_end_i}):")
+        else:
+            st.write(f"**Found {total_arch:,} closed historical lots** (showing {arch_start_i + 1}–{arch_end_i}):")
+
+        render_pagination_bar("arch_top", "arch_page_num", arch_curr_page, arch_total_pages, arch_start_i, arch_end_i, total_arch, noun="lots")
+
+        records = arch_page_df.to_dict("records")
+        # Live-verify unverified visible page rows so archive results show live status without scanning all 290k rows
+        unv_page_ids = tuple(sorted({
+            int(r["auction_id"])
+            for r in records
+            if not (r.get("is_closed") is True) and int(r.get("auction_id") or 0) > 0
+        }))
+        page_live_map = verify_closed_lots_cached(unv_page_ids) if unv_page_ids else {}
+        for r in records:
+            if r.get("is_closed") is True:
+                r["_arch_status_badge"] = "✅ Verified Won"
+                continue
+            res_l = page_live_map.get(int(r.get("auction_id") or 0))
+            if res_l and not res_l.get("not_found") and res_l.get("is_closed"):
+                r["final_price"] = float(res_l.get("final_price") or r.get("final_price") or 0)
+                r["bid_count"] = int(res_l.get("bid_count") or r.get("bid_count") or 0)
+                msrp_r = float(r.get("retail_price") or res_l.get("retail_price") or 0)
+                r["dollar_savings"] = max(0.0, msrp_r - r["final_price"])
+                if msrp_r > 0:
+                    r["discount_pct"] = round((1.0 - r["final_price"] / msrp_r) * 100.0, 1)
+                mkt_l = str(res_l.get("market_status") or "sold").lower()
+                r["_arch_status_badge"] = (
+                    "✅ Live Verified Won"
+                    if is_verified_sold_result(res_l)
+                    else f"⚠️ {mkt_l.title()} (0 bids)"
+                )
+            elif res_l and res_l.get("not_found"):
+                r["_arch_status_badge"] = "🗄️ Purged / Archived"
+            else:
+                r["_arch_status_badge"] = "📸 Pre-Close Snapshot"
+
         open_radar_index = load_open_radar_index()
         hist_index = load_historical_price_index()
-
-        # Configurable pagination (default 40 per page)
-        PD_PAGE_SIZE = pd_page_size_opt
-        pd_sig = (pd_kw.strip(), pd_date_preset, str(pd_start_date), str(pd_end_date), pd_min_disc, pd_sleeper_only, pd_cat, pd_loc, pd_cond, pd_min_retail, pd_max_bid, pd_sort, PD_PAGE_SIZE)
-        if st.session_state.get("pd_last_sig") != pd_sig:
-            st.session_state["pd_last_sig"] = pd_sig
-            st.session_state["pd_page_num"] = 1
-
-        pd_total = len(pd_df)
-        pd_total_pages = max(1, math.ceil(pd_total / PD_PAGE_SIZE))
-        pd_curr_page = min(max(1, int(st.session_state.get("pd_page_num", 1))), pd_total_pages)
-        st.session_state["pd_page_num"] = pd_curr_page
-        pd_start_i = (pd_curr_page - 1) * PD_PAGE_SIZE
-        pd_end_i = min(pd_start_i + PD_PAGE_SIZE, pd_total)
-        pd_page_df = pd_df.iloc[pd_start_i:pd_end_i]
-
-        def render_pd_pagination(key_prefix: str):
-            if pd_total_pages <= 1:
-                return
-            p1, p2, p3 = st.columns([1.5, 3, 1.5])
-            with p1:
-                if st.button("⬅️ Previous Page", key=f"{key_prefix}_prev", disabled=(pd_curr_page <= 1), use_container_width=True):
-                    st.session_state["pd_page_num"] = pd_curr_page - 1
-                    st.session_state["_scroll_to_top"] = True
-                    st.rerun()
-            with p2:
-                st.markdown(
-                    f"<div style='text-align:center; padding-top:6px; font-weight:600;'>"
-                    f"Page {pd_curr_page} of {pd_total_pages} &nbsp;·&nbsp; Showing {pd_start_i + 1}–{pd_end_i} of {pd_total:,} deals"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-            with p3:
-                if st.button("Next Page ➡️", key=f"{key_prefix}_next", disabled=(pd_curr_page >= pd_total_pages), use_container_width=True):
-                    st.session_state["pd_page_num"] = pd_curr_page + 1
-                    st.session_state["_scroll_to_top"] = True
-                    st.rerun()
-
-        render_pd_pagination("pd_top")
-
-        records = pd_page_df.to_dict("records")
-        verified_pd_hist = batch_verify_rows_history(records, hist_index, same_condition_only=True)
-        for row_start in range(0, len(records), 4):
-            grid_cols = st.columns(4)
-            for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
-                auction_id = int(row_dict["auction_id"])
-                item_url = f"https://www.nellisauction.com/p/item/{auction_id}"
-                win_bid = float(row_dict.get("final_price") or 0)
-                msrp = float(row_dict.get("retail_price") or 0)
-                disc_pct_val = float(row_dict.get("discount_pct") or 0)
-                savings_val = float(row_dict.get("dollar_savings") or max(0.0, msrp - win_bid))
-                cond_display = format_clean_condition(row_dict.get("condition"))
-                cond_tier = get_condition_tier(cond_display)
-                cat_primary = row_dict.get("category_primary") or "Home & General"
-                cat_secondary = row_dict.get("category_secondary") or "Miscellaneous"
-
-                # Idea 1: Check if an identical item is open right now!
-                open_matches = find_open_radar_matches(row_dict, open_radar_index)
-                past_matches = verified_pd_hist.get(auction_id, [])
-
-                with grid_cols[col_idx]:
-                    with st.container(border=True):
-                        photo = row_dict.get("photo_url")
-                        img_src = str(photo).strip() if photo and str(photo) != "nan" and str(photo).strip() else "https://placehold.co/300x200?text=No+Photo"
-                        st.markdown(
-                            f'<a href="{item_url}" target="_blank"><div class="nellis-card-img-wrap"><img src="{img_src}" alt="Item"/></div></a>',
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(
-                            f'<div class="nellis-cat-pill" title="{cat_primary} → {cat_secondary}">🏷️ {cat_primary} → {cat_secondary}</div>',
-                            unsafe_allow_html=True,
-                        )
-                        safe_title = str(row_dict.get("title") or "Untitled").replace('"', '&quot;').replace('<', '&lt;').replace('>', '&gt;')
-                        st.markdown(
-                            f'<div class="nellis-card-title" title="{safe_title}"><a href="{item_url}" target="_blank">{safe_title}</a></div>',
-                            unsafe_allow_html=True,
-                        )
-                        st.markdown(
-                            f"""
-                            <div class="nellis-stat-grid">
-                                <div class="nellis-stat-box">
-                                    <div class="nellis-stat-label">CLOSED DATE</div>
-                                    <div class="nellis-stat-val" style="font-size:12.5px;">🏁 {str(row_dict.get("closed_at"))[:16]}</div>
-                                </div>
-                                <div class="nellis-stat-box">
-                                    <div class="nellis-stat-label">WINNING PRICE</div>
-                                    <div class="nellis-stat-val">${win_bid:,.2f} <span class="nellis-disc-badge">({disc_pct_val:.0f}% off)</span></div>
-                                </div>
-                            </div>
-                            <div class="nellis-meta-strip">
-                                <div><div class="nellis-meta-item-label">EST. RETAIL</div><div class="nellis-meta-item-val">${msrp:,.2f}</div></div>
-                                <div><div class="nellis-meta-item-label">BIDS</div><div class="nellis-meta-item-val">{int(row_dict.get('bid_count') or 0)}</div></div>
-                                <div><div class="nellis-meta-item-label">SAVED</div><div class="nellis-meta-item-val" style="color:#15803d;">${savings_val:,.0f}</div></div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
-
-                        # Star rating + condition tags + location
-                        m_rating = re.search(r"(\d)/5", cond_display)
-                        stars_n = int(m_rating.group(1)) if m_rating else (5 if cond_tier == "New" else (4 if cond_tier == "Open Box / Like New" else (3 if cond_tier == "Used" else 2)))
-                        stars_html = f'<span style="color:#facc15;">{"★" * stars_n}</span><span style="color:#475569;">{"☆" * (5 - stars_n)}</span>'
-                        tag_cls = "nellis-tag-pill new" if cond_tier == "New" else "nellis-tag-pill"
-                        st.markdown(
-                            f'<div class="nellis-cond-row"><div class="nellis-stars">{stars_html}</div>'
-                            f'<span class="{tag_cls}">{cond_display.split("(")[0].strip().lower()}</span> '
-                            f'<span class="nellis-tag-pill">📍 {row_dict["location"]}</span></div>',
-                            unsafe_allow_html=True,
-                        )
-
-                        if open_matches:
-                            cheapest_now = float(open_matches[0].get("final_price") or 0)
-                            open_url = f"https://www.nellisauction.com/p/item/{int(open_matches[0]['auction_id'])}"
-                            st.markdown(f"🟢 **:green[Back Open Tonight!]** ([From ${cheapest_now:.2f} ↗]({open_url}))")
-
-                        st.markdown(
-                            f'<a class="nellis-place-bid-btn archive" href="{item_url}" target="_blank">VIEW CLOSED LOT ↗</a>',
-                            unsafe_allow_html=True,
-                        )
-                        if st.button(f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})", key=f"pd_btn_hist_{auction_id}", use_container_width=True):
-                            show_item_history_dialog(row_dict)
-
-        render_pd_pagination("pd_bot")
+        _render_auction_card_grid(
+            records,
+            is_archive_mode=True,
+            hist_index=hist_index,
+            open_radar_index=open_radar_index,
+            btn_key_prefix="arch_btn_hist",
+        )
+        if arch_total_pages > 1:
+            st.markdown("---")
+            render_pagination_bar("arch_bot", "arch_page_num", arch_curr_page, arch_total_pages, arch_start_i, arch_end_i, total_arch, noun="lots")
 
 
-# --- TAB 2: ANALYTICS HUB ---
-elif view_mode == "📊 Analytics Hub":
+# --- TAB 3: ANALYTICS HUB ---
+elif view_mode == "📊 Analytics":
+    with st.sidebar:
+        st.subheader("📊 Analytics Hub")
+        st.caption("Filters apply to **🎯 Live Deals** and **🗄️ Past Archive**. Choose one of the 5 Data Lake models on the right.")
     st.title("📊 Nellis Auction Analytical Models")
     st.caption("Sub-second SQL analytics powered by DuckDB columnar processing over Parquet")
 
@@ -2979,8 +3224,11 @@ elif view_mode == "📊 Analytics Hub":
             st.dataframe(ext_df, use_container_width=True)
 
 
-# --- TAB 3: SQL STUDIO ---
+# --- TAB 4: SQL STUDIO ---
 elif view_mode == "💻 SQL Studio":
+    with st.sidebar:
+        st.subheader("💻 SQL Studio")
+        st.caption("Run read-only DuckDB queries or ask Gemini in plain English. Switch tabs above to return to deal filters.")
     st.title("💻 Interactive DuckDB SQL Studio")
     st.caption("Ask questions in plain English (powered by Gemini Free Tier) or run custom SQL directly against `fact_auctions`, `fact_bids`, and `dim_products` on Cloudflare R2.")
 
@@ -3041,17 +3289,6 @@ elif view_mode == "💻 SQL Studio":
    - auction_final_price (DOUBLE)
    - pct_of_final_price (DOUBLE: bid_amount / auction_final_price)
    - scraped_date (DATE)"""
-
-    def validate_readonly_sql(sql_text: str) -> str:
-        s = re.sub(r"^```(?:sql)?\s*|\s*```$", "", (sql_text or "").strip(), flags=re.IGNORECASE | re.MULTILINE).strip()
-        s = re.sub(r";+\s*$", "", s).strip()
-        if ";" in s:
-            raise ValueError("Only a single read-only SELECT statement is permitted.")
-        if not re.match(r"^(SELECT|WITH)\b", s, re.IGNORECASE):
-            raise ValueError("Generated query must start with SELECT or WITH.")
-        if re.search(r"\b(DROP|DELETE|UPDATE|INSERT|ALTER|CREATE|ATTACH|DETACH|COPY|TRUNCATE|PRAGMA|EXPORT|IMPORT|CALL|INSTALL|LOAD)\b", s, re.IGNORECASE):
-            raise ValueError("Only read-only SELECT queries are permitted.")
-        return s
 
     def generate_sql_from_english(question: str, api_key: str) -> str:
         prompt = (
