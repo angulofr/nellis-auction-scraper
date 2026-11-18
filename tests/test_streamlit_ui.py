@@ -243,6 +243,55 @@ class TestStreamlitUI(unittest.TestCase):
             at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
             self.assertEqual(len(at.exception), 0)
 
+    def test_legacy_session_state_migration_and_fallback_controls(self):
+        """Stale session values from earlier deploys & legacy (<1.40 / <1.33) fallbacks render with 0 exceptions."""
+        import streamlit as st
+
+        seed_local_data_lake(self.lake_dir)
+        now_ms = int(time.time() * 1000)
+        self.srv, _ = start_mock_nellis_server(now_ms)
+        base_url = f"http://127.0.0.1:{self.srv.server_port}"
+
+        with self._run_apptest_env({"NELLIS_API_BASE": base_url}):
+            # 1. Stale session_state keys carried over from pre-redesign UI
+            at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25)
+            at.session_state["nav_view"] = "🎯 Live Deals"
+            at.session_state["_last_nav_view"] = "🎯 Live Deals"
+            at.session_state["live_time"] = "< 5 mins"
+            at.session_state["live_sort"] = "Deprecated Sort"
+            at.session_state["live_min_retail"] = None
+            at.run()
+            self.assertEqual(len(at.exception), 0, f"Stale Live state raised: {at.exception}")
+            self.assertEqual(at.session_state["nav_view"], "Live")
+            self.assertEqual(at.session_state["live_time"], "5m")
+
+            at_arch = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25)
+            at_arch.session_state["nav_view"] = "🗄️ Past Archive"
+            at_arch.session_state["_last_nav_view"] = "🗄️ Past Archive"
+            at_arch.session_state["arch_date_preset"] = "Last 7 Days"
+            at_arch.run()
+            self.assertEqual(len(at_arch.exception), 0, f"Stale Archive state raised: {at_arch.exception}")
+            self.assertEqual(at_arch.session_state["nav_view"], "Archive")
+            self.assertEqual(at_arch.session_state["arch_date_preset"], "7d")
+
+            # 2. Legacy Streamlit <1.33 / <1.40 fallback (no segmented_control, no popover)
+            saved_seg = getattr(st, "segmented_control", None)
+            saved_pop = getattr(st, "popover", None)
+            if saved_seg is not None:
+                delattr(st, "segmented_control")
+            if saved_pop is not None:
+                delattr(st, "popover")
+            try:
+                at_leg = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
+                self.assertEqual(len(at_leg.exception), 0, f"Legacy fallback raised: {at_leg.exception}")
+                at_leg.radio(key="nav_view").set_value("Archive").run()
+                self.assertEqual(len(at_leg.exception), 0, f"Legacy Archive fallback raised: {at_leg.exception}")
+            finally:
+                if saved_seg is not None:
+                    st.segmented_control = saved_seg
+                if saved_pop is not None:
+                    st.popover = saved_pop
+
 
 if __name__ == "__main__":
     unittest.main()

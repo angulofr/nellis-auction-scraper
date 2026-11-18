@@ -7,6 +7,7 @@ Cloud-ready Streamlit application queryable from phone, tablet, or desktop.
 from __future__ import annotations
 
 import ast
+import contextlib
 import datetime as _dt
 import difflib
 import inspect as _inspect
@@ -1969,6 +1970,56 @@ LIVE_DEFAULTS = {
     "live_page_size": 40,
 }
 
+LEGACY_NAV_MAP = {
+    "🎯 Live Deals": "Live",
+    "🎯 Deal Finder": "Live",
+    "Live Deals": "Live",
+    "🗄️ Past Archive": "Archive",
+    "Past Archive": "Archive",
+    "🏆 Best Past Deals": "Archive",
+    "📊 Analytics": "Analytics",
+    "💻 SQL Studio": "SQL",
+    "SQL Studio": "SQL",
+}
+LEGACY_LIVE_MAP = {
+    "live_time": {
+        "< 5 mins": "5m",
+        "< 15 mins": "15m",
+        "< 30 mins": "30m",
+        "< 1 hour": "1h",
+        "< 24 hours": "24h",
+        "All Active": "All",
+    },
+}
+LEGACY_ARCH_MAP = {
+    "arch_date_preset": {
+        "All Time": "All",
+        "Last 24h": "24h",
+        "Last 3 Days": "3d",
+        "Last 7 Days": "7d",
+        "Last 30 Days": "30d",
+        "Custom Range": "Custom",
+    },
+}
+LIVE_ALLOWED_MAP = {
+    "live_time": LIVE_TIME_CHIPS,
+    "live_wh": WAREHOUSE_OPTIONS,
+    "live_cond": COND_OPTIONS,
+    "live_sort": LIVE_SORT_OPTIONS,
+    "live_retail_preset": RETAIL_PRESET_OPTIONS,
+    "live_cat": PRIMARY_CATEGORIES,
+    "live_page_size": [40, 60, 100],
+}
+ARCH_ALLOWED_MAP = {
+    "arch_date_preset": ARCH_DATE_CHIPS,
+    "arch_wh": WAREHOUSE_OPTIONS,
+    "arch_cond": COND_OPTIONS,
+    "arch_sort": ARCH_SORT_OPTIONS,
+    "arch_retail_preset": RETAIL_PRESET_OPTIONS,
+    "arch_cat": PRIMARY_CATEGORIES,
+    "arch_page_size": [40, 60, 100],
+}
+
 
 def _get_arch_defaults() -> dict:
     today_az = _dt.date.today()
@@ -1992,11 +2043,23 @@ def _get_arch_defaults() -> dict:
     }
 
 
-def _init_filter_state(defaults: dict):
-    """Initialize canonical filter keys and sync both sidebar (`sb_*`) and main (`top_*`) widget mirrors."""
+def _init_filter_state(defaults: dict, allowed_map: dict | None = None, legacy_map: dict | None = None):
+    """Initialize canonical filter keys, migrate/validate stale session values, and sync `sb_*` & `top_*` mirrors."""
     for field, default_val in defaults.items():
         if field not in st.session_state:
             st.session_state[field] = default_val
+        elif legacy_map and field in legacy_map:
+            cur_v = st.session_state[field]
+            if cur_v in legacy_map[field]:
+                st.session_state[field] = legacy_map[field][cur_v]
+        if allowed_map and field in allowed_map and st.session_state.get(field) not in allowed_map[field]:
+            st.session_state[field] = default_val
+        elif isinstance(default_val, bool):
+            st.session_state[field] = bool(st.session_state.get(field))
+        elif isinstance(default_val, int):
+            val_int = _safe_int(st.session_state.get(field), default_val)
+            min_ok = 1 if ("max_bid" in field or "min_sales" in field or "hist_avg" in field) else 0
+            st.session_state[field] = max(min_ok, val_int)
         st.session_state[f"sb_{field}"] = st.session_state[field]
         st.session_state[f"top_{field}"] = st.session_state[field]
 
@@ -2057,11 +2120,22 @@ def _toggle_arch_steal():
         st.session_state["arch_settled_only"] = bool(st.session_state.get("arch_sleeper_only"))
 
 
+def _normalize_nav_val(val) -> str:
+    if val in NAV_OPTIONS:
+        return val
+    mapped = LEGACY_NAV_MAP.get(val)
+    return mapped if mapped in NAV_OPTIONS else ""
+
+
 def _guard_nav_view():
-    if st.session_state.get("nav_view") not in NAV_OPTIONS:
-        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "Live")
+    cur = _normalize_nav_val(st.session_state.get("nav_view"))
+    if cur:
+        st.session_state["nav_view"] = cur
+        st.session_state["_last_nav_view"] = cur
     else:
-        st.session_state["_last_nav_view"] = st.session_state["nav_view"]
+        fallback = _normalize_nav_val(st.session_state.get("_last_nav_view")) or "Live"
+        st.session_state["nav_view"] = fallback
+        st.session_state["_last_nav_view"] = fallback
 
 
 def _render_chip_selector(label: str, options: list[str], key: str, on_change, args=()):
@@ -2090,12 +2164,9 @@ def _render_chip_selector(label: str, options: list[str], key: str, on_change, a
 def render_top_nav() -> str:
     """Render ultra-clean single-row top navigation bar above the Search input."""
     st.markdown('<div id="nellis-top-anchor"></div>', unsafe_allow_html=True)
-    if st.session_state.get("nav_view") not in NAV_OPTIONS:
-        st.session_state["nav_view"] = st.session_state.get("_last_nav_view", "Live")
+    _guard_nav_view()
     _render_chip_selector("Navigation", NAV_OPTIONS, key="nav_view", on_change=_guard_nav_view)
-    chosen = st.session_state.get("nav_view")
-    if chosen not in NAV_OPTIONS:
-        chosen = st.session_state.get("_last_nav_view", "Live")
+    chosen = _normalize_nav_val(st.session_state.get("nav_view")) or _normalize_nav_val(st.session_state.get("_last_nav_view")) or "Live"
     st.session_state["_last_nav_view"] = chosen
     return chosen
 
@@ -2130,8 +2201,20 @@ def _render_retail_facet(prefix: str, mode_prefix: str):
     )
 
 
+@contextlib.contextmanager
+def _facet_section(prefix: str, title: str, expanded: bool = False):
+    """Render collapsible accordion in Sidebar (`sb`), or clean direct section in `Filters` popover (`top`)."""
+    if prefix == "sb":
+        with st.expander(title, expanded=expanded):
+            yield
+    else:
+        st.markdown("---")
+        st.markdown(f"**{title}**")
+        yield
+
+
 def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: int, is_dirty: bool):
-    """Render official Nellis Auction Sort By + Filters (N) + Accordion sections (zero nested columns)."""
+    """Render official Nellis Auction Sort By + Filters (N) + Accordion sections (zero nested expanders/columns)."""
     st.selectbox(
         "Sort By",
         LIVE_SORT_OPTIONS,
@@ -2140,7 +2223,7 @@ def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: 
         args=(f"{prefix}_live_sort", "live_sort"),
     )
     if prefix == "sb":
-        h1, h2 = st.columns([1.4, 1.2])
+        h1, h2 = _st_columns([1.4, 1.2], vertical_alignment="center")
         with h1:
             st.markdown(f"**Filters ({filter_count})**" if filter_count else "**Filters**")
         with h2:
@@ -2154,7 +2237,7 @@ def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: 
             )
 
     if include_window:
-        with st.expander("⏳ Closing Window", expanded=True):
+        with _facet_section(prefix, "⏳ Closing Window", expanded=True):
             st.selectbox(
                 "Closing Within",
                 LIVE_TIME_CHIPS,
@@ -2164,7 +2247,7 @@ def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: 
                 args=(f"{prefix}_live_time", "live_time"),
             )
 
-    with st.expander("📍 Locations", expanded=(st.session_state["live_wh"] != "All" or prefix == "sb")):
+    with _facet_section(prefix, "📍 Locations", expanded=(st.session_state["live_wh"] != "All" or prefix == "sb")):
         st.radio(
             "Warehouse",
             WAREHOUSE_OPTIONS,
@@ -2174,7 +2257,7 @@ def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: 
             args=(f"{prefix}_live_wh", "live_wh"),
         )
 
-    with st.expander("⭐ Quality / Condition", expanded=(st.session_state["live_cond"] != "All")):
+    with _facet_section(prefix, "⭐ Quality / Condition", expanded=(st.session_state["live_cond"] != "All")):
         st.radio(
             "Condition",
             COND_OPTIONS,
@@ -2184,10 +2267,10 @@ def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: 
             args=(f"{prefix}_live_cond", "live_cond"),
         )
 
-    with st.expander("🏷️ Est. Retail", expanded=(st.session_state["live_retail_preset"] != "Any")):
+    with _facet_section(prefix, "🏷️ Est. Retail", expanded=(st.session_state["live_retail_preset"] != "Any")):
         _render_retail_facet(prefix, "live")
 
-    with st.expander("🗂️ Category", expanded=(st.session_state["live_cat"] != "All Categories")):
+    with _facet_section(prefix, "🗂️ Category", expanded=(st.session_state["live_cat"] != "All Categories")):
         st.selectbox(
             "Category",
             PRIMARY_CATEGORIES,
@@ -2197,7 +2280,7 @@ def _render_nellis_live_facets(prefix: str, include_window: bool, filter_count: 
             args=(f"{prefix}_live_cat", "live_cat"),
         )
 
-    with st.expander("💵 Max Bid & Steal Rules", expanded=(bool(st.session_state["live_predict_cheap"]) or int(st.session_state["live_max_bid"]) < 1000)):
+    with _facet_section(prefix, "💵 Max Bid & Steal Rules", expanded=(bool(st.session_state["live_predict_cheap"]) or int(st.session_state["live_max_bid"]) < 1000)):
         st.number_input(
             "Max Current Bid ($)",
             min_value=1,
@@ -2231,7 +2314,7 @@ def _render_nellis_arch_facets(prefix: str, include_window: bool, filter_count: 
         args=(f"{prefix}_arch_sort", "arch_sort"),
     )
     if prefix == "sb":
-        h1, h2 = st.columns([1.4, 1.2])
+        h1, h2 = _st_columns([1.4, 1.2], vertical_alignment="center")
         with h1:
             st.markdown(f"**Filters ({filter_count})**" if filter_count else "**Filters**")
         with h2:
@@ -2245,7 +2328,7 @@ def _render_nellis_arch_facets(prefix: str, include_window: bool, filter_count: 
             )
 
     if include_window:
-        with st.expander("📅 Date Window", expanded=(st.session_state["arch_date_preset"] != "All")):
+        with _facet_section(prefix, "📅 Date Window", expanded=(st.session_state["arch_date_preset"] != "All")):
             st.selectbox(
                 "Window",
                 ARCH_DATE_CHIPS,
@@ -2255,7 +2338,7 @@ def _render_nellis_arch_facets(prefix: str, include_window: bool, filter_count: 
                 args=(f"{prefix}_arch_date_preset", "arch_date_preset"),
             )
 
-    with st.expander("📍 Locations", expanded=(st.session_state["arch_wh"] != "All" or prefix == "sb")):
+    with _facet_section(prefix, "📍 Locations", expanded=(st.session_state["arch_wh"] != "All" or prefix == "sb")):
         st.radio(
             "Warehouse",
             WAREHOUSE_OPTIONS,
@@ -2265,7 +2348,7 @@ def _render_nellis_arch_facets(prefix: str, include_window: bool, filter_count: 
             args=(f"{prefix}_arch_wh", "arch_wh"),
         )
 
-    with st.expander("⭐ Quality / Condition", expanded=(st.session_state["arch_cond"] != "All")):
+    with _facet_section(prefix, "⭐ Quality / Condition", expanded=(st.session_state["arch_cond"] != "All")):
         st.radio(
             "Condition",
             COND_OPTIONS,
@@ -2275,10 +2358,10 @@ def _render_nellis_arch_facets(prefix: str, include_window: bool, filter_count: 
             args=(f"{prefix}_arch_cond", "arch_cond"),
         )
 
-    with st.expander("🏷️ Est. Retail", expanded=(st.session_state["arch_retail_preset"] != "Any")):
+    with _facet_section(prefix, "🏷️ Est. Retail", expanded=(st.session_state["arch_retail_preset"] != "Any")):
         _render_retail_facet(prefix, "arch")
 
-    with st.expander("🗂️ Category", expanded=(st.session_state["arch_cat"] != "All Categories")):
+    with _facet_section(prefix, "🗂️ Category", expanded=(st.session_state["arch_cat"] != "All Categories")):
         st.selectbox(
             "Category",
             PRIMARY_CATEGORIES,
@@ -2288,7 +2371,7 @@ def _render_nellis_arch_facets(prefix: str, include_window: bool, filter_count: 
             args=(f"{prefix}_arch_cat", "arch_cat"),
         )
 
-    with st.expander("🏆 Past Deals, Discount & Price Caps", expanded=(bool(st.session_state["arch_settled_only"]) or bool(st.session_state["arch_sleeper_only"]) or int(st.session_state["arch_min_disc"]) > 0 or int(st.session_state["arch_max_bid"]) < 1000)):
+    with _facet_section(prefix, "🏆 Past Deals, Discount & Price Caps", expanded=(bool(st.session_state["arch_settled_only"]) or bool(st.session_state["arch_sleeper_only"]) or int(st.session_state["arch_min_disc"]) > 0 or int(st.session_state["arch_max_bid"]) < 1000)):
         st.number_input("Max Winning Bid ($)", min_value=1, max_value=50000, step=25, key=f"{prefix}_arch_max_bid", on_change=_sync_widget, args=(f"{prefix}_arch_max_bid", "arch_max_bid"))
         st.number_input("Min Discount (% Off)", min_value=0, max_value=99, step=5, key=f"{prefix}_arch_min_disc", on_change=_sync_widget, args=(f"{prefix}_arch_min_disc", "arch_min_disc"))
         st.checkbox(
@@ -2324,7 +2407,7 @@ def _render_nellis_toolbar(
     btn_stretch = _stretch_kwargs(st.button)
     pop_label = f"🎛️ Filters ({filter_count})" if filter_count else "🎛️ Filters"
     with toolbar_box:
-        col_pop, col_steal, col_clr = st.columns([1.25, 1.15, 0.8])
+        col_pop, col_steal, col_clr = _st_columns([1.25, 1.15, 0.8], vertical_alignment="center")
         with col_pop:
             with _open_popover_or_expander(pop_label):
                 render_facets_fn("top", False, filter_count, is_dirty)
@@ -2373,7 +2456,7 @@ def _render_nellis_results_header(loc_filter: str, count_text: str, search_kw: s
 
 def render_live_filter_controls() -> dict:
     """Render Nellis-style Search-on-top, 5m/10m/15m Closing strip, horizontal Toolbar, and Accordion Drawer."""
-    _init_filter_state(LIVE_DEFAULTS)
+    _init_filter_state(LIVE_DEFAULTS, allowed_map=LIVE_ALLOWED_MAP, legacy_map=LEGACY_LIVE_MAP)
 
     filter_count = sum([
         st.session_state["live_wh"] != "All",
@@ -2447,7 +2530,7 @@ def render_live_filter_controls() -> dict:
 def render_arch_filter_controls() -> dict:
     """Render Nellis-style Search-on-top, Date strip, horizontal Toolbar, and Accordion Drawer for Past Archive."""
     arch_defaults = _get_arch_defaults()
-    _init_filter_state(arch_defaults)
+    _init_filter_state(arch_defaults, allowed_map=ARCH_ALLOWED_MAP, legacy_map=LEGACY_ARCH_MAP)
 
     filter_count = sum([
         st.session_state["arch_date_preset"] != "All",
