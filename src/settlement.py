@@ -758,9 +758,10 @@ def main():
     parser.add_argument("--cooldowns", type=int, default=12, help="Max HTTP 429 cooldown cycles per run (default: 12).")
     parser.add_argument("--cooldown-sec", type=int, default=65, help="Cooldown sleep seconds after HTTP 429 (default: 65).")
     parser.add_argument("--reverify-all", action="store_true", help="Re-check even already settled rows.")
+    parser.add_argument("--skip-v2", action="store_true", help="Skip updating compacted v2 lake after settlement.")
     args = parser.parse_args()
 
-    settle_r2_partitions(
+    updated = settle_r2_partitions(
         max_files=args.max_files,
         workers=args.workers,
         max_items_per_run=args.max_items,
@@ -769,6 +770,11 @@ def main():
         max_cooldowns=args.cooldowns,
         cooldown_seconds=args.cooldown_sec,
     )
+    if updated > 0 and not args.skip_v2:
+        from src.compact_lake import compact_v1_to_v2
+
+        print("\n[*] Refreshing compacted v2 lake after settlement updates...")
+        compact_v1_to_v2(use_r2=True)
 
 
 if __name__ == "__main__":

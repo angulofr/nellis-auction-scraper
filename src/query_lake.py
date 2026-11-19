@@ -10,18 +10,18 @@ import sys
 import duckdb
 import pandas as pd
 
-R2_ACCESS_KEY_ID = os.environ.get("R2_ACCESS_KEY_ID", "")
-R2_SECRET_ACCESS_KEY = os.environ.get("R2_SECRET_ACCESS_KEY", "")
-R2_ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "https://965a5411101d1521c551d99d9421a145.r2.cloudflarestorage.com")
-R2_BUCKET_NAME = os.environ.get("R2_BUCKET_NAME", "nellis-auction-lake")
-
-
-def get_r2_host():
-    return R2_ENDPOINT_URL.replace("https://", "").replace("http://", "").strip("/")
+from src.lake_sync import configure_duckdb_lake_views
+from src.r2_loader import (
+    R2_ACCESS_KEY_ID,
+    R2_BUCKET_NAME,
+    R2_ENDPOINT_URL,
+    R2_SECRET_ACCESS_KEY,
+    get_r2_host,
+)
 
 
 def get_duckdb_lake_conn(use_local: bool = False):
-    """Initialize DuckDB with httpfs S3/R2 credentials or local fallback and deduped lake views."""
+    """Initialize DuckDB with TLS S3/R2 or local fallback and v2/v1 Data Lake views."""
     con = duckdb.connect()
     if not use_local and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY:
         con.execute("INSTALL httpfs; LOAD httpfs;")
@@ -34,78 +34,12 @@ def get_duckdb_lake_conn(use_local: bool = False):
             SET s3_region = 'auto';
             SET s3_use_ssl = true;
         """)
-        facts_pattern = f"s3://{R2_BUCKET_NAME}/fact_auctions/*/*/*.parquet"
-        bids_pattern = f"s3://{R2_BUCKET_NAME}/fact_bids/*/*/*.parquet"
-        dim_catalog = f"s3://{R2_BUCKET_NAME}/dim_products/products_catalog.parquet"
-    else:
-        facts_pattern = "data_lake/fact_auctions/*/*/*.parquet"
-        bids_pattern = "data_lake/fact_bids/*/*/*.parquet"
-        dim_catalog = "data_lake/dim_products/products_catalog.parquet"
-
-    # Project missing optional columns cleanly when mixed legacy/new partitions exist
-    desc_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{facts_pattern}', union_by_name=true);").fetchall()
-    raw_cols = {str(r[0]).lower() for r in desc_rows}
-    optional_fact_cols = [
-        ("is_closed", "CAST(NULL AS BOOLEAN)"),
-        ("market_status", "CAST('unverified' AS VARCHAR)"),
-        ("open_at", "CAST(NULL AS TIMESTAMPTZ)"),
-        ("initial_closed_at", "CAST(NULL AS TIMESTAMPTZ)"),
-        ("was_extended", "CAST(NULL AS BOOLEAN)"),
-        ("extension_seconds", "CAST(NULL AS INTEGER)"),
-        ("first_bid_price", "CAST(NULL AS DOUBLE)"),
-        ("price_at_1h_left", "CAST(NULL AS DOUBLE)"),
-        ("price_at_5m_left", "CAST(NULL AS DOUBLE)"),
-        ("price_at_1m_left", "CAST(NULL AS DOUBLE)"),
-        ("bids_last_5m", "CAST(NULL AS INTEGER)"),
-        ("bids_last_60s", "CAST(NULL AS INTEGER)"),
-        ("winning_bid_sec_before_close", "CAST(NULL AS DOUBLE)"),
-        ("bids_captured", "CAST(FALSE AS BOOLEAN)"),
-    ]
-    extra_cols = [f"{expr} AS {col}" for col, expr in optional_fact_cols if col not in raw_cols]
-    extra_sql = (", " + ", ".join(extra_cols)) if extra_cols else ""
-    bids_order = "COALESCE(bids_captured, FALSE) DESC, " if "bids_captured" in raw_cols else ""
-    settled_order = "COALESCE(is_closed, FALSE) DESC, " if "is_closed" in raw_cols else ""
-
-    con.execute(f"""
-        CREATE OR REPLACE VIEW fact_auctions AS
-        SELECT DISTINCT ON (auction_id) *{extra_sql}
-        FROM read_parquet('{facts_pattern}', union_by_name=true)
-        ORDER BY auction_id, {bids_order}{settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
-    """)
-
-    try:
-        con.execute(f"""
-            CREATE OR REPLACE VIEW fact_bids AS
-            SELECT DISTINCT ON (auction_id, bid_seq) *
-            FROM read_parquet('{bids_pattern}', union_by_name=true)
-            ORDER BY auction_id, bid_seq, scraped_date DESC;
-        """)
-    except Exception:
-        # Empty typed view before the first bids_*.parquet partition is uploaded
-        con.execute("""
-            CREATE OR REPLACE VIEW fact_bids AS
-            SELECT
-                CAST(NULL AS BIGINT) AS auction_id,
-                CAST(NULL AS VARCHAR) AS product_id,
-                CAST(NULL AS SMALLINT) AS bid_seq,
-                CAST(NULL AS VARCHAR) AS bidder_label,
-                CAST(NULL AS SMALLINT) AS bidder_num,
-                CAST(NULL AS DOUBLE) AS bid_amount,
-                CAST(NULL AS DOUBLE) AS bid_increment,
-                CAST(NULL AS VARCHAR) AS bid_status,
-                CAST(NULL AS BOOLEAN) AS is_winning_bid,
-                CAST(NULL AS TIMESTAMPTZ) AS bid_time,
-                CAST(NULL AS TINYINT) AS bid_hour,
-                CAST(NULL AS DOUBLE) AS seconds_before_close,
-                CAST(NULL AS DOUBLE) AS seconds_before_initial_close,
-                CAST(NULL AS VARCHAR) AS time_bucket,
-                CAST(NULL AS DOUBLE) AS auction_final_price,
-                CAST(NULL AS DOUBLE) AS pct_of_final_price,
-                CAST(NULL AS DATE) AS scraped_date
-            WHERE FALSE;
-        """)
-
-    con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('{dim_catalog}');")
+    configure_duckdb_lake_views(
+        con,
+        use_local=use_local,
+        lake_dir="data_lake",
+        enable_fts=False,
+    )
     return con
 
 

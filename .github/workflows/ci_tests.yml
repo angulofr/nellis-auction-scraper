@@ -29,7 +29,7 @@ jobs:
 
       - name: Compile Check All Python Entrypoints & Tests
         run: |
-          python -m py_compile app.py src/scraper.py src/transform.py src/r2_loader.py src/settlement.py src/query_lake.py scripts/smoke_live_uat.py
+          python -m py_compile app.py src/scraper.py src/transform.py src/r2_loader.py src/settlement.py src/query_lake.py src/compact_lake.py src/lake_sync.py scripts/smoke_live_uat.py
 
       - name: Run Unit, Integration & Streamlit AppTest Suites
         run: |

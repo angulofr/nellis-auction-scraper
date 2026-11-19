@@ -6,6 +6,7 @@ Normalizes raw scraped auction records into a Star Schema:
   - fact_auctions: Lean, numeric-heavy table for daily completed lots
 """
 
+import ast
 import datetime
 import hashlib
 import re
@@ -13,6 +14,62 @@ from typing import Dict, List, Tuple
 
 # Arizona is UTC-7 year-round (no DST)
 MST_TZ = datetime.timezone(datetime.timedelta(hours=-7))
+
+STOP_WORDS = {
+    "with", "for", "and", "the", "in", "to", "of", "by", "on", "at", "from",
+    "compatible", "pack", "set", "new", "sealed", "factory", "inch", "ft"
+}
+
+
+def extract_amazon_image_id(photo_url: str) -> str:
+    """Extract canonical Amazon product image ID from URL (covers ~97.3% of Nellis catalog)."""
+    if not photo_url:
+        return ""
+    m = re.search(r"/images/I/([A-Za-z0-9\+%\-_]+?)(?:\._[^\./]+)?\.(?:jpg|jpeg|png|webp|gif)", str(photo_url), re.I)
+    return m.group(1) if m else ""
+
+
+def clean_title_text(title: str) -> str:
+    """Strip warehouse inspector prefixes like **FACTORY SEALED** or [4 in 1]."""
+    if not title:
+        return ""
+    t = str(title)
+    t = re.sub(r"^\s*\*+[^*]+\*+\s*", "", t)
+    t = re.sub(r"^\s*\[[^\]]+\]\s*", "", t)
+    t = re.sub(r"^\s*\([^)]+\)\s*", "", t)
+    return t.strip()
+
+
+def normalize_title_tokens(title: str) -> list:
+    """Tokenize and normalize product title for fuzzy signature matching."""
+    t = clean_title_text(title).lower()
+    t = re.sub(r"[^\w\s]", " ", t)
+    tokens = []
+    for w in t.split():
+        if w in STOP_WORDS or len(w) <= 1:
+            continue
+        if len(w) > 4 and w.endswith("s") and not w.endswith("ss"):
+            w = w[:-1]
+        tokens.append(w)
+    return tokens
+
+
+def get_title_signature(title: str) -> str:
+    """Return first 5 normalized core tokens as a fast lookup key."""
+    return " ".join(normalize_title_tokens(title)[:5])
+
+
+def normalize_search_text(title: str, brand: str = "", cat1: str = "", cat2: str = "") -> str:
+    """Build normalized searchable string combining title, brand, categories, and de-hyphenated tokens."""
+    combined = " ".join(
+        part for part in (str(title or ""), str(brand or ""), str(cat1 or ""), str(cat2 or ""))
+        if part and str(part).lower() not in ("nan", "none")
+    ).lower()
+    collapsed = re.sub(r"[^a-z0-9\s]+", " ", combined)
+    dehyphenated = combined.replace("-", "")
+    dehyphenated_clean = re.sub(r"[^a-z0-9\s]+", " ", dehyphenated)
+    tokens = list(dict.fromkeys(collapsed.split() + dehyphenated_clean.split()))
+    return " ".join(tokens)
 
 
 def normalize_title(title: str) -> str:
@@ -121,6 +178,55 @@ def standardize_functionality(func_type: str) -> str:
     if "power" in f:
         return "Powers On"
     return "Untested"
+
+
+def format_clean_condition(raw_cond, title: str = "", notes: str = "") -> str:
+    """Convert raw grade dict or string into clean display label, flagging incomplete/damaged items."""
+    if isinstance(raw_cond, dict):
+        c_type = raw_cond.get("conditionType", {})
+        d_type = raw_cond.get("damageType", {})
+        m_type = raw_cond.get("missingPartsType", {})
+        f_type = raw_cond.get("functionalType", {})
+        c_desc = c_type.get("description", "") if isinstance(c_type, dict) else ""
+        d_desc = d_type.get("description", "") if isinstance(d_type, dict) else ""
+        m_desc = m_type.get("description", "") if isinstance(m_type, dict) else ""
+        f_desc = f_type.get("description", "") if isinstance(f_type, dict) else ""
+        rat = raw_cond.get("rating")
+
+        if is_incomplete_or_damaged(title=title, notes=notes, damage_type=d_desc, missing_parts=m_desc, func_type=f_desc, rating=rat):
+            return f"Incomplete / Damaged / Parts ({rat}/5)" if rat else "Incomplete / Damaged / Parts"
+        if c_desc in ["New", "Brand New"] or rat == 5:
+            return "Brand New (5/5)"
+        elif c_desc:
+            return f"{c_desc} ({rat}/5)" if rat else c_desc
+        elif rat:
+            return f"Rated {rat}/5"
+        return "Standard"
+
+    s = str(raw_cond or "Standard").strip()
+    if s.startswith("{"):
+        try:
+            g = ast.literal_eval(s)
+            return format_clean_condition(g, title=title, notes=notes)
+        except Exception:
+            pass
+
+    if is_incomplete_or_damaged(title=title, notes=notes):
+        m_r = re.search(r"(\d)/5", s)
+        return f"Incomplete / Damaged / Parts ({m_r.group(1)}/5)" if m_r else "Incomplete / Damaged / Parts"
+    return s
+
+
+def get_condition_tier(cond_str: str, title: str = "", notes: str = "") -> str:
+    """Standardize condition into like-for-like comparison tiers."""
+    c = format_clean_condition(cond_str, title=title, notes=notes).lower()
+    if any(k in c for k in ["incomplete", "damaged", "missing", "broken", "1/5", "2/5", "parts"]):
+        return "Incomplete / Damaged / Parts"
+    if any(k in c for k in ["used", "fair", "3/5"]):
+        return "Used"
+    if any(k in c for k in ["like new", "open box", "4/5", "very good"]):
+        return "Open Box / Like New"
+    return "New"
 
 
 CATEGORY_RULES = [
@@ -295,16 +401,20 @@ def transform_records(raw_items: List[Dict], scrape_date: str = None) -> Tuple[L
             raw_cat_primary = item.get("category") or item.get("taxonomyLevel1") or ""
             raw_cat_secondary = item.get("subcategory") or item.get("taxonomyLevel2") or ""
             cat_primary, cat_secondary = classify_product_category(title, raw_cat_primary, raw_cat_secondary)
+            brand_val = item.get("brand") or ""
             dim_products_map[product_id] = {
                 "product_id": product_id,
                 "title": title,
-                "brand": item.get("brand") or "",
+                "brand": brand_val,
                 "category_primary": cat_primary,
                 "category_secondary": cat_secondary,
                 "base_retail_price": retail_price,
                 "description": item.get("catalog_description") or item.get("description") or "",
                 "first_seen_date": scrape_date,
-                "photo_url": photo_url
+                "photo_url": photo_url,
+                "amazon_image_id": extract_amazon_image_id(photo_url),
+                "title_signature": get_title_signature(title),
+                "search_text_norm": normalize_search_text(title, brand_val, cat_primary, cat_secondary),
             }
 
     return list(dim_products_map.values()), fact_auctions

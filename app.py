@@ -25,9 +25,41 @@ import streamlit.components.v1 as components
 
 import importlib
 import src.transform as _transform_mod
-if not hasattr(_transform_mod, "is_incomplete_or_damaged"):
+if not all(
+    hasattr(_transform_mod, attr)
+    for attr in (
+        "is_incomplete_or_damaged",
+        "extract_amazon_image_id",
+        "clean_title_text",
+        "normalize_title_tokens",
+        "get_title_signature",
+        "normalize_search_text",
+        "format_clean_condition",
+        "get_condition_tier",
+    )
+):
     importlib.reload(_transform_mod)
-from src.transform import CATEGORY_RULES, classify_product_category, is_incomplete_or_damaged
+from src.transform import (
+    CATEGORY_RULES,
+    STOP_WORDS,
+    classify_product_category,
+    clean_title_text,
+    extract_amazon_image_id,
+    format_clean_condition,
+    get_condition_tier,
+    get_title_signature,
+    is_incomplete_or_damaged,
+    normalize_search_text,
+    normalize_title_tokens,
+)
+import src.lake_sync as _lake_sync_mod
+if not hasattr(_lake_sync_mod, "configure_duckdb_lake_views"):
+    importlib.reload(_lake_sync_mod)
+from src.lake_sync import (
+    configure_duckdb_lake_views,
+    create_empty_fallback_views,
+    fetch_v2_manifest_etag,
+)
 from src.settlement import fetch_closed_lots_batch, is_verified_sold_result
 
 # Page setup
@@ -51,75 +83,15 @@ R2_SECRET_ACCESS_KEY = get_secret("R2_SECRET_ACCESS_KEY", "")
 R2_ENDPOINT_URL = get_secret("R2_ENDPOINT_URL", "https://965a5411101d1521c551d99d9421a145.r2.cloudflarestorage.com")
 R2_BUCKET_NAME = get_secret("R2_BUCKET_NAME", "nellis-auction-lake")
 NELLIS_API_BASE = os.environ.get("NELLIS_API_BASE", "https://www.nellisauction.com").rstrip("/")
-
-STOP_WORDS = {
-    "with", "for", "and", "the", "in", "to", "of", "by", "on", "at", "from",
-    "compatible", "pack", "set", "new", "sealed", "factory", "inch", "ft"
-}
+_LAKE_META = {"mode": "v1", "has_v2": False, "has_fts": False, "etag": "v1", "counts": {}}
 
 
 def _create_empty_fact_auctions_view(con):
-    con.execute("""
-        CREATE OR REPLACE VIEW fact_auctions AS
-        SELECT
-            CAST(NULL AS BIGINT) AS auction_id,
-            CAST(NULL AS VARCHAR) AS product_id,
-            CAST(NULL AS VARCHAR) AS location,
-            CAST(NULL AS VARCHAR) AS condition,
-            CAST(NULL AS VARCHAR) AS completeness,
-            CAST(NULL AS VARCHAR) AS functional_status,
-            CAST(NULL AS VARCHAR) AS damage_notes,
-            CAST(NULL AS DOUBLE) AS retail_price,
-            CAST(NULL AS DOUBLE) AS final_price,
-            CAST(NULL AS DOUBLE) AS discount_ratio,
-            CAST(NULL AS INTEGER) AS bid_count,
-            CAST(NULL AS INTEGER) AS unique_bidders,
-            CAST(NULL AS TIMESTAMPTZ) AS closed_at,
-            CAST(NULL AS TINYINT) AS close_day_of_week,
-            CAST(NULL AS TINYINT) AS close_hour,
-            CAST(NULL AS DATE) AS scraped_date,
-            CAST(NULL AS VARCHAR) AS photo_url,
-            CAST(NULL AS BOOLEAN) AS is_closed,
-            CAST('unverified' AS VARCHAR) AS market_status,
-            CAST(NULL AS TIMESTAMPTZ) AS open_at,
-            CAST(NULL AS TIMESTAMPTZ) AS initial_closed_at,
-            CAST(NULL AS BOOLEAN) AS was_extended,
-            CAST(NULL AS INTEGER) AS extension_seconds,
-            CAST(NULL AS DOUBLE) AS first_bid_price,
-            CAST(NULL AS DOUBLE) AS price_at_1h_left,
-            CAST(NULL AS DOUBLE) AS price_at_5m_left,
-            CAST(NULL AS DOUBLE) AS price_at_1m_left,
-            CAST(NULL AS INTEGER) AS bids_last_5m,
-            CAST(NULL AS INTEGER) AS bids_last_60s,
-            CAST(NULL AS DOUBLE) AS winning_bid_sec_before_close,
-            CAST(FALSE AS BOOLEAN) AS bids_captured
-        WHERE FALSE;
-    """)
+    create_empty_fallback_views(con, include_facts=True)
 
 
 def _create_empty_fact_bids_view(con):
-    con.execute("""
-        CREATE OR REPLACE VIEW fact_bids AS
-        SELECT
-            CAST(NULL AS BIGINT) AS auction_id,
-            CAST(NULL AS VARCHAR) AS product_id,
-            CAST(NULL AS SMALLINT) AS bid_seq,
-            CAST(NULL AS VARCHAR) AS bidder_label,
-            CAST(NULL AS SMALLINT) AS bidder_num,
-            CAST(NULL AS DOUBLE) AS bid_amount,
-            CAST(NULL AS DOUBLE) AS bid_increment,
-            CAST(NULL AS VARCHAR) AS bid_status,
-            CAST(NULL AS BOOLEAN) AS is_winning_bid,
-            CAST(NULL AS TIMESTAMPTZ) AS bid_time,
-            CAST(NULL AS TINYINT) AS bid_hour,
-            CAST(NULL AS DOUBLE) AS seconds_before_close,
-            CAST(NULL AS DOUBLE) AS seconds_before_initial_close,
-            CAST(NULL AS VARCHAR) AS time_bucket,
-            CAST(NULL AS DOUBLE) AS auction_final_price,
-            CAST(NULL AS DOUBLE) AS pct_of_final_price,
-            CAST(NULL AS DATE) AS scraped_date
-        WHERE FALSE;
-    """)
+    create_empty_fallback_views(con, include_facts=False)
 
 
 def _create_empty_dim_products_view(con):
@@ -134,15 +106,32 @@ def _create_empty_dim_products_view(con):
             CAST(NULL AS DOUBLE) AS base_retail_price,
             CAST(NULL AS VARCHAR) AS description,
             CAST(NULL AS DATE) AS first_seen_date,
-            CAST(NULL AS VARCHAR) AS photo_url
+            CAST(NULL AS VARCHAR) AS photo_url,
+            CAST(NULL AS VARCHAR) AS amazon_image_id,
+            CAST(NULL AS VARCHAR) AS title_signature,
+            CAST(NULL AS VARCHAR) AS search_text_norm
         WHERE FALSE;
     """)
 
 
-@st.cache_resource
-def get_duckdb_con(_v=5):
-    """Create and cache persistent DuckDB connection with Cloudflare R2, local lake, or empty fallback views."""
-    con = duckdb.connect()
+@st.cache_data(ttl=300, show_spinner=False)
+def get_v2_manifest_etag() -> str:
+    """Poll tiny v2/manifest.json ETag (~1 KB) so cached connections refresh cleanly after scrapes."""
+    use_local = os.environ.get("NELLIS_USE_LOCAL_LAKE") == "1"
+    lake_dir = os.environ.get("NELLIS_LAKE_DIR", "data_lake").replace("\\", "/").rstrip("/")
+    r2_creds = {
+        "access_key_id": get_secret("R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID),
+        "secret_access_key": get_secret("R2_SECRET_ACCESS_KEY", R2_SECRET_ACCESS_KEY),
+        "endpoint_url": get_secret("R2_ENDPOINT_URL", R2_ENDPOINT_URL),
+        "bucket_name": get_secret("R2_BUCKET_NAME", R2_BUCKET_NAME),
+    }
+    return fetch_v2_manifest_etag(use_local=use_local, lake_dir=lake_dir, r2_creds=r2_creds)
+
+
+@st.cache_resource(max_entries=1)
+def get_duckdb_con(_manifest_etag: str = ""):
+    """Create and cache persistent DuckDB connection over ETag-synced v2 Parquet or TLS R2 v1 fallback."""
+    con_inst = duckdb.connect()
     use_local = os.environ.get("NELLIS_USE_LOCAL_LAKE") == "1"
     lake_dir = os.environ.get("NELLIS_LAKE_DIR", "data_lake").replace("\\", "/").rstrip("/")
     r2_key = get_secret("R2_ACCESS_KEY_ID", R2_ACCESS_KEY_ID)
@@ -152,9 +141,9 @@ def get_duckdb_con(_v=5):
 
     if (not use_local) and r2_key and r2_secret:
         try:
-            con.execute("INSTALL httpfs; LOAD httpfs;")
+            con_inst.execute("INSTALL httpfs; LOAD httpfs;")
             host = r2_endpoint.replace("https://", "").replace("http://", "").strip("/")
-            con.execute(f"""
+            con_inst.execute(f"""
                 SET GLOBAL s3_endpoint = '{host}';
                 SET GLOBAL s3_access_key_id = '{r2_key}';
                 SET GLOBAL s3_secret_access_key = '{r2_secret}';
@@ -162,70 +151,28 @@ def get_duckdb_con(_v=5):
                 SET GLOBAL s3_region = 'auto';
                 SET GLOBAL s3_use_ssl = true;
             """)
-            facts_glob = f"s3://{r2_bucket}/fact_auctions/*/*/*.parquet"
-            bids_glob = f"s3://{r2_bucket}/fact_bids/*/*/*.parquet"
-            dim_glob = f"s3://{r2_bucket}/dim_products/products_catalog.parquet"
         except Exception:
-            facts_glob = f"{lake_dir}/fact_auctions/*/*/*.parquet"
-            bids_glob = f"{lake_dir}/fact_bids/*/*/*.parquet"
-            dim_glob = f"{lake_dir}/dim_products/products_catalog.parquet"
-    else:
-        facts_glob = f"{lake_dir}/fact_auctions/*/*/*.parquet"
-        bids_glob = f"{lake_dir}/fact_bids/*/*/*.parquet"
-        dim_glob = f"{lake_dir}/dim_products/products_catalog.parquet"
+            pass
 
-    optional_fact_cols = [
-        ("is_closed", "CAST(NULL AS BOOLEAN)"),
-        ("market_status", "CAST('unverified' AS VARCHAR)"),
-        ("open_at", "CAST(NULL AS TIMESTAMPTZ)"),
-        ("initial_closed_at", "CAST(NULL AS TIMESTAMPTZ)"),
-        ("was_extended", "CAST(NULL AS BOOLEAN)"),
-        ("extension_seconds", "CAST(NULL AS INTEGER)"),
-        ("first_bid_price", "CAST(NULL AS DOUBLE)"),
-        ("price_at_1h_left", "CAST(NULL AS DOUBLE)"),
-        ("price_at_5m_left", "CAST(NULL AS DOUBLE)"),
-        ("price_at_1m_left", "CAST(NULL AS DOUBLE)"),
-        ("bids_last_5m", "CAST(NULL AS INTEGER)"),
-        ("bids_last_60s", "CAST(NULL AS INTEGER)"),
-        ("winning_bid_sec_before_close", "CAST(NULL AS DOUBLE)"),
-        ("bids_captured", "CAST(FALSE AS BOOLEAN)"),
-    ]
-
-    try:
-        desc_rows = con.execute(f"DESCRIBE SELECT * FROM read_parquet('{facts_glob}', union_by_name=true);").fetchall()
-        raw_cols = {str(r[0]).lower() for r in desc_rows}
-        extra_cols = [f"{expr} AS {col}" for col, expr in optional_fact_cols if col not in raw_cols]
-        extra_sql = (", " + ", ".join(extra_cols)) if extra_cols else ""
-        bids_order = "COALESCE(bids_captured, FALSE) DESC, " if "bids_captured" in raw_cols else ""
-        settled_order = "COALESCE(is_closed, FALSE) DESC, " if "is_closed" in raw_cols else ""
-        con.execute(f"""
-            CREATE OR REPLACE VIEW fact_auctions AS
-            SELECT DISTINCT ON (auction_id) *{extra_sql}
-            FROM read_parquet('{facts_glob}', union_by_name=true)
-            ORDER BY auction_id, {bids_order}{settled_order}scraped_date DESC, final_price DESC, bid_count DESC;
-        """)
-    except Exception:
-        _create_empty_fact_auctions_view(con)
-
-    try:
-        con.execute(f"""
-            CREATE OR REPLACE VIEW fact_bids AS
-            SELECT DISTINCT ON (auction_id, bid_seq) *
-            FROM read_parquet('{bids_glob}', union_by_name=true)
-            ORDER BY auction_id, bid_seq, scraped_date DESC;
-        """)
-    except Exception:
-        _create_empty_fact_bids_view(con)
-
-    try:
-        con.execute(f"CREATE OR REPLACE VIEW dim_products AS SELECT * FROM read_parquet('{dim_glob}');")
-    except Exception:
-        _create_empty_dim_products_view(con)
-
-    return con
+    r2_creds = {
+        "access_key_id": r2_key,
+        "secret_access_key": r2_secret,
+        "endpoint_url": r2_endpoint,
+        "bucket_name": r2_bucket,
+    }
+    info = configure_duckdb_lake_views(
+        con_inst,
+        use_local=use_local,
+        lake_dir=lake_dir,
+        r2_creds=r2_creds,
+        enable_fts=True,
+    )
+    _LAKE_META.clear()
+    _LAKE_META.update(info)
+    return con_inst
 
 
-con = get_duckdb_con()
+con = get_duckdb_con(get_v2_manifest_etag())
 
 
 def run_duckdb_query(sql: str) -> pd.DataFrame:
@@ -245,7 +192,13 @@ def run_cached_duckdb_query(sql: str) -> pd.DataFrame:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def has_settled_history_rows() -> bool:
-    """True once R2 holds at least 500 settled post-close lots."""
+    """True once Data Lake holds at least 500 settled post-close lots."""
+    try:
+        agg_df = run_duckdb_query("SELECT settled_lots FROM agg_lake_stats LIMIT 1;")
+        if not agg_df.empty:
+            return int(agg_df.iloc[0, 0] or 0) >= 500
+    except Exception:
+        pass
     try:
         cnt = int(run_duckdb_query("SELECT COUNT(*) FROM fact_auctions WHERE is_closed = TRUE;").iloc[0, 0])
         return cnt >= 500
@@ -277,46 +230,7 @@ def get_archive_candidates_where_sql(alias: str = "f") -> str:
     ])
 
 
-# --- PRODUCT MATCHING & NORMALIZATION ENGINE ($0 COST) ---
-
-def extract_amazon_image_id(photo_url: str) -> str:
-    """Extract canonical Amazon product image ID from URL (covers ~97.3% of Nellis catalog)."""
-    if not photo_url:
-        return ""
-    m = re.search(r'/images/I/([A-Za-z0-9\+%\-_]+?)(?:\._[^\./]+)?\.(?:jpg|jpeg|png|webp|gif)', str(photo_url), re.I)
-    return m.group(1) if m else ""
-
-
-def clean_title_text(title: str) -> str:
-    """Strip warehouse inspector prefixes like **FACTORY SEALED** or [4 in 1]."""
-    if not title:
-        return ""
-    t = str(title)
-    t = re.sub(r'^\s*\*+[^*]+\*+\s*', '', t)
-    t = re.sub(r'^\s*\[[^\]]+\]\s*', '', t)
-    t = re.sub(r'^\s*\([^)]+\)\s*', '', t)
-    return t.strip()
-
-
-def normalize_title_tokens(title: str) -> list:
-    """Tokenize and normalize product title for fuzzy signature matching."""
-    t = clean_title_text(title).lower()
-    t = re.sub(r'[^\w\s]', ' ', t)
-    tokens = []
-    for w in t.split():
-        if w in STOP_WORDS or len(w) <= 1:
-            continue
-        if len(w) > 4 and w.endswith('s') and not w.endswith('ss'):
-            w = w[:-1]
-        tokens.append(w)
-    return tokens
-
-
-def get_title_signature(title: str) -> str:
-    """Return first 5 normalized core tokens as a fast lookup key."""
-    tokens = normalize_title_tokens(title)
-    return " ".join(tokens[:5])
-
+# --- PRODUCT MATCHING & NORMALIZATION ENGINE ($0 COST; core logic shared with src.transform) ---
 
 def extract_search_keywords(title: str) -> str:
     """Extract clean 5-word search query for live Nellis duplicate lookup."""
@@ -324,55 +238,6 @@ def extract_search_keywords(title: str) -> str:
     t = re.sub(r'[^\w\s\-]', ' ', t)
     words = [w for w in t.split() if len(w) > 1]
     return " ".join(words[:6])
-
-
-def format_clean_condition(raw_cond, title: str = "", notes: str = "") -> str:
-    """Convert raw grade dict or string into clean display label, flagging incomplete/damaged items."""
-    if isinstance(raw_cond, dict):
-        c_type = raw_cond.get('conditionType', {})
-        d_type = raw_cond.get('damageType', {})
-        m_type = raw_cond.get('missingPartsType', {})
-        f_type = raw_cond.get('functionalType', {})
-        c_desc = c_type.get('description', '') if isinstance(c_type, dict) else ''
-        d_desc = d_type.get('description', '') if isinstance(d_type, dict) else ''
-        m_desc = m_type.get('description', '') if isinstance(m_type, dict) else ''
-        f_desc = f_type.get('description', '') if isinstance(f_type, dict) else ''
-        rat = raw_cond.get('rating')
-
-        if is_incomplete_or_damaged(title=title, notes=notes, damage_type=d_desc, missing_parts=m_desc, func_type=f_desc, rating=rat):
-            return f"Incomplete / Damaged / Parts ({rat}/5)" if rat else "Incomplete / Damaged / Parts"
-        if c_desc in ['New', 'Brand New'] or rat == 5:
-            return "Brand New (5/5)"
-        elif c_desc:
-            return f"{c_desc} ({rat}/5)" if rat else c_desc
-        elif rat:
-            return f"Rated {rat}/5"
-        return "Standard"
-
-    s = str(raw_cond or "Standard").strip()
-    if s.startswith("{"):
-        try:
-            g = ast.literal_eval(s)
-            return format_clean_condition(g, title=title, notes=notes)
-        except Exception:
-            pass
-
-    if is_incomplete_or_damaged(title=title, notes=notes):
-        m_r = re.search(r"(\d)/5", s)
-        return f"Incomplete / Damaged / Parts ({m_r.group(1)}/5)" if m_r else "Incomplete / Damaged / Parts"
-    return s
-
-
-def get_condition_tier(cond_str: str, title: str = "", notes: str = "") -> str:
-    """Standardize condition into like-for-like comparison tiers."""
-    c = format_clean_condition(cond_str, title=title, notes=notes).lower()
-    if any(k in c for k in ["incomplete", "damaged", "missing", "broken", "1/5", "2/5", "parts"]):
-        return "Incomplete / Damaged / Parts"
-    if any(k in c for k in ["used", "fair", "3/5"]):
-        return "Used"
-    if any(k in c for k in ["like new", "open box", "4/5", "very good"]):
-        return "Open Box / Like New"
-    return "New"
 
 
 def is_same_product(title_a, msrp_a, photo_a, title_b, msrp_b, photo_b) -> bool:
@@ -411,11 +276,60 @@ def is_same_product(title_a, msrp_a, photo_a, title_b, msrp_b, photo_b) -> bool:
 @st.cache_data(ttl=600)
 def load_historical_price_index():
     """
-    Load closed auctions from Cloudflare R2 Data Lake and build fast O(1) lookup indexes
-    by Amazon Image ID and Normalized Title Signature.
+    Load lightweight pre-aggregated product price stats (v2 lake) or closed auctions (v1 fallback)
+    and build fast O(1) lookup indexes by Amazon Image ID and Normalized Title Signature.
     """
     try:
+        agg_df = run_duckdb_query("""
+            SELECT
+                product_key,
+                amazon_image_id,
+                title_signature,
+                cond_tier,
+                settled_count,
+                settled_min_price,
+                settled_avg_price,
+                settled_max_retail,
+                sample_auction_ids
+            FROM agg_product_price_stats
+            WHERE settled_count > 0;
+        """)
+    except Exception:
+        agg_df = pd.DataFrame()
+
+    if not agg_df.empty:
+        by_img = {}
+        by_sig = {}
+        for row in agg_df.to_dict("records"):
+            cnt = _safe_int(row.get("settled_count"))
+            if cnt <= 0:
+                continue
+            s_ids = {
+                int(tok.strip())
+                for tok in str(row.get("sample_auction_ids") or "").split(",")
+                if tok.strip().isdigit()
+            }
+            entry = {
+                "_is_agg": True,
+                "product_key": str(row.get("product_key") or ""),
+                "amazon_image_id": str(row.get("amazon_image_id") or ""),
+                "title_signature": str(row.get("title_signature") or ""),
+                "cond_tier": str(row.get("cond_tier") or "New"),
+                "settled_count": cnt,
+                "settled_min_price": _safe_float(row.get("settled_min_price")),
+                "settled_avg_price": _safe_float(row.get("settled_avg_price")),
+                "settled_max_retail": _safe_float(row.get("settled_max_retail")),
+                "sample_auction_ids": s_ids,
+            }
+            if entry["amazon_image_id"]:
+                by_img.setdefault(entry["amazon_image_id"], []).append(entry)
+            if entry["title_signature"]:
+                by_sig.setdefault(entry["title_signature"], []).append(entry)
+        return {"mode": "agg", "by_img": by_img, "by_sig": by_sig}
+
+    try:
         cand_where = get_archive_candidates_where_sql("f")
+        dim_extra = ", p.amazon_image_id, p.title_signature" if _LAKE_META.get("has_v2") else ""
         hist_df = run_duckdb_query(f"""
             SELECT 
                 f.auction_id,
@@ -429,14 +343,14 @@ def load_historical_price_index():
                 f.closed_at,
                 f.photo_url,
                 f.is_closed,
-                f.market_status
+                f.market_status{dim_extra}
             FROM fact_auctions f
             JOIN dim_products p ON f.product_id = p.product_id
             WHERE {cand_where}
         """)
     except Exception as e:
         print(f"Warning loading historical index: {e}")
-        return {"by_img": {}, "by_sig": {}}
+        return {"mode": "raw", "by_img": {}, "by_sig": {}}
 
     by_img = {}
     by_sig = {}
@@ -445,8 +359,8 @@ def load_historical_price_index():
         purl = row.get("photo_url") or ""
         title = row.get("title") or ""
         notes = row.get("damage_notes") or ""
-        img_id = extract_amazon_image_id(purl)
-        sig = get_title_signature(title)
+        img_id = str(row.get("amazon_image_id") or "").strip() or extract_amazon_image_id(purl)
+        sig = str(row.get("title_signature") or "").strip() or get_title_signature(title)
         row["cond_tier"] = get_condition_tier(row.get("condition"), title=title, notes=notes)
         row["clean_cond"] = format_clean_condition(row.get("condition"), title=title, notes=notes)
 
@@ -455,11 +369,167 @@ def load_historical_price_index():
         if sig:
             by_sig.setdefault(sig, []).append(row)
 
-    return {"by_img": by_img, "by_sig": by_sig}
+    return {"mode": "raw", "by_img": by_img, "by_sig": by_sig}
+
+
+def fetch_modal_historical_lots(item_row: dict, same_condition_only: bool = True) -> list:
+    """Fetch individual historical closed lots for one clicked item via indexed DuckDB query."""
+    item_id = _safe_int(item_row.get("auction_id"))
+    title = str(item_row.get("title") or "")
+    msrp = _safe_float(item_row.get("retail_price"))
+    photo = str(item_row.get("photo_url") or "")
+    target_tier = get_condition_tier(item_row.get("condition"))
+    img_id = extract_amazon_image_id(photo)
+    sig = get_title_signature(title)
+
+    preds = []
+    if _LAKE_META.get("has_v2"):
+        if img_id:
+            safe_img = img_id.replace("'", "''")
+            preds.append(f"p.amazon_image_id = '{safe_img}'")
+        if sig:
+            safe_sig = sig.replace("'", "''")
+            preds.append(f"p.title_signature = '{safe_sig}'")
+    if not preds:
+        fallback_where = build_fuzzy_sql_where(title)
+        if not fallback_where:
+            return []
+        match_sql = fallback_where
+    else:
+        match_sql = "(" + " OR ".join(preds) + ")"
+
+    cand_where = get_archive_candidates_where_sql("f")
+    sql = f"""
+        SELECT
+            f.auction_id,
+            p.title,
+            f.location,
+            f.condition,
+            f.retail_price,
+            f.final_price,
+            f.bid_count,
+            f.damage_notes,
+            f.closed_at,
+            f.photo_url,
+            f.is_closed,
+            f.market_status
+        FROM fact_auctions f
+        JOIN dim_products p ON f.product_id = p.product_id
+        WHERE {cand_where}
+          AND f.auction_id <> {item_id}
+          AND {match_sql}
+        ORDER BY f.final_price ASC
+        LIMIT 250;
+    """
+    try:
+        cand_df = run_duckdb_query(sql)
+    except Exception:
+        return []
+    if cand_df.empty:
+        return []
+
+    matches = []
+    seen = set()
+    for cand in cand_df.to_dict("records"):
+        cid = _safe_int(cand.get("auction_id"))
+        if cid <= 0 or cid == item_id or cid in seen:
+            continue
+        c_title = cand.get("title") or ""
+        c_notes = cand.get("damage_notes") or ""
+        c_tier = get_condition_tier(cand.get("condition"), title=c_title, notes=c_notes)
+        if same_condition_only and c_tier != target_tier:
+            continue
+        if is_same_product(title, msrp, photo, c_title, cand.get("retail_price"), cand.get("photo_url")):
+            seen.add(cid)
+            cand["cond_tier"] = c_tier
+            cand["clean_cond"] = format_clean_condition(cand.get("condition"), title=c_title, notes=c_notes)
+            matches.append(cand)
+    matches.sort(key=lambda x: (float(x.get("final_price") or 0), str(x.get("closed_at") or "")))
+    return matches
+
+
+def summarize_item_history(
+    item_row: dict,
+    hist_index: dict,
+    same_condition_only: bool = True,
+    verified_matches: list | None = None,
+) -> dict | None:
+    """
+    Return compact historical stats `{count, min_won, avg_won}` for an item across
+    precomputed `agg` mode, verified match lists, or legacy `raw` dict indexes.
+    """
+    if verified_matches is not None:
+        if not verified_matches:
+            return None
+        prices = [float(m.get("final_price") or 0) for m in verified_matches]
+        return {"count": len(prices), "min_won": min(prices), "avg_won": sum(prices) / len(prices)}
+
+    if isinstance(hist_index, dict) and hist_index.get("mode") == "agg":
+        item_id = _safe_int(item_row.get("auction_id"))
+        msrp = _safe_float(item_row.get("retail_price"))
+        photo = item_row.get("photo_url") or ""
+        title = item_row.get("title") or ""
+        target_tier = get_condition_tier(item_row.get("condition"))
+        img_id = extract_amazon_image_id(photo)
+        sig = get_title_signature(title)
+
+        candidates = []
+        if img_id and img_id in hist_index.get("by_img", {}):
+            candidates.extend(hist_index["by_img"][img_id])
+        if sig and sig in hist_index.get("by_sig", {}):
+            candidates.extend(hist_index["by_sig"][sig])
+
+        seen_buckets = set()
+        total_cnt = 0
+        weighted_sum = 0.0
+        min_won = None
+        for entry in candidates:
+            bkey = (entry["product_key"], entry["cond_tier"])
+            if bkey in seen_buckets:
+                continue
+            if same_condition_only and entry["cond_tier"] != target_tier:
+                continue
+
+            other_msrp = entry.get("settled_max_retail") or 0.0
+            if msrp > 0 and other_msrp > 0:
+                ratio = other_msrp / msrp
+                if ratio < 0.72 or ratio > 1.38:
+                    continue
+
+            same_img = bool(img_id and entry["amazon_image_id"] == img_id)
+            same_sig = bool(sig and entry["title_signature"] == sig)
+            if not (same_img or same_sig):
+                continue
+
+            seen_buckets.add(bkey)
+            cnt = entry["settled_count"] - (1 if (item_id > 0 and item_id in entry["sample_auction_ids"]) else 0)
+            if cnt <= 0:
+                continue
+            total_cnt += cnt
+            weighted_sum += entry["settled_avg_price"] * cnt
+            e_min = entry["settled_min_price"]
+            min_won = e_min if min_won is None else min(min_won, e_min)
+
+        if total_cnt <= 0 or min_won is None:
+            return None
+        return {
+            "count": total_cnt,
+            "min_won": float(min_won),
+            "avg_won": float(weighted_sum / total_cnt),
+        }
+
+    matches = find_historical_matches(item_row, hist_index, same_condition_only=same_condition_only)
+    if not matches:
+        return None
+    prices = [float(m.get("final_price") or 0) for m in matches]
+    return {"count": len(prices), "min_won": min(prices), "avg_won": sum(prices) / len(prices)}
 
 
 def find_historical_matches(item_row: dict, hist_index: dict, same_condition_only: bool = True) -> list:
     """Find all closed historical lots matching the given item."""
+    if isinstance(hist_index, dict) and hist_index.get("mode") == "agg":
+        return fetch_modal_historical_lots(item_row, same_condition_only=same_condition_only)
+
     item_id = int(item_row.get("auction_id") or 0)
     title = item_row.get("title") or ""
     msrp = float(item_row.get("retail_price") or 0)
@@ -668,7 +738,7 @@ def smart_fuzzy_search_score(query: str, title: str, notes: str = "") -> float:
     return matched_score / len(q_tokens)
 
 
-def build_fuzzy_sql_where(query: str) -> str:
+def build_fuzzy_sql_where(query: str, text_col: str = "p.title", match_op: str = "ILIKE") -> str:
     """
     Build a typo-tolerant DuckDB SQL WHERE clause using 2-3 char prefix/suffix anchors
     so misspelled queries still pull candidate rows before Python fuzzy scoring.
@@ -681,14 +751,21 @@ def build_fuzzy_sql_where(query: str) -> str:
     for qt in q_tokens[:4]:
         safe_qt = qt.replace("'", "''")
         if len(qt) <= 3:
-            token_clauses.append(f"(p.title ILIKE '%{safe_qt}%' OR f.damage_notes ILIKE '%{safe_qt}%')")
+            token_clauses.append(f"({text_col} {match_op} '%{safe_qt}%' OR f.damage_notes ILIKE '%{safe_qt}%')")
         else:
             p3 = safe_qt[:3]
             s3 = safe_qt[-3:]
             token_clauses.append(
-                f"(p.title ILIKE '%{p3}%' OR p.title ILIKE '%{s3}%' OR f.damage_notes ILIKE '%{p3}%')"
+                f"({text_col} {match_op} '%{p3}%' OR {text_col} {match_op} '%{s3}%' OR f.damage_notes ILIKE '%{p3}%')"
             )
     return "(" + " AND ".join(token_clauses) + ")"
+
+
+def build_fast_text_search_sql(query: str) -> str:
+    """Use pre-normalized `p.search_text_norm` with fast LIKE on v2, falling back to `p.title` ILIKE."""
+    if _LAKE_META.get("has_v2"):
+        return build_fuzzy_sql_where(query, text_col="p.search_text_norm", match_op="LIKE")
+    return build_fuzzy_sql_where(query)
 
 
 @st.cache_data(ttl=15)
@@ -1189,13 +1266,14 @@ def find_open_radar_matches(item_row: dict, open_index: dict) -> list:
 
 @st.cache_data(ttl=300)
 def load_open_radar_index():
-    """Build O(1) index of currently open lots from R2 + Live API for 'Back Tonight' Radar."""
+    """Build O(1) index of currently open lots from Hot Lake Partition + Live API for 'Back Tonight' Radar."""
     open_rows = []
     try:
-        lake_open = run_duckdb_query("""
+        dim_extra = ", p.amazon_image_id, p.title_signature" if _LAKE_META.get("has_v2") else ""
+        lake_open = run_duckdb_query(f"""
             SELECT f.auction_id, p.title, f.location, f.condition, f.retail_price,
-                   f.final_price, f.bid_count, f.closed_at, f.photo_url
-            FROM fact_auctions f
+                   f.final_price, f.bid_count, f.closed_at, f.photo_url{dim_extra}
+            FROM fact_auctions_hot f
             JOIN dim_products p ON f.product_id = p.product_id
             WHERE f.closed_at > now()
             LIMIT 3000;
@@ -1220,8 +1298,8 @@ def load_open_radar_index():
     by_img = {}
     by_sig = {}
     for row in open_rows:
-        img_id = extract_amazon_image_id(row.get("photo_url") or "")
-        sig = get_title_signature(row.get("title") or "")
+        img_id = str(row.get("amazon_image_id") or "").strip() or extract_amazon_image_id(row.get("photo_url") or "")
+        sig = str(row.get("title_signature") or "").strip() or get_title_signature(row.get("title") or "")
         if img_id:
             by_img.setdefault(img_id, []).append(row)
         if sig:
@@ -1249,6 +1327,13 @@ def validate_readonly_sql(sql_text: str) -> str:
 def enrich_categories(df_in: pd.DataFrame) -> pd.DataFrame:
     """Populate normalized `category_primary` and `category_secondary` columns on a DataFrame."""
     if df_in.empty:
+        return df_in
+    if (
+        "category_primary" in df_in.columns
+        and "category_secondary" in df_in.columns
+        and (df_in["category_primary"].fillna("").astype(str).str.strip() != "").all()
+        and (df_in["category_secondary"].fillna("").astype(str).str.strip() != "").all()
+    ):
         return df_in
     df_out = df_in.copy()
     if "category_primary" not in df_out.columns:
@@ -1719,7 +1804,8 @@ def _render_auction_card_grid(
     max_hist_avg: int = 25,
 ):
     """Render responsive 4-column card grid for Live Deals or unified Past Archive."""
-    verified_page_hist = batch_verify_rows_history(records, hist_index, same_condition_only=True)
+    is_agg_hist = isinstance(hist_index, dict) and hist_index.get("mode") == "agg"
+    verified_page_hist = {} if is_agg_hist else batch_verify_rows_history(records, hist_index, same_condition_only=True)
     for row_start in range(0, len(records), 4):
         grid_cols = st.columns(4)
         for col_idx, row_dict in enumerate(records[row_start:row_start + 4]):
@@ -1734,7 +1820,13 @@ def _render_auction_card_grid(
             cat_primary = row_dict.get("category_primary") or "Home & General"
             cat_secondary = row_dict.get("category_secondary") or "Miscellaneous"
 
-            past_matches = verified_page_hist.get(auction_id, [])
+            hist_summary = summarize_item_history(
+                row_dict,
+                hist_index,
+                same_condition_only=True,
+                verified_matches=None if is_agg_hist else verified_page_hist.get(auction_id, []),
+            )
+            hist_count = int(hist_summary["count"]) if hist_summary else 0
             open_matches = [
                 c for c in find_open_radar_matches(row_dict, open_radar_index)
                 if _safe_int(c.get("auction_id")) != auction_id
@@ -1850,10 +1942,9 @@ def _render_auction_card_grid(
                             unsafe_allow_html=True,
                         )
 
-                    if past_matches:
-                        p_prices = [float(m.get("final_price") or 0) for m in past_matches]
-                        min_won = min(p_prices)
-                        avg_won = sum(p_prices) / len(p_prices)
+                    if hist_summary:
+                        min_won = float(hist_summary["min_won"])
+                        avg_won = float(hist_summary["avg_won"])
                         hist_avg_disc = ((msrp - avg_won) / msrp * 100.0) if msrp > 0 else 0.0
                         if cur_bid <= min_won:
                             verdict = "🟢 **Below All-Time Low!**"
@@ -1864,13 +1955,13 @@ def _render_auction_card_grid(
                         if (
                             not is_archive_mode
                             and cur_bid <= avg_won
-                            and len(past_matches) >= min_hist_sales
+                            and hist_count >= min_hist_sales
                             and avg_won <= max_hist_avg
                             and hist_avg_disc >= min_hist_disc
                         ):
-                            sale_noun = "sale" if len(past_matches) == 1 else "sales"
-                            st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {len(past_matches)} {sale_noun})]**")
-                        st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.2f} ({len(past_matches)}) · {verdict}")
+                            sale_noun = "sale" if hist_count == 1 else "sales"
+                            st.markdown(f"🔮 **:green[Likely Cheap Tonight: Avg ${avg_won:.2f} ({hist_avg_disc:.0f}% off · {hist_count} {sale_noun})]**")
+                        st.caption(f"🏆 **Min Won ({cond_tier}):** ${min_won:.2f} · Avg ${avg_won:.2f} ({hist_count}) · {verdict}")
                     else:
                         st.caption(f"📊 No past '{cond_tier}' sales yet")
 
@@ -1888,7 +1979,7 @@ def _render_auction_card_grid(
                         f'<a class="{btn_cls}" href="{item_url}" target="_blank">{action_label}</a>',
                         unsafe_allow_html=True,
                     )
-                    if st.button(f"🔍 History ({len(past_matches)}) & Active ({len(open_matches)})", key=f"{btn_key_prefix}_{auction_id}", **_stretch_kwargs(st.button)):
+                    if st.button(f"🔍 History ({hist_count}) & Active ({len(open_matches)})", key=f"{btn_key_prefix}_{auction_id}", **_stretch_kwargs(st.button)):
                         show_item_history_dialog(row_dict)
 
 
@@ -2667,7 +2758,7 @@ if view_mode == "Live":
             if cond_filter != "All" and cond_filter != "Incomplete / Damaged / Parts":
                 where_parts.append(f"f.condition ILIKE '%{cond_filter}%'")
             if search_kw.strip():
-                fuzzy_sql = build_fuzzy_sql_where(search_kw)
+                fuzzy_sql = build_fast_text_search_sql(search_kw)
                 if fuzzy_sql:
                     where_parts.append(fuzzy_sql)
 
@@ -2697,7 +2788,7 @@ if view_mode == "Live":
                     f.closed_at,
                     f.photo_url,
                     CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms
-                FROM fact_auctions f
+                FROM fact_auctions_hot f
                 JOIN dim_products p ON f.product_id = p.product_id
                 WHERE {where_sql}
                 ORDER BY {sort_sql}
@@ -2765,44 +2856,51 @@ if view_mode == "Live":
         if need_hist_scoring and not filtered.empty:
             hist_index_for_pred = load_historical_price_index()
             cand_rows = filtered.to_dict("records")
+            is_agg_hist = isinstance(hist_index_for_pred, dict) and hist_index_for_pred.get("mode") == "agg"
 
-            # Pre-filter candidates, then live-verify matching sales so Likely Cheap Tonight
-            # never surfaces stale $1 pre-close prices or already-expensive live items.
-            pre_keep_rows = []
-            for r in cand_rows:
-                ms = find_historical_matches(r, hist_index_for_pred, same_condition_only=True)
-                if not ms:
-                    continue
-                avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
-                msrp_v = float(r.get("retail_price") or 0)
-                cur_p = float(r.get("final_price") or 0)
-                avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
-                if (not predict_cheap_only) or (
-                    len(ms) >= min_hist_sales
-                    and avg_p <= max_hist_avg
-                    and cur_p <= max_hist_avg
-                    and avg_d >= min_hist_disc
-                ):
-                    pre_keep_rows.append(r)
-
-            verified_pred_map = batch_verify_rows_history(
-                pre_keep_rows,
-                hist_index_for_pred,
-                same_condition_only=True,
-                max_verify_per_item=15,
-                max_total_live_checks=280,
-            )
-
-            h_counts, h_avgs, h_discs, h_still_cheap = [], [], [], []
-            for r in cand_rows:
-                aid_r = int(r.get("auction_id") or 0)
-                ms = verified_pred_map.get(aid_r, [])
-                if ms:
+            verified_pred_map = {}
+            if not is_agg_hist:
+                # Legacy v1 path: pre-filter candidates then live-verify matching sales
+                pre_keep_rows = []
+                for r in cand_rows:
+                    ms = find_historical_matches(r, hist_index_for_pred, same_condition_only=True)
+                    if not ms:
+                        continue
                     avg_p = sum(float(m.get("final_price") or 0) for m in ms) / len(ms)
                     msrp_v = float(r.get("retail_price") or 0)
                     cur_p = float(r.get("final_price") or 0)
                     avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
-                    h_counts.append(len(ms))
+                    if (not predict_cheap_only) or (
+                        len(ms) >= min_hist_sales
+                        and avg_p <= max_hist_avg
+                        and cur_p <= max_hist_avg
+                        and avg_d >= min_hist_disc
+                    ):
+                        pre_keep_rows.append(r)
+
+                verified_pred_map = batch_verify_rows_history(
+                    pre_keep_rows,
+                    hist_index_for_pred,
+                    same_condition_only=True,
+                    max_verify_per_item=15,
+                    max_total_live_checks=280,
+                )
+
+            h_counts, h_avgs, h_discs, h_still_cheap = [], [], [], []
+            for r in cand_rows:
+                aid_r = int(r.get("auction_id") or 0)
+                summ = summarize_item_history(
+                    r,
+                    hist_index_for_pred,
+                    same_condition_only=True,
+                    verified_matches=None if is_agg_hist else verified_pred_map.get(aid_r, []),
+                )
+                if summ:
+                    avg_p = float(summ["avg_won"])
+                    msrp_v = float(r.get("retail_price") or 0)
+                    cur_p = float(r.get("final_price") or 0)
+                    avg_d = ((msrp_v - avg_p) / msrp_v * 100.0) if msrp_v > 0 else 0.0
+                    h_counts.append(int(summ["count"]))
                     h_avgs.append(avg_p)
                     h_discs.append(avg_d)
                     h_still_cheap.append(cur_p <= avg_p)
@@ -2960,8 +3058,11 @@ elif view_mode == "Archive":
         where_parts.append("(f.condition ILIKE '%Damaged%' OR f.condition ILIKE '%Incomplete%' OR f.condition ILIKE '%Parts%')")
     elif a_cond != "All":
         where_parts.append(f"f.condition ILIKE '%{a_cond}%'")
+    if a_cat != "All Categories" and _LAKE_META.get("has_v2"):
+        safe_cat = a_cat.replace("'", "''")
+        where_parts.append(f"p.category_primary = '{safe_cat}'")
     if a_kw.strip():
-        fuzzy_sql = build_fuzzy_sql_where(a_kw)
+        fuzzy_sql = build_fast_text_search_sql(a_kw)
         if fuzzy_sql:
             where_parts.append(fuzzy_sql)
 
@@ -2994,7 +3095,6 @@ elif view_mode == "Archive":
             f.photo_url,
             f.is_closed,
             f.market_status,
-            COUNT(*) OVER () AS _sql_total_count,
             CAST(epoch_ms(f.closed_at) AS BIGINT) AS close_ms
         FROM fact_auctions f
         JOIN dim_products p ON f.product_id = p.product_id
@@ -3004,9 +3104,11 @@ elif view_mode == "Archive":
     """
 
     arch_df = pd.DataFrame()
+    raw_sql_count = 0
     with st.spinner("Searching closed historical auctions in Data Lake..."):
         try:
             arch_df = run_cached_duckdb_query(archive_sql)
+            raw_sql_count = len(arch_df)
         except Exception as e:
             st.error(f"Error querying Past Archive: {e}")
 
@@ -3029,7 +3131,16 @@ elif view_mode == "Archive":
         st.info("No past closed lots match your filters. Try tapping **Clear** or widening the Date window / Discount threshold.")
     else:
         total_arch = len(arch_df)
-        sql_total_arch = int(arch_df["_sql_total_count"].max() or 0) if "_sql_total_count" in arch_df.columns else total_arch
+        sql_total_arch = raw_sql_count
+        if raw_sql_count >= 2000:
+            try:
+                cnt_df = run_cached_duckdb_query(
+                    f"SELECT COUNT(*) AS cnt FROM fact_auctions f JOIN dim_products p ON f.product_id = p.product_id WHERE {where_sql};"
+                )
+                if not cnt_df.empty:
+                    sql_total_arch = int(cnt_df.iloc[0, 0] or raw_sql_count)
+            except Exception:
+                pass
 
         # Target Bid Cheat Sheet & Condition Arbitrage: prefer verified sales when mixed archive results exist
         settled_mask = (arch_df["is_closed"] == True) & (arch_df["bid_count"].fillna(0) > 0) & (arch_df["final_price"].fillna(0) > 0)

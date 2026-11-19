@@ -197,6 +197,7 @@ def main():
     parser.add_argument("--upload-r2", action="store_true", default=True, help="Upload Parquet files to Cloudflare R2 (default: True)")
     parser.add_argument("--local-only", action="store_true", help="Force saving to local ./data_lake instead of Cloudflare R2")
     parser.add_argument("--settle-recent", type=int, default=4, help="Verify & settle closed lots in the N newest R2 files (0 to skip)")
+    parser.add_argument("--skip-v2", action="store_true", help="Skip updating compacted v2 store after ingest")
     args = parser.parse_args()
 
     locations = [loc.strip() for loc in args.locations.split(",") if loc.strip()]
@@ -228,10 +229,11 @@ def main():
     fact_path = write_fact_auctions(fact_auctions, scrape_date=scrape_date, use_r2=use_r2)
     catalog_path = merge_dim_products(dim_products, use_r2=use_r2)
 
+    settled_count = 0
     if use_r2 and args.settle_recent > 0 and args.limit is None:
         from src.settlement import settle_r2_partitions
         print(f"\n[*] Settling closed auctions across newest {args.settle_recent} R2 partitions...")
-        settle_r2_partitions(
+        settled_count = settle_r2_partitions(
             max_files=args.settle_recent,
             workers=10,
             max_items_per_run=4000,
@@ -240,6 +242,19 @@ def main():
             max_cooldowns=6,
             cooldown_seconds=65,
         )
+
+    if (not args.skip_v2) and (args.limit is None):
+        from src.compact_lake import compact_v1_to_v2, update_v2_incremental
+        if settled_count > 0:
+            print("\n[*] Updating compacted v2 store (full refresh after settlement edits)...")
+            compact_v1_to_v2(use_r2=use_r2)
+        else:
+            print("\n[*] Incrementally updating compacted v2 store...")
+            update_v2_incremental(
+                new_fact_records=fact_auctions,
+                new_dim_records=dim_products,
+                use_r2=use_r2,
+            )
 
     print("\n" + "=" * 70)
     print("[✓] Pipeline Run Completed Successfully!")

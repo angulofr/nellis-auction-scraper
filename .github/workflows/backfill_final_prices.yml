@@ -54,4 +54,6 @@ jobs:
             --max-files "${{ github.event.inputs.max_files || '0' }}" \
             --workers "${{ github.event.inputs.workers || '10' }}" \
             --cooldowns "${{ github.event.inputs.cooldowns || '45' }}" \
+            --skip-v2 \
             $REVERIFY_ARG
+          python -m src.compact_lake

@@ -48,6 +48,9 @@ jobs:
           LOCATIONS="${{ github.event.inputs.locations || 'Phoenix,Mesa' }}"
           echo "[*] Ingesting Nellis Auction lots for $LOCATIONS..."
           python -m src.scraper --locations "$LOCATIONS" $LIMIT_ARG
+          if [ -n "$LIMIT_ARG" ]; then
+            echo "[*] Limited run detected; skipping v2 compaction."
+          fi
 
       - name: Verify Data Lake via DuckDB
         env:
