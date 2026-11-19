@@ -266,14 +266,132 @@ class TestCompactionAndSpeed(unittest.TestCase):
                 }
                 self.assertIsNone(self.app.summarize_item_history(archive_dewalt, hist_idx, same_condition_only=True))
 
-                # Fast search clause switches to p.search_text_norm in v2 mode
+                # Fast search clause switches to p.search_text_norm in v2 without slow f.damage_notes scan
                 fast_sql = self.app.build_fast_text_search_sql("dyson vacuum")
                 self.assertIn("p.search_text_norm", fast_sql)
+                self.assertNotIn("damage_notes", fast_sql)
             finally:
                 con.close()
                 self.app.con = prev_con
                 self.app._LAKE_META.clear()
                 self.app._LAKE_META.update(prev_meta)
+
+    def test_live_keyword_search_skips_unfiltered_fallback_sweep(self):
+        """Specific Live keyword searches (>=1 match) must not run slow 4-page unfiltered fallback dumps."""
+        import json
+        import urllib.request
+        from tests.fixtures.nellis_fixtures import build_turbo_stream_search_payload
+
+        now_ms = int(time.time() * 1000)
+        payload = build_turbo_stream_search_payload([
+            {
+                "id": 99101,
+                "title": "DeWalt 20V Cordless Hammer Drill Kit",
+                "retailPrice": 249.0,
+                "currentPrice": 35.0,
+                "bidCount": 4,
+                "closeTime": now_ms + 360_000,
+                "isClosed": False,
+                "location": {"name": "Phoenix"},
+                "grade": {"conditionType": {"description": "New"}, "rating": 5},
+                "photos": [],
+            }
+        ])
+        search_calls = []
+
+        class _Resp:
+            def __init__(self, body):
+                self._raw = json.dumps(body).encode("utf-8")
+
+            def read(self):
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        class _Opener:
+            def open(self, req, timeout=6):
+                u = req.full_url if hasattr(req, "full_url") else str(req)
+                if "search.data" in u:
+                    search_calls.append(u)
+                    return _Resp(payload)
+                return _Resp({"ok": True})
+
+        self.app.fetch_live_nellis_lots.clear()
+        with mock.patch.object(urllib.request, "build_opener", return_value=_Opener()):
+            df = self.app.fetch_live_nellis_lots(
+                search_kw="dewalt drill",
+                loc_filter="All",
+                page_size=240,
+                max_pages=8,
+                target_window_sec=900,
+            )
+        self.assertEqual(len(df), 1)
+        self.assertEqual(len(search_calls), 1)
+
+    def test_archive_search_skips_http_verify_for_old_lots(self):
+        """Old (>36h) unverified Archive search results must render without slow HTTP verification sweeps."""
+        import streamlit as st
+
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lake_dir = os.path.join(tmpdir, "data_lake")
+            fact_dir = Path(lake_dir) / "fact_auctions" / "year=2026" / "month=11"
+            dim_dir = Path(lake_dir) / "dim_products"
+            fact_dir.mkdir(parents=True, exist_ok=True)
+            dim_dir.mkdir(parents=True, exist_ok=True)
+
+            gen = duckdb.connect(":memory:")
+            dim_p = str(dim_dir / "products_catalog.parquet").replace("\\", "/")
+            fact_p = str(fact_dir / "auctions_2026-11-10.parquet").replace("\\", "/")
+            gen.execute(f"""
+                COPY (
+                    SELECT 'p_old1' AS product_id, 'Dyson V15 Old Archive Vacuum' AS title,
+                           'Dyson' AS brand, 'Home & General' AS category_primary,
+                           'General' AS category_secondary, 500.0 AS base_retail_price,
+                           '' AS description, DATE '2026-11-01' AS first_seen_date, '' AS photo_url
+                ) TO '{dim_p}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
+            """).fetchall()
+            gen.execute(f"""
+                COPY (
+                    SELECT CAST(88001 AS BIGINT) AS auction_id, 'p_old1' AS product_id,
+                           'Phoenix' AS location, 'Brand New (5/5)' AS condition,
+                           'Standard' AS completeness, 'Functional' AS functional_status,
+                           '' AS damage_notes, 500.0 AS retail_price, 40.0 AS final_price,
+                           0.08 AS discount_ratio, 5 AS bid_count, 3 AS unique_bidders,
+                           TIMESTAMPTZ '2026-11-10 12:00:00+00' AS closed_at,
+                           CAST(2 AS TINYINT) AS close_day_of_week, CAST(12 AS TINYINT) AS close_hour,
+                           DATE '2026-11-10' AS scraped_date, '' AS photo_url,
+                           FALSE AS is_closed, 'active' AS market_status
+                ) TO '{fact_p}' (FORMAT 'PARQUET', COMPRESSION 'ZSTD');
+            """).fetchall()
+            gen.close()
+
+            compact_v1_to_v2(use_r2=False, lake_dir=lake_dir, hot_days=3)
+            now_ms = int(time.time() * 1000)
+            srv, _ = start_mock_nellis_server(now_ms)
+            try:
+                env = {
+                    "NELLIS_USE_LOCAL_LAKE": "1",
+                    "NELLIS_LAKE_DIR": lake_dir,
+                    "NELLIS_API_BASE": f"http://127.0.0.1:{srv.server_port}",
+                    "R2_ACCESS_KEY_ID": "",
+                    "R2_SECRET_ACCESS_KEY": "",
+                }
+                with mock.patch.dict(os.environ, env), mock.patch("src.settlement.fetch_closed_lots_batch") as mock_batch:
+                    at = AppTest.from_file(str(ROOT_DIR / "app.py"), default_timeout=25).run()
+                    at.segmented_control(key="nav_view").set_value("Archive").run()
+                    self.assertEqual(len(at.exception), 0, f"Archive exceptions: {at.exception}")
+                    self.assertEqual(mock_batch.call_count, 0)
+            finally:
+                srv.shutdown()
+                srv.server_close()
+                st.cache_data.clear()
+                st.cache_resource.clear()
 
     def test_100k_scale_v2_query_latency(self):
         """Benchmark v2 sorted partitions + precomputed agg over 100,000 synthetic lots."""

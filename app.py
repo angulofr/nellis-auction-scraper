@@ -165,7 +165,7 @@ def get_duckdb_con(_manifest_etag: str = ""):
         use_local=use_local,
         lake_dir=lake_dir,
         r2_creds=r2_creds,
-        enable_fts=True,
+        enable_fts=False,
     )
     _LAKE_META.clear()
     _LAKE_META.update(info)
@@ -738,7 +738,12 @@ def smart_fuzzy_search_score(query: str, title: str, notes: str = "") -> float:
     return matched_score / len(q_tokens)
 
 
-def build_fuzzy_sql_where(query: str, text_col: str = "p.title", match_op: str = "ILIKE") -> str:
+def build_fuzzy_sql_where(
+    query: str,
+    text_col: str = "p.title",
+    match_op: str = "ILIKE",
+    include_notes: bool = True,
+) -> str:
     """
     Build a typo-tolerant DuckDB SQL WHERE clause using 2-3 char prefix/suffix anchors
     so misspelled queries still pull candidate rows before Python fuzzy scoring.
@@ -751,24 +756,32 @@ def build_fuzzy_sql_where(query: str, text_col: str = "p.title", match_op: str =
     for qt in q_tokens[:4]:
         safe_qt = qt.replace("'", "''")
         if len(qt) <= 3:
-            token_clauses.append(f"({text_col} {match_op} '%{safe_qt}%' OR f.damage_notes ILIKE '%{safe_qt}%')")
+            if include_notes:
+                token_clauses.append(f"({text_col} {match_op} '%{safe_qt}%' OR f.damage_notes ILIKE '%{safe_qt}%')")
+            else:
+                token_clauses.append(f"{text_col} {match_op} '%{safe_qt}%'")
         else:
             p3 = safe_qt[:3]
             s3 = safe_qt[-3:]
-            token_clauses.append(
-                f"({text_col} {match_op} '%{p3}%' OR {text_col} {match_op} '%{s3}%' OR f.damage_notes ILIKE '%{p3}%')"
-            )
+            if include_notes:
+                token_clauses.append(
+                    f"({text_col} {match_op} '%{p3}%' OR {text_col} {match_op} '%{s3}%' OR f.damage_notes ILIKE '%{p3}%')"
+                )
+            else:
+                token_clauses.append(
+                    f"({text_col} {match_op} '%{p3}%' OR {text_col} {match_op} '%{s3}%')"
+                )
     return "(" + " AND ".join(token_clauses) + ")"
 
 
 def build_fast_text_search_sql(query: str) -> str:
-    """Use pre-normalized `p.search_text_norm` with fast LIKE on v2, falling back to `p.title` ILIKE."""
+    """Use pre-normalized `p.search_text_norm` in RAM `dim_products` (avoiding slow fact scans on v2)."""
     if _LAKE_META.get("has_v2"):
-        return build_fuzzy_sql_where(query, text_col="p.search_text_norm", match_op="LIKE")
+        return build_fuzzy_sql_where(query, text_col="p.search_text_norm", match_op="LIKE", include_notes=False)
     return build_fuzzy_sql_where(query)
 
 
-@st.cache_data(ttl=15)
+@st.cache_data(ttl=30)
 def fetch_live_nellis_lots(
     search_kw: str = "",
     loc_filter: str = "All",
@@ -790,12 +803,19 @@ def fetch_live_nellis_lots(
             data=b'shoppingLocationId=2',
             headers={'User-Agent': 'Mozilla/5.0', 'Content-Type': 'application/x-www-form-urlencoded'}
         )
-        opener.open(req_loc, timeout=10)
+        opener.open(req_loc, timeout=6)
 
+        has_kw = bool(search_kw and search_kw.strip())
+        eff_page_size = min(max(int(page_size), 40), 240)
         # Short live windows MUST walk chronologically so sorting by Discount/Bid/MSRP still sees the full window
         if target_window_sec > 0:
             nellis_sort = "time_remaining_asc"
-            eff_max_pages = max(max_pages, 25 if target_window_sec >= 1800 else 18)
+            if has_kw:
+                eff_max_pages = min(max_pages, 3)
+            elif eff_page_size >= 240:
+                eff_max_pages = max(max_pages, 12 if target_window_sec >= 1800 else 8)
+            else:
+                eff_max_pages = max(max_pages, 18 if target_window_sec >= 1800 else 12)
         else:
             nellis_sort = {
                 "Closing Soonest": "time_remaining_asc",
@@ -805,9 +825,7 @@ def fetch_live_nellis_lots(
                 "Highest Retail MSRP ($)": "retail_price_desc",
                 "Highest Discount (%)": "time_remaining_asc",
             }.get(sort_by, "time_remaining_asc")
-            eff_max_pages = max_pages
-
-        eff_page_size = min(max(int(page_size), 40), 240)
+            eff_max_pages = min(max_pages, 3) if has_kw else max_pages
 
         def _fetch_query(kw_str: str, pages: int, direct_match: bool = False):
             collected = []
@@ -823,7 +841,7 @@ def fetch_live_nellis_lots(
                 qs = urllib.parse.urlencode(params)
                 url = f'{NELLIS_API_BASE}/search.data?{qs}'
                 req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                with opener.open(req, timeout=12) as resp:
+                with opener.open(req, timeout=6) as resp:
                     data = json.loads(resp.read().decode())
 
                 page_items, raw_count, max_diff_sec = parse_nellis_products_with_meta(
@@ -863,24 +881,18 @@ def fetch_live_nellis_lots(
                     consecutive_empty_new = 0
             return collected
 
-        items = _fetch_query(search_kw, eff_max_pages, direct_match=bool(search_kw and search_kw.strip()))
+        items = _fetch_query(search_kw, eff_max_pages, direct_match=has_kw)
 
-        # If search query had a typo or multi-word constraint that returned very few hits from Nellis,
-        # also fetch a broader live pool so our typo-tolerant fuzzy matcher can surface relevant items.
-        if search_kw and search_kw.strip() and len(items) < 25:
+        # Typo-tolerant fallback: only issue 1 lightweight rescue page when Nellis returned zero hits
+        if has_kw and len(items) == 0:
             q_tokens = [w for w in re.findall(r"[a-z0-9]+", search_kw.strip().lower()) if len(w) >= 3]
-            seen_ids = {it.get("auction_id") for it in items}
-            if len(q_tokens) > 1:
-                longest_tok = max(q_tokens, key=len)
-                for extra in _fetch_query(longest_tok, 2, direct_match=False):
-                    if extra.get("auction_id") not in seen_ids:
-                        seen_ids.add(extra.get("auction_id"))
-                        items.append(extra)
-            if len(items) < 25:
-                for extra in _fetch_query("", 4, direct_match=False):
-                    if extra.get("auction_id") not in seen_ids:
-                        seen_ids.add(extra.get("auction_id"))
-                        items.append(extra)
+            seen_ids = set()
+            rescue_kw = max(q_tokens, key=len) if len(q_tokens) > 1 else ""
+            for extra in _fetch_query(rescue_kw, 1, direct_match=False):
+                aid = extra.get("auction_id")
+                if aid not in seen_ids:
+                    seen_ids.add(aid)
+                    items.append(extra)
 
         return pd.DataFrame(items)
     except Exception as e:
@@ -935,8 +947,14 @@ def search_live_active_duplicates(title: str, retail_price: float, photo_url: st
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def verify_closed_lots_cached(aids_tuple: tuple) -> dict:
-    """Cache live post-close Nellis .data verification per batch of past auction IDs."""
-    return fetch_closed_lots_batch(list(aids_tuple), workers=24)
+    """Cache fast interactive post-close verification per batch of auction IDs."""
+    return fetch_closed_lots_batch(
+        list(aids_tuple),
+        workers=12,
+        max_cooldowns=0,
+        timeout=2.5,
+        attempts=1,
+    )
 
 
 def _format_az_date(val) -> str:
@@ -1284,7 +1302,7 @@ def load_open_radar_index():
         pass
 
     try:
-        live_open = fetch_live_nellis_lots(search_kw="", loc_filter="All", page_size=120, max_pages=3)
+        live_open = fetch_live_nellis_lots(search_kw="", loc_filter="All", page_size=240, max_pages=1)
         if not live_open.empty:
             seen = {int(r.get("auction_id") or 0) for r in open_rows}
             for r in live_open.to_dict("records"):
@@ -2738,7 +2756,7 @@ if view_mode == "Live":
             loc_filter=loc_filter,
             sort_by=sort_by,
             page_size=240,
-            max_pages=8,
+            max_pages=(3 if (time_filter in ("All", "24h") or bool(search_kw.strip())) else 8),
             target_window_sec=short_window_sec,
         )
 
@@ -3259,12 +3277,15 @@ elif view_mode == "Archive":
         render_pagination_bar("arch_top", "arch_page_num", arch_curr_page, arch_total_pages, arch_start_i, arch_end_i, total_arch, noun="lots")
 
         records = arch_page_df.to_dict("records")
-        # Live-verify unverified visible page rows so archive results show live status without scanning all 290k rows
+        # Live-verify at most 6 recent (<36h) unverified closes so old archive searches never stall on 40 HTTP calls
+        recent_cutoff_ms = (time.time() - 36 * 3600) * 1000.0
         unv_page_ids = tuple(sorted({
             int(r["auction_id"])
             for r in records
-            if not (r.get("is_closed") is True) and int(r.get("auction_id") or 0) > 0
-        }))
+            if not (r.get("is_closed") is True)
+            and int(r.get("auction_id") or 0) > 0
+            and _safe_float(r.get("close_ms")) >= recent_cutoff_ms
+        })[:6])
         page_live_map = verify_closed_lots_cached(unv_page_ids) if unv_page_ids else {}
         for r in records:
             if r.get("is_closed") is True:

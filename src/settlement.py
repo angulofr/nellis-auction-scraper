@@ -291,7 +291,12 @@ def _is_single_fetch_not_found(resp, data=None) -> bool:
     return False
 
 
-def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session] = None, timeout: int = 10) -> Optional[Dict]:
+def fetch_closed_lot_result(
+    auction_id: int,
+    session: Optional[requests.Session] = None,
+    timeout: float = 10.0,
+    attempts: int = 2,
+) -> Optional[Dict]:
     """Fetch authoritative post-close state & full bidHistory of a lot from Nellis .data endpoint."""
     aid = int(auction_id)
     base_url = os.environ.get("NELLIS_API_BASE", "https://www.nellisauction.com").rstrip("/")
@@ -300,7 +305,7 @@ def fetch_closed_lot_result(auction_id: int, session: Optional[requests.Session]
     sess = session or _build_pooled_session(4)
 
     try:
-        for attempt in range(2):
+        for attempt in range(max(1, int(attempts))):
             try:
                 resp = sess.get(url, timeout=timeout)
                 if resp.status_code == 429:
@@ -403,6 +408,8 @@ def fetch_closed_lots_batch(
     chunk_size: int = 150,
     max_cooldowns: int = 0,
     cooldown_seconds: int = 65,
+    timeout: Optional[float] = None,
+    attempts: Optional[int] = None,
 ) -> Dict[int, Dict]:
     """
     Concurrently fetch authoritative post-close status, winning prices & bidHistory in paced chunks.
@@ -441,7 +448,12 @@ def fetch_closed_lots_batch(
             wave_resolved = 0
 
             with ThreadPoolExecutor(max_workers=eff_workers) as ex:
-                fut_map = {ex.submit(fetch_closed_lot_result, aid, sess): aid for aid in batch_ids}
+                extra_kw = {}
+                if timeout is not None:
+                    extra_kw["timeout"] = timeout
+                if attempts is not None:
+                    extra_kw["attempts"] = attempts
+                fut_map = {ex.submit(fetch_closed_lot_result, aid, sess, **extra_kw): aid for aid in batch_ids}
                 for fut in as_completed(fut_map):
                     aid = fut_map[fut]
                     try:
