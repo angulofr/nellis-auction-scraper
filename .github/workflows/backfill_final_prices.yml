@@ -1,6 +1,9 @@
 name: Backfill Settled Final Winning Prices
 
 on:
+  schedule:
+    # Twice-daily paced post-close backfill (11:30 PM & 8:30 AM AZ MST)
+    - cron: '30 6,15 * * *'
   workflow_dispatch:
     inputs:
       max_files:
@@ -10,11 +13,23 @@ on:
       workers:
         description: 'Concurrent HTTP workers'
         required: false
-        default: '10'
+        default: '4'
+      rate:
+        description: 'Sustained max requests/sec (0 = unpaced)'
+        required: false
+        default: '2.5'
+      max_items:
+        description: 'Max unique auction lookups resolved per run (0 = unlimited)'
+        required: false
+        default: '35000'
+      max_minutes:
+        description: 'Soft wall-clock budget in minutes before compacting v2 (0 = unlimited)'
+        required: false
+        default: '250'
       cooldowns:
         description: 'Max HTTP 429 cooldown cycles per run'
         required: false
-        default: '45'
+        default: '10'
       reverify_all:
         description: 'Re-verify even already settled rows (true/false)'
         required: false
@@ -52,8 +67,12 @@ jobs:
           fi
           python -m src.settlement \
             --max-files "${{ github.event.inputs.max_files || '0' }}" \
-            --workers "${{ github.event.inputs.workers || '10' }}" \
-            --cooldowns "${{ github.event.inputs.cooldowns || '45' }}" \
+            --workers "${{ github.event.inputs.workers || '4' }}" \
+            --rate "${{ github.event.inputs.rate || '2.5' }}" \
+            --max-items "${{ github.event.inputs.max_items || '35000' }}" \
+            --max-minutes "${{ github.event.inputs.max_minutes || '250' }}" \
+            --cooldowns "${{ github.event.inputs.cooldowns || '10' }}" \
+            --cooldown-sec 120 \
             --skip-v2 \
             $REVERIFY_ARG
           python -m src.compact_lake

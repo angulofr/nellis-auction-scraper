@@ -2,8 +2,8 @@ name: Nellis Auction Daily Lake Ingestion
 
 on:
   schedule:
-    # Runs 3x daily (6:15 PM active sweep, 11:15 PM post-close settlement + active sweep, 7:00 AM morning catch-up AZ MST)
-    - cron: '15 1,6,14 * * *'
+    # Runs 3x daily (7:15 PM post-early-close sweep, 12:15 AM night close sweep, 8:15 AM morning AZ MST)
+    - cron: '15 2,7,15 * * *'
   workflow_dispatch:
     inputs:
       limit:

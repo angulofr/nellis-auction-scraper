@@ -437,6 +437,96 @@ class TestR2LoaderAndQueries(unittest.TestCase):
         self.assertTrue(bool(row_30001["bids_captured"]))
         self.assertFalse(bool(row_30002["is_closed"]))  # respected 5-minute safety buffer
 
+    def test_fetch_closed_lots_batch_paced_and_rate_limit_abort(self):
+        """Paced batch respects rate limiter, stops waves early on 429 clusters, and reports abort telemetry."""
+        calls = []
+
+        def _always_429(aid, session=None):
+            calls.append(aid)
+            return {"auction_id": aid, "_rate_limited": True, "retry_after": 0}
+
+        stats = {}
+        ids = list(range(60001, 60021))  # 20 items
+        with mock.patch.object(settlement, "fetch_closed_lot_result", side_effect=_always_429):
+            res = settlement.fetch_closed_lots_batch(
+                ids,
+                workers=4,
+                chunk_size=150,
+                max_cooldowns=1,
+                cooldown_seconds=0,
+                rate_per_sec=200.0,
+                stats_out=stats,
+            )
+
+        self.assertEqual(res, {})
+        self.assertTrue(stats["rate_limited_aborted"])
+        self.assertEqual(stats["cooldowns"], 1)
+        # wave_abort trips after 4 x 429s per wave across 2 waves (instead of hitting all 20 x 2 = 40)
+        self.assertLess(len(calls), 20)
+
+    def test_settle_r2_partitions_stops_across_files_on_rate_limit_abort(self):
+        """Partition sweep stops advancing to older files on 429 abort while still saving resolved items."""
+        now_ms = int(time.time() * 1000)
+        closed_past_ms = now_ms - 3_600_000
+        _, fact_new = transform.transform_records(
+            [{"id": 40001, "title": "Item A", "retailPrice": 40.0, "currentPrice": 5.0, "bidCount": 2,
+              "closeTime": closed_past_ms, "condition": "Brand New", "locationName": "Phoenix", "isClosed": False}],
+            scrape_date="2026-11-20",
+        )
+        _, fact_old = transform.transform_records(
+            [{"id": 40002, "title": "Item B", "retailPrice": 40.0, "currentPrice": 5.0, "bidCount": 2,
+              "closeTime": closed_past_ms, "condition": "Brand New", "locationName": "Phoenix", "isClosed": False}],
+            scrape_date="2026-11-19",
+        )
+        dim_df = pd.DataFrame([{"product_id": "p1", "title": "Item A", "category_primary": "Home & General", "category_secondary": "General", "brand": "", "first_seen_date": "2026-11-19"}])
+
+        def _to_bytes(df):
+            b = io.BytesIO()
+            df.to_parquet(b, index=False, compression="zstd")
+            return b.getvalue()
+
+        s3_mock = _InMemoryS3Client(
+            {
+                "dim_products/products_catalog.parquet": _to_bytes(dim_df),
+                "fact_auctions/year=2026/month=11/auctions_2026-11-20.parquet": _to_bytes(r2_loader.enforce_fact_auctions_schema(pd.DataFrame(fact_new))),
+                "fact_auctions/year=2026/month=11/auctions_2026-11-19.parquet": _to_bytes(r2_loader.enforce_fact_auctions_schema(pd.DataFrame(fact_old))),
+            }
+        )
+
+        batch_calls = []
+
+        def _partial_then_abort(aids, **kwargs):
+            batch_calls.append(list(aids))
+            stats_out = kwargs.get("stats_out")
+            if stats_out is not None:
+                stats_out.update({"resolved": 1, "rate_limited_hits": 4, "cooldowns": 1, "rate_limited_aborted": True, "deadline_aborted": False})
+            return {
+                40001: {
+                    "auction_id": 40001, "is_closed": True, "market_status": "sold",
+                    "final_price": 12.0, "retail_price": 40.0, "bid_count": 3,
+                    "close_ms": closed_past_ms, "open_ms": closed_past_ms - 86_400_000,
+                    "bid_history": [], "cond_raw": "New", "dmg_raw": "None",
+                    "mp_raw": "No", "func_raw": "Yes", "rating": 5, "notes": "", "not_found": False,
+                }
+            }
+
+        with mock.patch.object(r2_loader, "R2_ACCESS_KEY_ID", "test_key"), mock.patch.object(
+            r2_loader, "R2_SECRET_ACCESS_KEY", "test_secret"
+        ), mock.patch.object(
+            r2_loader, "R2_ENDPOINT_URL", "https://example.r2.cloudflarestorage.com"
+        ), mock.patch.object(
+            r2_loader, "R2_BUCKET_NAME", "test-bucket"
+        ), mock.patch("boto3.client", return_value=s3_mock), mock.patch.object(
+            settlement, "fetch_closed_lots_batch", side_effect=_partial_then_abort
+        ):
+            updated = settlement.settle_r2_partitions(max_files=0, workers=4, buffer_minutes=5, rate_per_sec=2.5)
+
+        self.assertEqual(updated, 1)
+        self.assertEqual(len(batch_calls), 1)  # aborted cleanly before hitting 2026-11-19
+        saved_new = pd.read_parquet(io.BytesIO(s3_mock.objects["fact_auctions/year=2026/month=11/auctions_2026-11-20.parquet"]))
+        self.assertTrue(bool(saved_new.loc[saved_new["auction_id"] == 40001, "is_closed"].iloc[0]))
+        self.assertEqual(float(saved_new.loc[saved_new["auction_id"] == 40001, "final_price"].iloc[0]), 12.0)
+
     def test_fetch_live_short_window_chronological_walk(self):
         """TC-INT-008 (CR-01): Short-window mode walks past closed page 0 & stops at target_window_sec + 90."""
         now_ms = int(time.time() * 1000)

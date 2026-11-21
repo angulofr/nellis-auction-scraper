@@ -15,8 +15,9 @@ import datetime
 import io
 import os
 import re
+import threading
 import time
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import pandas as pd
 import requests
@@ -402,6 +403,47 @@ def fetch_closed_lot_result(
             sess.close()
 
 
+class _RateLimiter:
+    """Thread-safe pacer enforcing a smooth max request/sec rate across worker threads."""
+
+    def __init__(self, rate_per_sec: float):
+        self._lock = threading.Lock()
+        self._rate = max(0.0, float(rate_per_sec))
+        self._interval = (1.0 / self._rate) if self._rate > 0 else 0.0
+        self._next_slot = time.monotonic()
+
+    @property
+    def rate(self) -> float:
+        with self._lock:
+            return self._rate
+
+    def slow_down(self, factor: float = 0.65, min_rate: float = 0.5) -> float:
+        """Reduce sustained rate after an HTTP 429 signal and push the next slot forward."""
+        with self._lock:
+            if self._rate <= 0:
+                return 0.0
+            self._rate = max(float(min_rate), round(self._rate * float(factor), 3))
+            self._interval = 1.0 / self._rate
+            self._next_slot = max(self._next_slot, time.monotonic()) + self._interval
+            return self._rate
+
+    def acquire(self) -> None:
+        if self._interval <= 0:
+            return
+        with self._lock:
+            if self._interval <= 0:
+                return
+            now = time.monotonic()
+            if now < self._next_slot:
+                wait_s = self._next_slot - now
+                self._next_slot += self._interval
+            else:
+                wait_s = 0.0
+                self._next_slot = now + self._interval
+        if wait_s > 0:
+            time.sleep(wait_s)
+
+
 def fetch_closed_lots_batch(
     auction_ids: Iterable[int],
     workers: int = 12,
@@ -410,11 +452,15 @@ def fetch_closed_lots_batch(
     cooldown_seconds: int = 65,
     timeout: Optional[float] = None,
     attempts: Optional[int] = None,
+    rate_per_sec: float = 0.0,
+    deadline_ts: float = 0.0,
+    stats_out: Optional[Dict[str, Any]] = None,
 ) -> Dict[int, Dict]:
     """
     Concurrently fetch authoritative post-close status, winning prices & bidHistory in paced chunks.
-    Respects HTTP 429 rate limits cleanly by cooling down when `max_cooldowns > 0`, or exiting early
-    for interactive UI callers (`max_cooldowns=0`) without hammering blocked requests.
+    When `rate_per_sec > 0`, smooths requests across workers to avoid triggering burst HTTP 429 bans.
+    Respects HTTP 429 rate limits cleanly by cooling down and slowing down when `max_cooldowns > 0`,
+    or exiting early for interactive UI callers (`max_cooldowns=0`) without hammering blocked requests.
     """
     unique_ids = []
     seen = set()
@@ -427,33 +473,76 @@ def fetch_closed_lots_batch(
         except (ValueError, TypeError):
             continue
 
+    if stats_out is not None:
+        stats_out.clear()
+        stats_out.update(
+            {
+                "resolved": 0,
+                "rate_limited_hits": 0,
+                "cooldowns": 0,
+                "rate_limited_aborted": False,
+                "deadline_aborted": False,
+            }
+        )
+
     if not unique_ids:
         return {}
 
     eff_workers = min(max(1, int(workers)), 12)
     eff_chunk = max(1, int(chunk_size))
+    if rate_per_sec > 0:
+        eff_chunk = min(eff_chunk, 25)
+    limiter = _RateLimiter(rate_per_sec) if rate_per_sec > 0 else None
+
     sess = _build_pooled_session(pool_size=max(eff_workers + 8, 16))
     results: Dict[int, Dict] = {}
     queue = list(unique_ids)
     cooldowns_used = 0
     consecutive_empty_waves = 0
     total_rate_limited = 0
+    rate_limited_aborted = False
+    deadline_aborted = False
 
     try:
         while queue:
+            if deadline_ts > 0 and time.time() >= deadline_ts:
+                deadline_aborted = True
+                break
+
             batch_ids = queue[:eff_chunk]
             queue = queue[eff_chunk:]
             rate_limited_ids = []
+            aborted_ids = []
             max_retry_after = 0
             wave_resolved = 0
+            wave_abort = threading.Event()
+            rl_lock = threading.Lock()
+            wave_rl_count = 0
+
+            extra_kw = {}
+            if timeout is not None:
+                extra_kw["timeout"] = timeout
+            if attempts is not None:
+                extra_kw["attempts"] = attempts
+
+            def _run_one(aid: int):
+                nonlocal wave_rl_count
+                if wave_abort.is_set() or (deadline_ts > 0 and time.time() >= deadline_ts):
+                    return {"_wave_aborted": True}
+                if limiter is not None:
+                    limiter.acquire()
+                if wave_abort.is_set() or (deadline_ts > 0 and time.time() >= deadline_ts):
+                    return {"_wave_aborted": True}
+                res = fetch_closed_lot_result(aid, sess, **extra_kw)
+                if res and res.get("_rate_limited"):
+                    with rl_lock:
+                        wave_rl_count += 1
+                        if wave_rl_count >= 4:
+                            wave_abort.set()
+                return res
 
             with ThreadPoolExecutor(max_workers=eff_workers) as ex:
-                extra_kw = {}
-                if timeout is not None:
-                    extra_kw["timeout"] = timeout
-                if attempts is not None:
-                    extra_kw["attempts"] = attempts
-                fut_map = {ex.submit(fetch_closed_lot_result, aid, sess, **extra_kw): aid for aid in batch_ids}
+                fut_map = {ex.submit(_run_one, aid): aid for aid in batch_ids}
                 for fut in as_completed(fut_map):
                     aid = fut_map[fut]
                     try:
@@ -462,32 +551,63 @@ def fetch_closed_lots_batch(
                         res = None
                     if not res:
                         continue
-                    if res.get("_rate_limited"):
+                    if res.get("_wave_aborted"):
+                        aborted_ids.append(aid)
+                    elif res.get("_rate_limited"):
                         rate_limited_ids.append(aid)
                         max_retry_after = max(max_retry_after, int(res.get("retry_after") or 0))
                     else:
                         results[aid] = res
                         wave_resolved += 1
 
+            if deadline_ts > 0 and time.time() >= deadline_ts and not rate_limited_ids:
+                deadline_aborted = True
+                break
+
             if rate_limited_ids:
                 total_rate_limited += len(rate_limited_ids)
                 if cooldowns_used >= max_cooldowns:
+                    rate_limited_aborted = True
                     break
                 consecutive_empty_waves = consecutive_empty_waves + 1 if wave_resolved == 0 else 0
                 if consecutive_empty_waves >= 2:
+                    rate_limited_aborted = True
                     print("[!] Consecutive cooldown waves remained rate-limited; stopping sweep cleanly.")
                     break
                 cooldowns_used += 1
-                sleep_s = max(int(cooldown_seconds), min(max_retry_after, 300))
+                new_rate = limiter.slow_down() if limiter is not None else 0.0
+                base_sleep = int(cooldown_seconds)
+                prog_sleep = base_sleep * min(cooldowns_used, 3) if base_sleep > 0 else 0
+                sleep_s = max(prog_sleep, min(max_retry_after, 360))
+                if deadline_ts > 0:
+                    rem_s = max(0.0, deadline_ts - time.time())
+                    if sleep_s > rem_s:
+                        deadline_aborted = True
+                        break
+                rate_msg = f", pacing reduced to {new_rate:.2f} req/s" if new_rate > 0 else ""
                 print(
                     f"[!] Rate-limited (HTTP 429) on {len(rate_limited_ids)} items "
-                    f"(resolved={len(results):,}; cooldown {cooldowns_used}/{max_cooldowns}, sleeping {sleep_s}s)..."
+                    f"(resolved={len(results):,}; cooldown {cooldowns_used}/{max_cooldowns}{rate_msg}, sleeping {sleep_s}s)..."
                 )
-                time.sleep(sleep_s)
-                # Retry rate-limited items once cooled down
-                queue = rate_limited_ids + queue
+                if sleep_s > 0:
+                    time.sleep(sleep_s)
+                # Retry rate-limited & aborted items in original priority order
+                retry_set = set(rate_limited_ids) | set(aborted_ids)
+                retry_ordered = [aid for aid in batch_ids if aid in retry_set]
+                queue = retry_ordered + queue
     finally:
         sess.close()
+
+    if stats_out is not None:
+        stats_out.update(
+            {
+                "resolved": len(results),
+                "rate_limited_hits": total_rate_limited,
+                "cooldowns": cooldowns_used,
+                "rate_limited_aborted": rate_limited_aborted,
+                "deadline_aborted": deadline_aborted,
+            }
+        )
 
     if total_rate_limited > 0 and max_cooldowns > 0:
         print(f"[*] Batch telemetry: resolved={len(results):,}, rate_limited_hits={total_rate_limited:,}, cooldowns={cooldowns_used}")
@@ -508,12 +628,14 @@ def is_verified_sold_result(res: Dict) -> bool:
 
 def settle_r2_partitions(
     max_files: int = 0,
-    workers: int = 10,
+    workers: int = 4,
     max_items_per_run: int = 0,
     buffer_minutes: int = 5,
     only_unsettled: bool = True,
-    max_cooldowns: int = 12,
-    cooldown_seconds: int = 65,
+    max_cooldowns: int = 10,
+    cooldown_seconds: int = 120,
+    rate_per_sec: float = 2.5,
+    max_seconds: int = 0,
 ) -> int:
     """
     Scan R2 fact_auctions Parquet partitions newest-first:
@@ -569,8 +691,12 @@ def settle_r2_partitions(
     total_fetched = 0
     total_resolved = 0
     total_bids_saved = 0
+    deadline_ts = (time.time() + int(max_seconds)) if max_seconds and int(max_seconds) > 0 else 0.0
 
     for idx_file, key in enumerate(keys, 1):
+        if deadline_ts > 0 and time.time() >= deadline_ts:
+            print("[*] Reached settlement wall-clock budget; stopping cleanly before next partition.")
+            break
         t0 = time.time()
         obj = s3.get_object(Bucket=R2_BUCKET_NAME, Key=key)
         df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
@@ -598,13 +724,17 @@ def settle_r2_partitions(
             remaining_budget = max(0, max_items_per_run - total_resolved)
             to_fetch = to_fetch[:remaining_budget]
 
+        batch_stats: Dict[str, Any] = {}
         if to_fetch:
             fetched_map = fetch_closed_lots_batch(
                 to_fetch,
                 workers=workers,
-                chunk_size=150,
+                chunk_size=25 if rate_per_sec > 0 else 150,
                 max_cooldowns=max_cooldowns,
                 cooldown_seconds=cooldown_seconds,
+                rate_per_sec=rate_per_sec,
+                deadline_ts=deadline_ts,
+                stats_out=batch_stats,
             )
             settled_cache.update(fetched_map)
             total_fetched += len(to_fetch)
@@ -752,6 +882,12 @@ def settle_r2_partitions(
             f"attempted={len(to_fetch)}, auctions_updated={changed_in_file}, "
             f"bids_saved={len(file_bid_rows)} ({time.time() - t0:.1f}s)"
         )
+        if batch_stats.get("rate_limited_aborted"):
+            print("[!] Stopping partition sweep early after persistent HTTP 429 rate limiting; resolved items were saved.")
+            break
+        if deadline_ts > 0 and (batch_stats.get("deadline_aborted") or time.time() >= deadline_ts):
+            print("[*] Reached settlement wall-clock budget; stopping cleanly so v2 compaction can run.")
+            break
         if max_items_per_run > 0 and total_resolved >= max_items_per_run:
             break
 
@@ -765,10 +901,12 @@ def settle_r2_partitions(
 def main():
     parser = argparse.ArgumentParser(description="Verify & settle closed Nellis winning prices and bid histories in R2.")
     parser.add_argument("--max-files", type=int, default=0, help="Max R2 Parquet files to scan newest-first (0 = all).")
-    parser.add_argument("--workers", type=int, default=10, help="Concurrent HTTP workers (default: 10).")
+    parser.add_argument("--workers", type=int, default=4, help="Concurrent HTTP workers (default: 4).")
     parser.add_argument("--max-items", type=int, default=0, help="Max unique auction lookups resolved (0 = unlimited).")
-    parser.add_argument("--cooldowns", type=int, default=12, help="Max HTTP 429 cooldown cycles per run (default: 12).")
-    parser.add_argument("--cooldown-sec", type=int, default=65, help="Cooldown sleep seconds after HTTP 429 (default: 65).")
+    parser.add_argument("--rate", type=float, default=2.5, help="Sustained max requests/sec (0 = unpaced, default: 2.5).")
+    parser.add_argument("--max-minutes", type=int, default=0, help="Soft wall-clock budget in minutes (0 = unlimited).")
+    parser.add_argument("--cooldowns", type=int, default=10, help="Max HTTP 429 cooldown cycles per run (default: 10).")
+    parser.add_argument("--cooldown-sec", type=int, default=120, help="Base cooldown sleep seconds after HTTP 429 (default: 120).")
     parser.add_argument("--reverify-all", action="store_true", help="Re-check even already settled rows.")
     parser.add_argument("--skip-v2", action="store_true", help="Skip updating compacted v2 lake after settlement.")
     args = parser.parse_args()
@@ -781,6 +919,8 @@ def main():
         only_unsettled=not args.reverify_all,
         max_cooldowns=args.cooldowns,
         cooldown_seconds=args.cooldown_sec,
+        rate_per_sec=args.rate,
+        max_seconds=max(0, int(args.max_minutes) * 60),
     )
     if updated > 0 and not args.skip_v2:
         from src.compact_lake import compact_v1_to_v2
